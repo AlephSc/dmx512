@@ -884,3 +884,28 @@ punya konfigurasi fade/hold sendiri sehingga scene playback punya timing bervari
    kedua tanpa jeda 1 detik (bukti push aktif).
 4. Blokir port 81 (atau matikan WS) -> UI otomatis fallback polling,
    indikator status tetap hidup.
+
+## Session 31 - 2026-08-25 01:20 - BUILD_TAG v29 -> v30 (Strobe Master)
+
+### Fitur: Strobe Master global (permintaan user)
+- Slider "Strobe" di bawah Master (id mstrb, 0-255).
+- Semantik: 0 = nonaktif; >0 = SELURUH output di-gate kotak on/off,
+  half-period dipetakan v=1 -> 2000ms s/d v=255 -> 40ms (besar=cepat).
+- Implementasi di buildFrame() (Core0, 40fps): fase kotak strobePhase +
+  strobeNextAt; saat fase OFF seluruh frame di-nol-kan (semua fixture ikut,
+  termasuk tipe tanpa dimmer). Scene/chase/fader TIDAK berubah datanya -
+  efek hanya sesaat pada tampilan. Re-aktif selalu mulai dari fase ON.
+- API: /ctrl?strb=N (ephemeral, tidak menandai nvsDirty/tidak persisten).
+- State JSON (+WS push): field "strb" -> posisi slider tersinkron antar
+  device secara realtime; skipActive menghormati slider yang digeser.
+
+### Verifikasi statis
+- grep: globals 133-134; gate buildFrame 349-358; onCtrl strb 1402;
+  JSON strb 1440; UI label 844; handler 1101-1103; sync 1304;
+  BUILD_TAG v30 konsisten (54/629/1367/1547).
+
+### Uji (user)
+1. Upload v30, hard refresh UI. Slider Strobe di bawah Master.
+2. Mainkan scene/chase lalu naikkan Strobe -> semua lampu kedip;
+   turunkan ke 0 -> kembali normal persis seperti sebelum strobe.
+3. Nilai kecil = lambat, besar = cepat. Buka 2 device -> posisi strobe sinkron.

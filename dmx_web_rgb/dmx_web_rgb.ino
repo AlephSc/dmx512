@@ -51,7 +51,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v29"
+#define BUILD_TAG "v30"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -126,6 +126,13 @@ Fixture fix[N_FIX] = {
 static uint8_t want[513];         // target (dari slider/preset/chase)
 static uint8_t out[513];          // nilai tampilan (hasil fade)
 static volatile uint8_t masterOut = 255; static volatile uint8_t masterWant = 255;
+
+// STROBE MASTER: 0=nonaktif; >0 = SELURUH output di-gate kotak on/off.
+// Nilai besar = kedip cepat: half-period 2000ms (v=1) .. 40ms (v=255).
+// Efek global sesaat: menimpa tampilan scene/chase/fader tanpa mengubah datanya.
+static volatile uint8_t strobeWant = 0;
+static uint32_t strobeNextAt = 0;      // hanya disentuh buildFrame (Core0)
+static bool strobePhase = true;        // true=fase ON
 static volatile uint32_t fadeMs = 600;
 static volatile bool chaseOn = false; static volatile uint32_t chaseMs = 1500; static volatile int chaseIdx = -1;
 
@@ -337,6 +344,19 @@ void buildFrame(){
     }
   }
   xSemaphoreGive(dmxMutex);
+  // STROBE MASTER: gate kotak seluruh frame (lampu mati-nyala global).
+  // Timing di sini (40fps) cukup presisi utk half-period >=40ms.
+  uint8_t sv = strobeWant;
+  if(sv>0){
+    uint32_t half = 40 + (uint32_t)(255 - sv) * 1960 / 255;
+    if(strobeNextAt==0 || (int32_t)(now - strobeNextAt) >= 0){
+      strobePhase = (strobeNextAt==0) ? true : !strobePhase;  // aktif kembali mulai ON
+      strobeNextAt = now + half;
+    }
+    if(!strobePhase) memset(frame,0,sizeof(frame));
+  } else {
+    strobeNextAt = 0;   // arm ulang: saat dinyalakan lagi mulai dari fase ON
+  }
   DMX.writeBytes(frame+1,512,1);
   DMX.transmit();
 }
@@ -821,6 +841,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <section class="panel" id="masterPanel">
     <h3>Master <span style="color:var(--muted);font-weight:400">global</span></h3>
     <label><span class="lab">Master</span><input type="range" id="master" min="0" max="255" value="255"><span class="val" id="masterv">255</span></label>
+    <label><span class="lab">Strobe</span><input type="range" id="mstrb" min="0" max="255" value="0"><span class="val" id="mstrbv">0</span></label>
     <div class="actions"><button class="btn-off act" id="btnBlack">Blackout</button><button class="btn-go act" id="btnChase">Chase OFF</button><button class="btn-reset act" id="btnSaveData">Save Data</button><button class="btn-off act" id="btnLoadData">Load Data</button></div>
     <div class="status" id="saveStatus">Data tersimpan</div>
   </section>
@@ -1076,6 +1097,10 @@ function applyPFadeUI(){ $('pfade').value=pfade; setPFadeLabel(pfade); paintFill
 $('master').addEventListener('input',()=>{activeKey='master';$('masterv').textContent=$('master').value;paintFill($('master'));pushCtrl('mast='+$('master').value);});
 $('master').addEventListener('change',()=>onRelease($('master')));
 $('master').addEventListener('blur',()=>onRelease($('master')));
+// STROBE MASTER: 0=off; >0 = kedip global, makin besar makin cepat.
+$('mstrb').addEventListener('input',()=>{activeKey='mstrb';$('mstrbv').textContent=$('mstrb').value;paintFill($('mstrb'));pushCtrl('strb='+$('mstrb').value);});
+$('mstrb').addEventListener('change',()=>onRelease($('mstrb')));
+$('mstrb').addEventListener('blur',()=>onRelease($('mstrb')));
 // input = update label saja; persist ke NVS hanya saat lepas (change) -> hindari tulis flash tiap tick
 // Jalur simpan Fade & Hold SAMA PERSIS lewat satu fungsi persistTiming().
 function persistTiming(){
@@ -1276,6 +1301,7 @@ $('fileIn').addEventListener('change',e=>{const file=e.target.files[0];if(!file)
 function syncFromServer(j, skipActive){
   if(j.master===undefined) return;
   if(!skipActive || activeKey!=='master'){ $('master').value=j.master; $('masterv').textContent=j.master; paintFill($('master')); }
+  if(j.strb!==undefined && (!skipActive || activeKey!=='mstrb')){ $('mstrb').value=j.strb; $('mstrbv').textContent=j.strb; paintFill($('mstrb')); }
   allKeys.forEach(k=>{
     if(skipActive && k===activeKey) return;
     const v=(j.cur&&j.cur[k]!==undefined)?j.cur[k]:0;
@@ -1371,8 +1397,9 @@ void onSet(){
   sendApiOk();
 }
 void onCtrl(){
-  // fade/hold kini milik preset (di-set saat preset dimuat); /ctrl hanya master & all.
+  // fade/hold kini milik preset (di-set saat preset dimuat); /ctrl hanya master, strobe & all.
   if(server.hasArg("mast")){ masterWant=cv(server.arg("mast").toInt()); masterOut=masterWant; }
+  if(server.hasArg("strb")){ strobeWant=cv(server.arg("strb").toInt()); }   // ephemeral: tidak persisten NVS
   if(server.hasArg("all")){
     bool on = server.arg("all")=="on";
     xSemaphoreTake(dmxMutex,portMAX_DELAY);
@@ -1410,7 +1437,7 @@ String buildStateJson(){
   bool so=sceneOn;
   xSemaphoreGive(dmxMutex);
   String j="{";
-  j+="\"master\":"+String(m)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision)+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
+  j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision)+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
     if(!first) j+=","; first=false;
