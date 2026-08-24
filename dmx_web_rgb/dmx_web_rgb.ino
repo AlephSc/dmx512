@@ -44,13 +44,14 @@
  */
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPAsyncWebServer.h>
 #include <Preferences.h>
 #include <Arduino.h>
 #include "Dmx_ESP32.h"
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v28"
+#define BUILD_TAG "v29"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -165,6 +166,20 @@ static volatile uint8_t sceneError = 0;
 SemaphoreHandle_t dmxMutex = NULL;
 
 WebServer server(80);
+
+// ---------------------------------------------------------------
+// WEBSOCKET PUSH (port 81, path /ws)
+// State dikirim ke browser saat berubah -> UI tidak lagi polling /cur
+// tiap detik (hemat CPU Core 1 & alokasi String). Semua KONTROL tetap
+// lewat HTTP REST port 80: tidak ada handler lama yang diubah.
+// ---------------------------------------------------------------
+AsyncWebServer wsSrv(81);
+AsyncWebSocket ws("/ws");
+void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* c, AwsEventType t, void*, uint8_t*, size_t){
+  if(t==WS_EVT_CONNECT)         Serial.printf("WS: client %u tersambung\n",(unsigned)c->id());
+  else if(t==WS_EVT_DISCONNECT) Serial.printf("WS: client %u putus\n",(unsigned)c->id());
+}
+
 Preferences nvs;
 const char* NVS_NS = "dmxrgb";
 const uint8_t PRESET_VER = 6;   // versi format preset untuk file export JSON
@@ -1286,8 +1301,22 @@ function syncFromServer(j, skipActive){
 buildFixes();buildGroups();buildSceneBank();renderSteps();updatePinfo();refreshPresets();
 // Init penuh (tidak melewati apa pun)
 api('/cur').then(j=>{syncFromServer(j,false);syncGroups(j);$('status').classList.add('live');$('statTxt').textContent='tersimpan';}).catch(e=>{$('statTxt').textContent='server tidak menjawab: '+e.message;});
-// Polling tracking (lewati slider yang sedang digeser)
-setInterval(()=>{ if(document.hidden||httpBusy||httpQueue.length>0) return; api('/cur').then(j=>syncFromServer(j,true)).catch(()=>{}); },1000);
+// WebSocket realtime (port 81): ESP32 push state saat berubah -> tanpa polling.
+let ws=null,wsOk=false,wsTries=0;
+function startWs(){
+  try{ ws=new WebSocket('ws://'+location.hostname+':81/ws'); }catch(e){ scheduleWsRetry(); return; }
+  ws.onopen =()=>{ wsOk=true; wsTries=0; $('status').classList.add('live'); };
+  ws.onmessage=ev=>{ try{ syncFromServer(JSON.parse(ev.data),true); $('status').classList.add('live'); }catch(_){} };
+  ws.onclose=()=>{ wsOk=false; scheduleWsRetry(); };
+  ws.onerror=()=>{ try{ws.close();}catch(_){} };
+}
+function scheduleWsRetry(){
+  if(++wsTries>5) return;                       // gagal terus -> cukup andalkan polling fallback
+  setTimeout(startWs,Math.min(8000,500*wsTries));
+}
+startWs();
+// Fallback polling: hanya jalan saat WebSocket belum/gagal tersambung.
+setInterval(()=>{ if(wsOk||document.hidden||httpBusy||httpQueue.length>0) return; api('/cur').then(j=>syncFromServer(j,true)).catch(()=>{}); },1000);
 </script>
 </body></html>
 )HTML";
@@ -1369,9 +1398,10 @@ void onChase(){
   if(!chaseOn) chaseIdx=-1; else chaseNextAt=millis();
   sendApiOk();
 }
-void onCur(){
+String buildStateJson(){
   // Snapshot cepat di bawah mutex, bangun JSON DI LUAR mutex ->
   // task DMX (Core0) tidak pernah menunggu lama gara-gara pembentukan String.
+  // Dipakai oleh HTTP /cur (fallback) DAN WebSocket push (jalur utama).
   static uint8_t snapOut[513];
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
   memcpy(snapOut,out,sizeof(snapOut));
@@ -1387,8 +1417,9 @@ void onCur(){
     j+="\""+String(f)+"_"+String(c)+"\":"+String(snapOut[fix[f].start+c]);
   }
   j+="}}";
-  server.send(200,"application/json",j);
+  return j;
 }
+void onCur(){ server.send(200,"application/json",buildStateJson()); }
 void onPresets(){ server.send(200,"application/json",presetsJson()); }
 void onPresetLoad(){
   int n=server.arg("n").toInt()-1;
@@ -1543,6 +1574,12 @@ void setup(){
   server.on("/import",HTTP_POST, onImportFinal, onImportUpload);
   server.begin();
 
+  // WebSocket realtime push di port terpisah (81): kontrol tetap HTTP port 80.
+  ws.onEvent(onWsEvent);
+  wsSrv.addHandler(&ws);
+  wsSrv.begin();
+  Serial.println("WebSocket push -> port 81 (/ws)");
+
   // Kirim satu frame awal SEBELUM task DMX berjalan.
   // (Dulu dipanggil SETELAH task dibuat -> dua transmit paralel, frame boot bisa rusak.)
   buildFrame();
@@ -1551,4 +1588,18 @@ void setup(){
   xTaskCreatePinnedToCore(dmxTask, "dmx", 8192, NULL, 5, &dmxTaskHandle, 0);
   Serial.println("DMX task -> Core 0 | WebServer -> Core 1");
 }
-void loop(){ server.handleClient(); }
+// Broadcast state via WebSocket: segera saat stateRevision berubah,
+// heartbeat 1 dtk saat diam (paritas dgn polling lama utk scn/stp playback).
+void wsBroadcastTick(){
+  static uint32_t lastAt=0, lastRev=0;
+  uint32_t now=millis();
+  if(stateRevision==lastRev && now-lastAt<1000) return;
+  if(ws.count()==0){ lastAt=now; return; }   // tanpa klien -> hemat CPU; lastRev sengaja tidak diupdate
+  lastRev=stateRevision; lastAt=now;
+  ws.textAll(buildStateJson());
+}
+void loop(){
+  server.handleClient();
+  ws.cleanupClients();      // housekeeping AsyncWebSocket
+  wsBroadcastTick();
+}

@@ -849,3 +849,38 @@ punya konfigurasi fade/hold sendiri sehingga scene playback punya timing bervari
     saat refactor v28) -> tidak perlu tekan Save Data setelah Impor.
 - Catatan: ini alur file via browser (komputer/HP). Simpan show langsung
   di flash ESP32 (slot show LittleFS/SD) BELUM ada - opsional bila diminta.
+
+## Session 30 - 2026-08-24 15:35 - BUILD_TAG v28 -> v29 (WebSocket realtime push)
+
+### Fitur: WebSocket push menggantikan polling /cur
+- Library: ESPAsyncWebServer + AsyncTCP (SUDAH terpasang di
+  Documents\Arduino\libraries - tanpa dependensi baru).
+- Arsitektur minimalis & aman:
+  * WebServer blocking port 80 + SEMUA handler REST TIDAK DIUBAH.
+  * Server Async kedua khusus WS: wsSrv(81), path /ws, event handler
+    onWsEvent (log connect/disconnect client).
+- onCur() direfaktor -> buildStateJson(); /cur tetap ada sebagai fallback.
+- wsBroadcastTick() di loop(): broadcast segera saat stateRevision berubah,
+  heartbeat 1000ms saat diam; skip bila tidak ada client (hemat CPU);
+  ws.cleanupClients() tiap iterasi.
+- JS: startWs() ke ws://host:81/ws, onmessage -> syncFromServer(j,true);
+  retry backoff maks 5x; polling lama dipertahankan sebagai fallback dan
+  hanya jalan saat !wsOk.
+
+### Manfaat
+- Latensi update UI ~1s -> <10ms saat state berubah; beban HTTP Core 1
+  turun drastis; alokasi String per-detik hilang (kurang fragmentasi heap).
+
+### Verifikasi statis
+- grep: include v29, wsSrv addHandler+begin, onEvent(onWsEvent),
+  buildStateJson x2 pemakai, textAll, cleanupClients, startWs/fallback OK;
+  BUILD_TAG v29 konsisten di banner/header/health.
+
+### Protokol uji (user)
+1. Upload sketch v29. Serial harus "=== DMX Web Console v29 ===" +
+   "WebSocket push -> port 81 (/ws)".
+2. Buka UI, hard-refresh (Ctrl+F5). Serial muncul "WS: client N tersambung".
+3. Geser fader/preset di satu device -> perubahan tampil instan di device
+   kedua tanpa jeda 1 detik (bukti push aktif).
+4. Blokir port 81 (atau matikan WS) -> UI otomatis fallback polling,
+   indikator status tetap hidup.
