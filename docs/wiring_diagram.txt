@@ -1,0 +1,39 @@
+DMX512 ESP32 + MAX485 Wiring Diagram
+=====================================
+
+ESP32 (NodeMCU/DevKit)          MAX485 Module               DMX XLR-5 Connector
+----------------------          -------------               -------------------
+                                                            
+GPIO17 (TX2) ---------------> DI (Data Input)              
+                                                            
+GPIO16 (RX2) <--------------- RO (Data Output)             
+                                                            
+GPIO21 (RTS) ---------------> DE (Driver Enable)           
+              |                                             
+              +-------------> RE (Receiver Enable)          
+                                                            
+3.3V or 5V ----------------> VCC                            
+                                                            
+GND -----------------------> GND ----------------------> Pin 1 (Signal Common)
+                                                            
+                             A (Data+) ----------------> Pin 3 (Data+)
+                                                            
+                             B (Data-) ----------------> Pin 2 (Data-)
+                                                            
+                                                         Pin 4 (Not used)
+                                                         Pin 5 (Not used)
+
+
+TERMINATION (Last device in chain):
+====================================
+120Ω resistor between Pin 2 and Pin 3 (Data- and Data+)
+
+
+NOTES:
+======
+1. DE dan RE tied together (same control signal)
+2. GPIO HIGH = Transmit mode, LOW = Receive mode
+3. MAX485 lebih stabil dengan 5V supply
+4. Tambahkan 100nF capacitor antara VCC dan GND MAX485
+5. XLR pinout: looking at MALE pins (solder side)
+6. Female XLR untuk OUTPUT, Male XLR untuk INPUT

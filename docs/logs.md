@@ -1,0 +1,851 @@
+# Session Logs - DMX512 Controller ESP32 Project
+
+## Session 1 - 2026-08-18 08:00
+
+### Konteks
+User ingin membuat controller DMX512 menggunakan ESP32 + MAX485
+
+### Tasks Completed
+
+#### 1. Riset DMX512 Protocol
+- ✅ Delegasi research ke sub-agent (task_id: ses_feda5131dffemWzHoNtsU8KiOn)
+- ✅ Generated comprehensive documentation
+- ✅ Created directory structure: `E:\code\Arduino\DMX512`
+
+**Files Created:**
+- `DMX512_Research.md` - Full protocol specification (368 lines)
+  - Protocol basics (RS-485, 250kbaud, 8N2)
+  - Timing specs (break 88μs, MAB 8μs)
+  - Hardware implementation ESP32+MAX485
+  - Library comparison (esp_dmx, ESP-Dmx)
+  - Best practices & common pitfalls
+  
+- `wiring_diagram.txt` - Pinout ESP32→MAX485→XLR-5
+  - GPIO17 (TX2) → DI
+  - GPIO16 (RX2) → RO
+  - GPIO21 (RTS) → DE/RE
+  - Termination notes
+  
+- `examples/dmx_transmitter_basic.ino` - Basic TX example (35 lines)
+  - esp_dmx library usage
+  - 3-channel RGB demo
+  - Brightness fade effect
+  
+- `examples/dmx_receiver_basic.ino` - Basic RX example (35 lines)
+  - Packet reception
+  - Error handling
+  - Serial output
+
+#### 2. Analisis Pro/Kontra ESP32 untuk DMX
+- ✅ Created `ESP32_DMX_Analysis.md` - Comprehensive analysis
+
+**Pro (8 points):**
+- Hardware UART powerful (3 UART, DMA, 250kbaud easy)
+- Dual core CPU (dedicated DMX task)
+- WiFi/BLE built-in (Art-Net, sACN bridge)
+- Large memory (520KB RAM, 4MB+ Flash)
+- Cheap ($2-5)
+- 30+ GPIO (encoders, LCD, buttons)
+- Development friendly (Arduino, PlatformIO, OTA)
+- Low power modes (battery feasible)
+
+**Kontra (8 points) + Solutions:**
+1. 3.3V logic → MAX485 needs 5V
+   - Solution: Level shifter TXS0108E or SN65HVD75 (3.3V native)
+   
+2. WiFi timing jitter
+   - Solution: Pin DMX task to Core 0, max priority
+   
+3. Break generation not native
+   - Solution: esp_dmx library handles it
+   
+4. No optical isolation
+   - Solution: 6N137 optocoupler + TVS diode
+   
+5. Half-duplex only
+   - Solution: Fast DE/RE switching or dual MAX485
+   
+6. Flash wear
+   - Solution: Wear leveling, RAM cache
+   
+7. Heat dissipation
+   - Solution: Heatsink 20×20mm
+   
+8. Limited RDM support
+   - Solution: esp_dmx library or skip RDM
+
+**Production-Ready Design:**
+- ESP32-S3 recommended (better WiFi, more RAM)
+- SN65HVD75 transceiver (3.3V native, ESD 15kV)
+- TXS0108E level shifter (if using MAX485)
+- 6N137 optocoupler (galvanic isolation 2500V)
+- SMAJ5.0CA TVS diode (bus protection)
+- Neutrik NC5FD-LX XLR-5 connector
+- 120Ω terminator (jumper selectable)
+
+**Software Architecture:**
+- Core 0: DMX task (highest priority, no WiFi)
+- Core 1: Art-Net, UI, application logic
+- Library: esp_dmx v4.0+ (RDM support)
+- FreeRTOS task pinning
+
+**BOM Cost: ~$15**
+**Development Timeline: 4 weeks**
+
+### Recommendations
+- ESP32 **sangat cocok** untuk DMX controller dengan proper design
+- Use cases: WiFi bridge, portable controller, multi-universe, DIY projects
+- NOT suitable: Professional fixtures (use Teensy), safety-critical, 24/7 industrial
+
+### Files Structure
+```
+E:\code\Arduino\DMX512\
+├── DMX512_Research.md          (368 lines - protocol specs)
+├── ESP32_DMX_Analysis.md       (NEW - pro/kontra analysis)
+├── wiring_diagram.txt          (39 lines - pinout)
+├── logs.md                     (THIS FILE)
+└── examples/
+    ├── dmx_transmitter_basic.ino
+    └── dmx_receiver_basic.ino
+```
+
+### Next Steps (User Decision)
+- Hardware procurement (ESP32-S3, MAX485/SN65HVD75, connectors)
+- Library installation (esp_dmx via Arduino Library Manager)
+- Breadboard prototype
+- Code implementation (basic TX first, then WiFi integration)
+
+---
+
+## Changelogs
+
+### 2026-08-18 08:00 - Initial Research
+- Created project directory structure
+- Completed DMX512 protocol research (10 topics)
+- Generated wiring diagrams
+- Created transmitter/receiver code examples
+- Analyzed ESP32 suitability for DMX512
+- Documented 8 pros, 8 contras with solutions
+- Provided production-ready design recommendations
+
+---
+
+## Technical References
+
+**Key Specs:**
+- Protocol: RS-485, 250kbaud, 8N2, unidirectional
+- Frame: BREAK(88μs) + MAB(8μs) + StartCode(0x00) + 512ch(0-255)
+- Timing: 44μs per byte, 25-44fps typical
+- Cable: 120Ω twisted pair, XLR-5 connector
+- Termination: 120Ω resistor at end of chain
+
+**Recommended Components:**
+- MCU: ESP32-S3 ($5)
+- Transceiver: SN65HVD75 or MAX485+level shifter
+- Isolation: 6N137 optocoupler
+- Protection: SMAJ5.0CA TVS diode
+- Connector: Neutrik NC5FD-LX
+
+**Library:**
+```cpp
+#include <esp_dmx.h>
+// GitHub: https://github.com/someweisguy/esp_dmx
+```
+
+---
+
+## Session 2 - 2026-08-21 16:05
+
+### Main sketch verification
+- Dibaca `main.ino`, sketch berhasil menurut user.
+- Library aktual: `Dmx_ESP32.h`, bukan `esp_dmx.h` dari contoh riset sebelumnya.
+- UART: `HardwareSerial DMXSerial(2)` pada 250000 baud, `SERIAL_8N2`.
+- Pin aktual: GPIO17 TX, GPIO16 RX, GPIO4 DE+RE.
+- Fixture teruji: PAR LED, start address 1, footprint 4 channel.
+- Mapping teruji: CH1 master dimmer, CH2 red, CH3 green, CH4 blue.
+- API aktual: `DMX.write(value, channel)` lalu `DMX.transmit()`.
+- Fungsi saat ini: RGB manual, dimmer, blackout, fade warna, color test.
+
+### Catatan integrasi
+- Contoh Web UI sebelumnya memakai API `esp_dmx`; tidak bisa langsung digabung dengan `main.ino`.
+- Pengembangan berikutnya harus mempertahankan `Dmx_ESP32.h`, `DMXSerial`, pin GPIO4, dan urutan argumen `DMX.write(value, channel)`.
+- TX-only: GPIO16/RO tidak diperlukan oleh logika, tetapi jika MAX485 diberi 5V jangan sambungkan RO langsung ke GPIO16. Gunakan divider atau lepaskan RO.
+- Multi-lampu: tulis seluruh channel semua fixture terlebih dahulu, panggil `DMX.transmit()` satu kali per frame.
+
+---
+
+## Session 3 - 2026-08-21 16:25
+
+### Web RGB Controller (`examples/dmx_web_rgb.ino`)
+- Dibuat kontrol warna RGB + dimming melalui website.
+- ESP32 terhubung ke WiFi SSID "Selin" / pass "lalisandi" (mode STA).
+- Server: WebServer bawaan ESP32 port 80, endpoint `/`, `/set`, `/cur`, `/off`, `/white`.
+- IP dicetak ke Serial (115200), dan disuntik ke elemen meta UI lewat token `__IP__`.
+- Dikonfirmasi dari source library `Dmx_ESP32`:
+  - `dmxTx` konstruktor `(port, pinTx, pinEnable)`; `configure()` set pin enable HIGH utk TX.
+  - `write(data, channel)` channel 1..512, tulis ke `_dmxBuf[channel]`.
+  - `writeBytes(data, numBytes, startChannel)` isi semua channel sekaligus.
+  - `transmit()` kirim break + MAB + 513 byte; `dmxBuffer()` akses buffer langsung.
+  - Warning library: jangan punya 2 transceiver DE mode bersamaan.
+- UI: dark theme (alasan fungsi konsol pencahayaan), slider besar target sentuh,
+  swatch live preview, dua tombol (Mati / Putih), status koneksi. Responsif PC + HP.
+- Arah desain ditulis di `DESAIN.md` (ENERGY 1 / RHYTHM 2 / MOTION 1).
+- Perbaikan minor: hapus variabel JS mati, token IP dimasukkan ke HTML.
+
+### Struktur file
+```
+examples/dmx_web_rgb.ino   <- controller web (file aktif)
+DESAIN.md                  <- arah visual UI
+main.ino                   <- baseline yang teruji (tidak diubah)
+```
+
+---
+
+## Session 4 - 2026-08-21 18:05
+
+### Fitur: bank preset gaya konsol (`examples/dmx_web_rgb.ino`)
+- Ditambahkan 8 bank preset (gaya konsol lighting).
+- Model operasi: tombol REKAM ON/OFF + pad preset.
+  - REKAM ON -> tekan pad = simpan kondisi slider (dimmer+R+G+B) saat ini ke pad itu.
+  - REKAM OFF -> tekan pad = muat preset ke slider + langsung kirim ke DMX.
+- Penyimpanan via NVS (`Preferences`, namespace "dmxrgb", key "presets"),
+  8 x `struct{uint8 d,r,g,b,used}` = chunk 5 byte, tanpa padding.
+- Endpoint baru: `/presets` (JSON), `/pload?n=`, `/psave?n=`, `/pclear?n=`.
+- UI: grid 4x2 pad, swatch warna per pad, pad kosong diarsir (hatch),
+  highlight kuning pada preset yang sedang aktif, lepas highlight saat nilai diubah.
+- Realtime fader dipertahankan (throttle in-flight) dari session sebelumnya.
+- Catatan: struct memakai `uint8_t used` (bukan bool) agar ukuran biner deterministik.
+
+---
+
+## Session 5 - 2026-08-21 18:40
+
+### Upgrade besar: `examples/dmx_web_rgb.ino` (4 PAR + 5 fitur)
+Refactor penuh menuju model multi-PAR + console-style.
+
+#### Model data
+- `N_PAR=4` PAR LED: channel per PAR = `p*4+1` (Dim), +2,+3,+4 (R,G,B).
+- `ParState{d,r,g,b}`, `Preset{ ParState par[4]; used; ignoreDimmer; }`.
+- Dua layer output: `want[]` (target) vs `out[]` (tampilan); fade interpolasi want->out.
+- Preset NVS dengan `PRESET_VER=2` (guard format bila skema berubah).
+
+#### Fitur yang ditambahkan
+1. **Master dimmer global + Blackout** - master slider mengalikan dimmer tiap PAR.
+2. **Chase / auto-run** - memutar antar preset used pada interval `/chase?on=1`, henti saat slider digerakkan.
+3. **Fade-time / crossfade** - slider Fade (0-2000ms), pemuatan preset & chase lewat `want` lalu fade.
+4. **Kontrol 4 PAR di UI** - grid 2 kolom (desktop), tiap PAR punya 4 slider; snapshot manual = snap realtime.
+5. **Rekam preset opsi "tanpa dimmer"** - checkbox idim; saat apply preset dengan idim, dimmer diset ke 255 (warna penuh).
+
+#### Endpoint baru
+- `/set?master=&{p}{c}=` parsa `master` + per-channel (key 2 char).
+- `/ctrl?fade=` set fade ms.
+- `/chase?on=1|off=1[&sp=ms]` start/stop chase.
+- `/cur` JSON master+fade+par (inisialisasi UI).
+- `/pload|/psave?n=&idim=|/pclear` preset (diperbarui ke 4 PAR).
+
+#### Catatan implementasi
+- `mulScale` mengalikan dimmer dengan master tanpa overflow (16-bit trap).
+- Loop: chaseTick -> fadeTick(0.025f) -> buildFrame tiap 25ms (frame kontinu).
+- Manual slider menulis want DAN out (snap); preset load & chase menulis want saja (fade).
+- JS: objek `sliders` dikunci `"{p}_{c}"`, `data-col` untuk warna fill slider.
+
+---
+
+## Session 6 - 2026-08-21 21:33
+
+### Refactor: model PATCH TABLE (`examples/dmx_web_rgb.ino`)
+Mengganti model offset `p*4+1` menjadi **patch table general** sesuai rekomendasi paling efisien.
+
+#### Patch table
+```c
+struct Fixture { const char* name; uint8_t type; uint16_t start; uint16_t foot; };
+Fixture fix[N_FIX] = {
+  { "PAR 1",    FX_PAR,    1,  4 },
+  { "PAR 2",    FX_PAR,    5,  4 },
+  ...
+  { "BEAM 1",   FX_BEAM,  21, 16 },
+  { "MOVING 1", FX_MOVING,37, 20 },
+  { "STROBE 1", FX_STROBE,57,  4 },
+  { "FOG 1",    FX_FOG,   61,  2 },
+};
+```
+- Jenis fixture: PAR / MOVING / BEAM / STROBE / FOG.
+- Layout: blok per tipe, sisa >63 = spare ekspansi (efisien, tanpa gap antar unit).
+- PAR footprint 4 (bukan 9) -> hindari boros 50 slot; blok spare terpisah untuk ekspansi.
+
+#### Perubahan inti
+- Patch table = satu sumber kebenaran.
+- Bug timing: fadeTick dipindahkan ke blok 25ms (sebelumnya dipanggil tiap loop -> fade 40x lebih cepat).
+- Bug fade stuck: tambah snap threshold `<2` supaya output tepat mencapai target preset/master.
+- Header dokumen ditandai versi FINAL.
+
+---
+
+## Session 7 - 2026-08-21 22:53 (FINAL INDUSTRIAL)
+
+### `examples/dmx_web_rgb.ino` - versi final industrial
+
+#### Arsitektur core (anti hang/freeze)
+- DMX timing di **Core 0** via `xTaskCreatePinnedToCore(dmxTask, ..., 5, ..., 0)`.
+- WebServer di **Core 1** (`loop()` Arduino).
+- `vTaskDelayUntil` untuk frame realtime ~40fps presisi.
+- FreeRTOS **mutex (`dmxMutex`)** melindungi `want[]`/`out[]`/`master*` antar core.
+- State lintas-core ditandai `volatile` (masterOut/masterWant/fadeMs/chaseOn/chaseMs/chaseIdx).
+
+#### Persistensi NVS (storage ibarat HDD/SSD)
+- Preset disimpan di NVS flash -> **tahan listrik mati / reboot** (jawaban: ya).
+- Simpan NVS hanya saat user merekam atau import (bukan tiap frame) -> flash awet.
+- Format NVS: `ver` tag (PRESET_VER=4) + 8 x chunk 513 byte.
+
+#### Import / Export preset
+- `GET /export` : unduh `dmx-presets.json`
+- `POST /import` (multipart) : upload file JSON -> parse manual -> simpan NVS
+- Format : `{"app":"DMX-RGB","ver":4,"presets":[{"u":0/1,"c":[512 nilai]},...]}`
+- Parser manual tanpa ArduinoJson (hemat flash).
+
+#### Patch table (user request: 10 PAR @9ch + 8 fixture lain)
+- 10 PAR foot 9 (1-90), 2 moving (20c), 2 beam (16c), 2 strobe (4c), 2 fog (2c) -> 174 ch, sisa >174 spare.
+
+#### Optimasi & standar industri
+- `DMX.setBreakLength(100)` -> break dalam spek DMX512-A (88-176us).
+- Frame 40fps; terminator 120 Ohm di-catat; kabel DMX dedicated.
+- Kirim channel: slider -> `pushOne` (1 param); master/all/fade/chase -> server-side `/ctrl` (hindari request raksasa utk 174 ch).
+- Catatan hardware: MAX485 5V; bila RX dipakai pasang divider 1k+2k ke GPIO16.
+
+#### Total baris kode final: ~610 baris (fitur lengkap; ringkas krn pola terpusat patch table + 1 handler set).
+
+---
+
+## Session 8 - 2026-08-21 23:04
+
+### Tambahan: slider Chase Speed di UI
+- Slider baru di panel Master: `id=chase`, rentang 200-5000ms, step 100, default 1500ms.
+- JS: `setChaseLabel`, listener `input` -> `pushCtrl('chase=...')`.
+- Server `/ctrl`: tambah `if(server.hasArg("chase")) chaseMs=...` (bisa berubah live saat chase berjalan).
+- `/cur`: tambah field `chase` agar UI tersinkron saat halaman dibuka.
+- Tidak ada konflik nama: fungsi `setChase(on/off)` terpisah dari id slider `#chase`.
+
+---
+
+## Session 9 - 2026-08-22 01:10
+
+### Tiga fitur Grade A (dmx_web_rgb.ino)
+
+#### 1. Tracking UI (polling /cur)
+- `syncFromServer(j, skipActive)` dipakai init & polling.
+- Polling `/cur` tiap 700ms (`document.hidden` -> skip).
+- Slider yang sedang digeser user dilewati via `activeKey` (di-set saat `input`, dilepas saat `change`).
+- Efek: saat chase/preset fade berjalan, slider di UI ikut bergerak menunjukkan nilai `out[]` aktual (seperti konsol nyata).
+
+#### 2. LTP + Blackout-on-move (moving head/beam)
+- `Fixture` tambah field `hasMove` (1 utk MOVING/BEAM; pan=ch0, tilt=ch2).
+- `applyPresetToWant`: deteksi lompatan pan/tilt >30 -> `blackoutEnd[f]=now+350`.
+- `buildFrame`: saat `now < blackoutEnd[f]`, dimmer fixture dipaksa 0 (frame[base]=0) -> lampu tidak "menggambar" lintasan kotor; setelah 350ms nyala lagi di posisi baru.
+- Berlaku juga untuk perpindahan chase (chaseTick memanggil applyPresetToWant).
+- Slider manual tetap snap (LTP by nature).
+
+#### 3. Preset 8 -> 16
+- `N_PRESETS=16` (NVS 16x513=8208 byte, masih muat partisi default).
+- `PRESET_VER=5` (format sama, versi naik agar NVS lama direset bersih).
+- Bank UI, export/import, chase otomatis mengikuti karena loop `i<N_PRESETS`.
+
+---
+
+## Session 10 - 2026-08-22 01:35
+
+### Code review menyeluruh + perbaikan semua temuan (dmx_web_rgb.ino, ~741 baris)
+
+#### HIGH (semua diperbaiki)
+- **H1 Race transmit saat boot**: `buildFrame()` dipindah SEBELUM `xTaskCreatePinnedToCore`
+  (dulu setelahnya -> dua transmit paralel, frame boot bisa rusak).
+- **H2 Import destruktif**: `importJson` kini parse ke `tmp[16][513]` (static BSS);
+  commit `memcpy` per baris HANYA bila parse sukses (`found>0`). File rusak ->
+  return false, preset lama utuh. Semantik merge (baris tak ditemukan tidak disentuh).
+- **H3 OOM upload**: `IMPORT_MAX 65536`; chunk melebihi -> `importTooBig` -> HTTP 413;
+  `UPLOAD_FILE_ABORTED` ditangani.
+
+#### MEDIUM (semua diperbaiki)
+- **M1 Mutex penulis presets**: `importJson` (commit), `onPresetClear`,
+  `capturePreset` (flag used pindah ke dalam lock), `nextUsedPreset` (pembaca).
+  Pembaca JSON (`presetsJson`/`exportJson`) memakai snapshot baris 513 byte per preset.
+- **M2 Throttle pushOne**: `setInFlight`/`setPending` -> maks 1 request /set beredar.
+- **M3 renderBank per tick**: diganti `updateBankSel()` (toggle class `sel` saja).
+- **M4 Hazard "Semua Penuh"**: server `all=on` hanya PAR (dimmer+RGB)=255;
+  moving/beam/strobe/fog di-nol-kan. JS `btnWhite` ikut set slider PAR saja.
+- **M5 chaseOn di `/cur`**: field `chaseOn` + JS `applyChaseBtn()` sinkron saat
+  server menghentikan chase sendiri.
+
+#### LOW (diperbaiki)
+- L1: clamp `fade` 0-5000ms, `chase`/`sp` 100-10000ms.
+- L2: parser import dibatasi ke objek preset (`objEnd`), tidak salah tangkap `"c":[` milik
+  preset lain; `pos` selalu maju (tidak ada re-parse).
+- L3: `exportJson` pakai `reserve(36000)`; parser angka manual tanpa alloc `substring`.
+- L4: `onCur` membaca `out[]` di dalam mutex.
+- L5: dokumen header disinkronkan (16 preset, ver 5, hapus typo "pmem world").
+- L6: `activeKey` dilepas juga via `blur` (master/fade/chase + slider channel).
+- L7: catatan keamanan (tanpa auth) ditambahkan di header.
+
+#### Dead code
+- `inFlight`/`queued` (sisa throttle lama) dihapus.
+
+#### Belum diubah (disengaja)
+- Tanpa autentikasi endpoint (hobby; terdokumentasi di header).
+- `onSet` dengan args==0 merender UI (quirk tak berbahaya).
+
+---
+
+## Session 11 - 2026-08-22 01:40
+
+### Perubahan WiFi: AP -> Station ke "SIGMA"
+- `WIFI_SSID="SIGMA"`, `WIFI_PASS="1ngantos12"` (mode STA, `WiFi.begin`).
+- Tunggu koneksi maks 15 detik; IP DHCP dicetak ke Serial.
+- **Fallback AP darurat**: bila gagal tersambung -> otomatis buka AP
+  "DMX-RGB"/12345678 (http://192.168.4.1) supaya tidak terkunci dari device.
+- Helper `activeIP()`: pilih `localIP` (STA) atau `softAPIP` (fallback) ->
+  dipakai Serial print dan token `__IP__` di UI.
+- `WiFi.setSleep(false)` agar respons web lebih responsif di mode STA.
+- Header dokumen bagian KONEKSI diperbarui.
+
+---
+
+## Session 12 - 2026-08-22 01:48
+
+### Fix compile error: 'DMX' was not declared in this scope
+- Penyebab: deklarasi `HardwareSerial DMXSerial(2);` dan `dmxTx DMX(...);`
+  hilang saat refactor besar (blok "DMX" tertinggal dari file final).
+- Perbaikan: deklarasi dikembalikan setelah blok PIN:
+  ```cpp
+  HardwareSerial DMXSerial(2);
+  dmxTx DMX(&DMXSerial, DMX_TX_PIN, DMX_ENABLE_PIN);
+  ```
+- Audit simbol global lain (fungsi + variabel): semua lengkap, tidak ada korban kedua.
+
+---
+
+## Session 13 - 2026-08-22 02:50
+
+### Fitur: FADER BANK (1 fader -> banyak lampu, ala konsol)
+
+#### Metode: soft-patch (grup fixture x offset channel)
+- Fader terikat ke (tipe fixture + satu offset channel lokal).
+- Geser fader = tulis channel offset itu di SEMUA fixture anggota grup (snap realtime).
+- Kenapa: (1) persis model konsol (fader=channel, patch=fixture), (2) tanpa state baru -
+  menulis ke want/out yang sama sehingga master/fade/preset/chase/blackout tetap bekerja,
+  (3) tracking /cur otomatis menampilkan efeknya ke slider per-channel,
+  (4) LTP: slider per-channel tetap bisa override manual.
+- Alternatif yang ditolak: fader page A/B (174 ch butuh banyak halaman),
+  fader intensitas + warna global terpisah (dua sistem, kompleks).
+
+#### Implementasi
+- C++: `struct FaderGroup {name, typeFilter, offset}` + tabel `grp[8]`:
+  PAR Dim/R/G/B (offset 0-3), MH Dim (offset 5), Beam Dim (offset 6),
+  Strobe (offset 1), Fog (offset 0). Offset = chart DMX, bisa diedit.
+- Endpoint `GET /grp?i=X&v=N`: loop fixture dgn type cocok, tulis want+out (snap, mutex).
+- `grpJson()` + token `__GRPDATA__` di sendUi.
+- UI: panel "Fader Bank" (antara Preset dan Channel); label fader menampilkan
+  jumlah anggota (mis. "PAR Red x10"); slider grup tak disentuh polling
+  (posisi = input gesture, disinkronkan hanya saat halaman dibuka via `syncGroups`).
+- Geser fader grup menghentikan chase (konsisten dgn slider per-channel).
+
+---
+
+## Session 14 - 2026-08-22 03:05
+
+### Fitur: tombol HAPUS preset
+- Tombol `HAPUS OFF/ON` di panel Preset (sejajar REKAM), pola interaksi sama:
+  aktifkan HAPUS -> tekan pad yang mau dihapus -> mode keluar otomatis.
+- Konfirmasi `confirm()` sebelum hapus; pad kosong diabaikan.
+- Saat mode HAPUS aktif, pad berisi diberi border merah (`.bank.deleting .pad.used`)
+  supaya jelas target mana yang akan terhapus.
+- Mutual exclusion: mengaktifkan HAPUS mematikan REKAM, dan sebaliknya.
+- Server: endpoint `/pclear?n=X` yang sudah ada (mutex + savePresets) dipakai;
+  UI refresh bank setelah hapus via `refreshPresets()`.
+- Helper JS `exitDelMode()` utk keluar mode secara konsisten (termasuk bila user
+  membatalkan lewat dialog konfirmasi).
+
+---
+
+## Session 15 - 2026-08-22 03:40
+
+### Fitur: SCENE (20 scene x 30 langkah preset, auto-play)
+
+#### Konsep
+- Scene = **rantai referensi preset** (bukan salinan channel): tiap langkah menyimpan
+  nomor preset (1..16), 0=kosong. Revisi preset otomatis ikut saat scene diputar.
+- Tujuan operator: sekali merangkai scene, show jalan sendiri tanpa menyentuh fader.
+- Chase TETAP global di preset (tidak berubah); scene punya pemutar sendiri.
+
+#### C++
+- `scenes[20][30]` (600 byte) di NVS (`sver` tag SCENE_VER=1) -> tahan listrik mati.
+- `sceneTick()` di dmxTask Core0: maju ke langkah non-kosong berikutnya (wrap),
+  skip preset yang sudah dihapus, apply via applyPresetToWant (fade +
+  blackout-on-move otomatis). Interval `sceneMs` clamp 100-10000ms.
+- Endpoint: `/scenes` (JSON), `/spush?s&p`, `/spop?s`, `/sclear?s`, `/splay?s|off`.
+- Cross-stop server-side: PLAY scene mematikan chase; nyalakan chase mematikan scene.
+- `/cur` tambah `sceneOn` + `scenesp`.
+
+#### UI (panel Scene, antara Preset dan Fader Bank)
+- Bank 20 pad S1-S20 (pad kosong arsir); klik = pilih scene aktif.
+- EDIT ON/OFF: saat ON, ketuk pad PRESET = append langkah berikutnya (max 30,
+  alert 'penuh'). Mode saling eksklusif dgn REKAM/HAPUS.
+- "Akhir" (pop langkah terakhir), "KOSONGKAN" (confirm), PLAY/STOP,
+  slider Speed 100-5000ms, readout 30 sel langkah (angka preset / titik).
+- `stopAuto()`: geser slider channel/fader-grup/muat preset menghentikan chase+scene.
+- Posisi speed & status PLAY tersinkron via polling /cur antar perangkat.
+
+#### Catatan desain
+- Preset tetap 16 (NVS ~8KB); scene 30 langkah boleh mereferensikan preset yang sama
+  berulang (pola alternasi). Ekspansi preset ke 30 butuh NVS ~15KB -> ditunda.
+
+---
+
+## Session 18 - 2026-08-22 14:05
+
+### Bugfix Web UI (laporan user: scene tak terlihat pilihannya, edit preset tak tersimpan visual, kadang tak bisa play)
+
+#### Akar masalah yang ditemukan & diperbaiki
+1. **Cache browser** - tidak ada header cache; setelah firmware di-update browser
+   bisa menjalankan UI lama vs endpoint baru -> gejala "bug aneh" acak.
+   Fix: `Cache-Control: no-store, must-revalidate` di sendUi().
+2. **Scene tak bisa play secara diam-diam** - /splay menerima scene kosong /
+   langkah menunjuk preset yg sudah dihapus, lalu sceneTick berhenti sendiri
+   tanpa pesan. Fix: /splay memvalidasi >=1 langkah playable; bila tidak ->
+   HTTP 409 "kosong" -> JS menampilkan alert penjelasan.
+3. **Preset terpilih tak terlihat** - selPreset hilang saat reload; highlight
+   `.pad.sel` terlalu samar. Fix: CSS .pad.sel diperkuat (border ganda kuning +
+   bg lebih terang), dan baris status `#pinfo` baru di panel Preset:
+   "Preset terpilih: #N · fade X ms · hold Y ms" (update saat muat/rekam/edit).
+4. **Edit fade/hold "tidak tersimpan"** - /psetfade diam-diam gagal 404 bila
+   preset belum ada; tidak ada konfirmasi sukses. Fix:
+   - toast hijau "disimpan ke preset #N" saat berhasil;
+   - toast peringatan "preset belum ada — rekam dulu" saat 404;
+   - REKAM kini otomatis memilih pad hasil rekam (selPreset=i) supaya
+     edit lanjutan fade/hold tepat sasaran.
+
+#### Tambahan kecil
+- Helper JS `toast(msg)` non-blocking (pengganti alert utk sukses).
+- `updatePinfo()` dipanggil di: init, muat preset, rekam, ubah fade/hold,
+  dan saat user menggeser slider channel (melepas seleksi).
+
+---
+
+## Session 20 - 2026-08-22 15:10
+
+### Live HTTP debugging terhadap ESP32 `192.168.0.2`
+
+#### Hasil endpoint
+- `GET /` -> halaman HTML berhasil, tetapi device yang sedang berjalan masih
+  menampilkan header lama `10 PAR + 8 fx`, bukan tag build terbaru.
+- `GET /cur` -> JSON valid saat dipanggil satu per satu.
+- `GET /presets` -> JSON valid; seluruh preset sempat `used:false` setelah
+  migrasi `PRESET_VER`, sehingga scene lama yang menunjuk preset 1-6 memang
+  tidak dapat dimainkan sampai preset direkam ulang.
+- `GET /scenes` -> JSON valid; Scene 1 berisi referensi `[1,2,3,4,5,6]`.
+- `GET /splay?s=1` -> `409` saat semua preset kosong (perilaku benar), lalu
+  `on` setelah preset 1 direkam (validasi scene bekerja).
+- `GET /pload?n=1` -> `404` saat preset 1 kosong (perilaku benar).
+- `GET /psave?n=1&f=100&h=500` -> `ok` (penyimpanan preset berjalan).
+
+#### Temuan jaringan
+- Saat `/cur`, `/presets`, `/scenes` ditembak paralel, sebagian request gagal.
+- Saat ditembak satu per satu, semuanya berhasil. Penyebab: `WebServer`
+  Arduino melayani koneksi secara serial, sedangkan UI lama membuka beberapa
+  `fetch` bersamaan.
+
+#### Perbaikan Session 20
+- BUILD_TAG dinaikkan `v19 -> v20`.
+- Ditambahkan wrapper `window.fetch` dengan antrean satu request aktif:
+  polling, slider, preset, dan scene tidak lagi berebut koneksi ESP32.
+- Poll `/cur` dilewati jika antrean sedang sibuk dan interval tetap 1000ms.
+- Semua request melalui wrapper memakai `cache: no-store`.
+
+#### Verifikasi wajib setelah upload
+1. Serial harus mencetak `=== DMX Web Console v20 ===`.
+2. Header web harus menampilkan `v20`, bukan `10 PAR + 8 fx`.
+3. Rekam ulang preset yang kosong sebelum menjalankan scene lama.
+
+---
+
+## Session 19 - 2026-08-22 14:45
+
+### Audit penuh (1239 baris dibaca utuh) + self-diagnostik
+
+#### Ditemukan & diperbaiki
+1. **`__BUILD__` token belum direplace di sendUi** (sisa edit sebelumnya)
+   -> ditambah `page.replace("__BUILD__", BUILD_TAG)`.
+2. **`onCur` memegang mutex selama membangun String ~3KB** (174 concat)
+   -> snapshot `memcpy(snapOut)` di bawah mutex, JSON dibangun di luar;
+   kontensi dgn task DMX Core0 turun drastis.
+3. **Tidak ada pelapor error JS** -> `window.onerror` menulis
+   "JS ERROR: <pesan>" ke baris status (merah) - bug JS tak lagi diam-diam.
+4. **Tidak ada penanda versi firmware** -> BUILD_TAG "v19": tampil di header UI
+   (span #buildtag) + Serial saat boot. Bila tag lama = cache/upload bermasalah.
+5. **Playback indicator** - saat scene main, #sinfo menampilkan
+   "▶ MEMUTAR S{n} · langkah k/30" via polling (/cur kini membawa scn/stp);
+   saat STOP, renderSteps() memulihkan teks seleksi.
+6. Polling /cur 700 -> 1000ms (beban lebih ringan utk multi-klien).
+
+#### Verifikasi struktur (grep)
+- BUILD_TAG: def(53) + Serial(1202) + sendUi replace(1037) + HTML(640) ✓
+- Semua handler scene/preset terdaftar sekali ✓
+- Tidak ada referensi tersisa ke slider global terhapus ✓
+- Mutex take/give seimbang di semua jalur ✓
+
+#### Protokol uji utk user
+1. Upload -> buka Serial: harus tercetak "=== DMX Web Console v19 ===".
+2. Hard-refresh browser sekali (Ctrl+Shift+R).
+3. Header UI harus menampilkan "v19". Bila tidak -> cache/upload, bukan kode.
+4. Bila ada interaksi mati -> lihat baris status: "JS ERROR: ..." = laporkan pesannya.
+
+---
+
+## Session 21 - 2026-08-22 15:20
+
+### Live HTTP debugging terhadap ESP32 `192.168.0.2`
+- `GET /`, `/cur`, `/presets`, dan `/scenes` berhasil saat dipanggil satu per satu.
+- Request paralel sebagian gagal, mengonfirmasi `WebServer` single-client sebagai
+  sumber bug intermiten ketika UI membuka beberapa `fetch` bersamaan.
+- Firmware live saat debugging belum memuat build tag terbaru dan `/cur` belum
+  memiliki `scn/stp`, sehingga belum menjalankan source terbaru.
+- `/presets` live menunjukkan seluruh slot kosong setelah migrasi versi; Scene 1
+  masih merujuk preset 1-6. Ini menjelaskan PLAY ditolak sebelum preset direkam.
+- `/splay?s=1` memberi HTTP 409 ketika preset rujukan kosong dan `on` setelah
+  preset 1 direkam, sesuai validasi.
+- Source aktif dinaikkan ke `BUILD_TAG v20`.
+- Ditambahkan wrapper `window.fetch` dengan antrean satu request aktif, drop polling
+  saat antrean sibuk, dan `cache: no-store` untuk request API.
+- Uji live membuat preset 1 sementara lalu menghapusnya kembali; Scene 1 dikembalikan
+  ke referensi `[1,2,3,4,5,6]`. Preset harus direkam ulang oleh user.
+
+### Verifikasi setelah upload
+1. Serial: `=== DMX Web Console v20 ===`.
+2. Header web: `v20`, bukan `10 PAR + 8 fx`.
+3. Rekam ulang preset 1-6 sebelum PLAY Scene 1.
+
+---
+
+## Session 16 - 2026-08-22 04:10
+
+### Perubahan arsitektur timing: fade & chase menjadi PER-PRESET
+
+Sebelumnya: fade & chase global (satu slider untuk semua). User ingin tiap preset
+punya konfigurasi fade/hold sendiri sehingga scene playback punya timing bervariasi.
+
+#### Model baru
+- Tiap preset menyimpan: **fade** (crossfade-in saat dimuat) + **hold**
+  (durasi tayang sebelum chase/scene melangkah ke preset berikutnya).
+- Chunk preset: [0]=used, [1..512]=channel, [513]=fade/10ms, [514]=hold/20ms.
+  `PRESET_CHUNK 513 -> 515`, `PRESET_VER 5 -> 6` (NVS lama direset).
+- `applyPresetToWant(idx)` kini mengaktifkan fade/hold milik preset:
+  `fadeMs=presetFadeMs(idx); chaseMs=hold; sceneMs=hold;`
+  -> dipakai fadeTick (crossfade) dan chaseTick/sceneTick (interval langkah).
+- Slider global Fade/Chase/Scene-Speed DIHAPUS dari panel Master & Scene
+  (beserta listener, label fn, dan parsing `/ctrl?fade|chase|scenesp` serta `/chase?sp`).
+
+#### UI & endpoint
+- Panel Preset: slider **Fade** (0-2s) & **Hold** (0.1-5s).
+  - input = update label; persist `/psetfade?n&f&h` hanya saat `change` (hemat flash).
+  - Memuat preset (pad) = slider ikut nilai f/h preset tsb.
+  - REKAM menyimpan nilai f/h slider ke preset (`/psave?...&f=&h=`).
+- `/psetfade` baru: ubah fade/hold tanpa rekam ulang (mutex + savePresets).
+- `presetsJson`/`exportJson` sertakan `"f"`/`"h"` (ms); `importJson` parse keduanya
+  (default 600/1500 bila absen), tetap bounded per objek.
+
+---
+
+## Session 17 - 2026-08-22 13:35
+
+### Perbaikan UX scene EDIT: langkah duplikat berurutan
+- Laporan user: Scene 1 terisi [1,2,2,2,2,2,2,2] — ketukan ganda membuat
+  langkah redundan (feedback append datang belakangan).
+- Server `/spush`: tolak push bila preset sama dgn langkah terakhir terisi
+  (HTTP 409 "dup") — langkah identik berurutan redundan secara fungsi
+  (hold per-preset; nilai sama = tanpa transisi).
+- JS onPad (sceneEdit): optimistic UI (langkah langsung tampil di readout),
+  cek duplikat di klien lebih dulu dgn pesan di `#sinfo`, reload dari server
+  sebagai koreksi.
+
+---
+## Session 22 - 2026-08-22 17:50
+
+### Fail-proof hardening (STATE, SELECT, SAVE, HEALTH) - BUILD_TAG v22
+- Server seleksi authoritative: selectedPreset/selectedScene/stateRevision/nvsDirty.
+- Endpoint baru: /select, /save (POST), /health.
+- Import: markStateChanged supaya rekap UI sinkron setelah import.
+- UI: api() wrapper (antrean HTTP + JSON error), state.id active Authoritative,
+  Save Data button + status, .pad.playing (selain .pad.sel),
+  panel grid desktop (max 1440px, scene & preset panel terpisah, mobile order).
+- Protokol uji: upload v22 -> Serial "=== DMX Web Console v22 ===" -> buka web,
+  verifikasi selected state + Save Data + Health (jika ada UI diag).
+
+## Session 23 - 2026-08-22 20:10
+
+### Bugfix laporan user (3 bug) - BUILD_TAG v22 -> v23
+
+1. renderSceneBank is not defined (popup saat KOSONGKAN Scene 1)
+   - Akar: fungsi dipanggil 5x (klik pad, syncFromServer, reloadScenes, onSPlay)
+     tetapi DEFINISINYA HILANG sejak refactor buildSceneBank.
+   - Fix: tambah renderSceneBank() berbasis class-toggle tanpa rebuild DOM
+     (empty/sel/playing mengikuti SCN, selScene, sceneOn, serverScene).
+
+2. Scene/Preset terpilih tidak berubah warna
+   - Akar scene: exception renderSceneBank memutus handler klik SEBELUM class
+     sel dipasang dan sebelum sinfo diperbarui.
+   - Akar preset: style .pad.sel hampir tak terlihat (bg #3a3321 vs dasar #262b33).
+   - Fix CSS: .pad.sel = fill kuning accent penuh + teks gelap;
+     .pad.playing = fill hijau penuh. Terlihat jelas di PC maupun HP.
+
+3. Fade reset ke 600ms setelah pindah preset
+   - Akar: /psetfade sukses di server (toast tampil), tetapi array lokal
+     presetsData[] tidak diperbarui -> onPad membaca nilai basi saat kembali.
+   - Fix: setelah /psetfade sukses, perbarui presetsData[selPreset].f/.h lokal.
+   - Extra: fallback onPad kini typeof p.f==='number'&&p.f>0 agar nilai 0
+     dari data rusak tidak diam-diam menjadi 600.
+
+### Verifikasi
+- grep: renderSceneBank def(1068) + 4 caller OK; BUILD_TAG v23(53).
+- Audit daftar definisi fungsi vs pemanggil: tidak ada yang hilang lagi.
+
+## Session 24 - 2026-08-22 21:00 - BUILD_TAG v23 -> v24
+
+### Laporan: lampu tidak menyala + desinkron web
+- Ternyata penyebab utama = salah setting DMX address di fixture (bukan kode).
+- Permintaan tetap yang dieksekusi: saat halaman dibuka/refresh, UI otomatis
+  memulihkan SELURUH state dari ESP32.
+- Yang sudah ada sebelumnya: /cur (channel+master+playback+selection),
+  /presets (metadata), scenes via token injeksi.
+- Yang ditambahkan v24: setelah refreshPresets masuk, slider Fade/Hold
+  dipulihkan dari preset terpilih (applyFadeOfSelected), dan dipanggil juga
+  ketika seleksi preset berubah via polling. Sebelumnya dua slider ini
+  tetap di default 600/1500 sampai user mengetuk pad manual.
+
+### Verifikasi
+- BUILD_TAG v24 (53); applyFadeOfSelected def(1155) + caller(979,1151).
+
+## Session 25 - 2026-08-22 21:15 - BUILD_TAG v24 -> v25
+
+### Fitur: EDIT MODE / SHOW MODE (pengganti tombol PLAY)
+- Tombol PLAY dihapus dari panel Scene.
+- Dua mode eksklusif: EDIT MODE (merah saat aktif) dan SHOW MODE (hijau saat aktif).
+- EDIT MODE: klik pad scene = pilih utk diedit; TIDAK menghasilkan output apa pun
+  (masuk mode otomatis stopAuto() -> chase & scene berhenti). Pop/Akhir dan
+  KOSONGKAN hanya aktif di mode ini (disabled di luar nya).
+- SHOW MODE (default): klik pad scene = LANGSUNG memutar rantai presetnya
+  (pengganti PLAY, penting utk ketepatan ketukan terhadap nada lagu).
+  Klik scene yang sedang diputar = STOP.
+- Preset pad tetap live di SHOW MODE (muat preset instan), REKAM/HAPUS tetap
+  berlaku untuk bank preset.
+- applySceneBtn() aman tanpa elemen tombol PLAY; status playback kini tampil
+  via #sinfo (polling).
+
+### Fix tuntas bug Fade reset ke 600ms
+- Setelah /psetfade sukses, UI kini melakukan reconciliasi otoritatif:
+  refreshPresets() menarik ulang data dari server. Sebelumnya hanya patch lokal
+  yang bisa basi bila ada race/perangkat lain.
+- onPad fallback nilai f/h diperkuat (tolak 0/tipe salah).
+
+---
+
+## Session 26 - 2026-08-22 21:30 - BUILD_TAG v25 -> v26
+
+### Tombol Cek/Play kembali di panel Scene
+- Tombol "? Cek" (id btnSPlay) ditambahkan kembali di baris tombol mode,
+  TANPA menghapus EDIT MODE / SHOW MODE.
+- Fungsi: memutar scene TERPILIH (highlight kuning) utk dicek, berlaku di
+  mode EDIT maupun SHOW. Saat sedang main, tombol berubah jadi STOP.
+- Stop branch memakai stopAuto() agar request /splay?off=1 benar terkirim
+  (bug urutan: sceneOn dinolkan sebelum stopAuto -> off tak terkirim; sudah
+  diperbaiki dgn memanggil stopAuto() langsung).
+- applySceneBtn() tetap aman (guard null) dan kembali memperbarui label tombol.
+
+## Session 27 - 2026-08-22 23:40 - BUILD_TAG v26 -> v27
+
+### Fix 1: Fade tidak tersimpan (asimetri dgn Hold)
+- Jalur simpan Fade & Hold disatukan: satu fungsi persistTiming() dipakai
+  kedua slider (persis pola Hold yang terbukti).
+- Akar persepsi "tidak tersimpan": fallback tampilan p.f||600 MENUTUPI nilai
+  fade 0 / kecil. Sekarang p.f>=0 ditampilkan apa adanya (0 = snap, sah).
+- Reconcile refreshPresets() setelah simpan tetap ada.
+
+### Fix 2: Scene tahan hapus preset (snapshot-semantics ringan)
+- Masalah user: hapus preset 2 -> scene 1-2-3 tinggal main 1 & 3.
+- Solusi hemat memori (tanpa salinan 300KB): HAPUS PRESET = SEMBUNYIKAN.
+  /pclear kini hanya men-set used=0; data channel [1..512] + f/h TETAP UTUH.
+- sceneTick & /splay: langkah playable selama nomor preset valid (1..16),
+  flag used tidak dipersyaratkan. Jadi preset tersembunyi tetap dimainkan
+  scene selamanya, sampai slot itu di-REKAM ulang (konten baru sengaja).
+- Bank UI tetap menampilkan hatch kosong utk preset tersembunyi (sinyal visual).
+
+### Fix 3: Export selalu sertakan channel
+- exportJson: array c diekspor utk SEMUA preset (termasuk used=0) supaya
+  import antar device tidak merusak scene; reserve 36000 -> 42000.
+
+---
+
+## Session 28 - 2026-08-23 14:40 - BUILD_TAG v27 -> v28 (NVS compact + Load Data)
+
+### Akar masalah "Save Data lalu reboot balik default" (TERKONFIRMASI)
+- Serial user: `E (1470) phy_init: store_cal_data_to_nvs_handle: store
+  calibration data failed(0x1105)` = ESP_ERR_NVS_NOT_ENOUGH_SPACE.
+- Partisi NVS (~20KB) PENUH/terfragmentasi: format lama menulis blob utuh
+  presets 16x515 = 8.240 byte tiap simpan + WiFi cal ikut gagal ditulis.
+- Jadi Save Data tidak pernah benar-benar persisten di v27.
+
+### Fix: Format penyimpanan kompak (storage rewrite)
+- Hapus loadPresets/savePresets/loadScenes/saveScenes/saveData + kedua
+  snapshot besar (savePresetsSnapshot/saveScenesSnapshot).
+- Baru: PATCH_CH_TOTAL=176 (channel tertinggi patch FOG2=174+margin),
+  COMPACT_CHUNK=179 byte/preset ([0]=used [1]=fade/10ms [2]=hold/20ms
+  [3..178]=CH1..176). Total pc=2.864 B, sc=600 B (~3,5KB vs ~8,8KB lama).
+- persistAll(): snapshot di bawah dmxMutex, tulis NVS di LUAR mutex.
+  Kunci baru: sver2=STORAGE_VER(7), pc, sc, selP, selS.
+- loadAll(): bila sver2 != 7 -> nvs.clear() sekali untuk RECLAIM ruang NVS
+  yang penuh/terfragmentasi (menghapus key lama ver/presets/sver/scenes),
+  mulai bersih dari default. Serial: "NVS: format lama terdeteksi".
+- loadData(): baca-balikkan NVS -> RAM tanpa clear (untuk tombol Load Data).
+
+### Fitur baru: tombol Load Data
+- Endpoint GET /loaddata -> onLoadData() -> loadData(); 404 no_saved_data
+  bila belum ada data valid. Rute didaftarkan setelah /save.
+- UI: tombol #btnLoadData "Load Data" di actions row sebelah Save Data;
+  confirm() dulu; sukses -> refreshPresets()+reloadScenes().
+- Semua penulis state kini lewat persistAll() (satu sumber kebenaran):
+  capturePreset, importJson, onSPush/Pop/Clear, onPresetFade, onPresetClear.
+
+### Bersih-bersih
+- Konstanta tak terpakai dihapus: UI_STATE_VER, SCENE_VER.
+- PRESET_VER tetap ada (versi format file export JSON saja).
+
+### Verifikasi statis
+- grep: 0 sisa savePresets/saveScenes/loadPresets()/loadScenes()/saveData();
+  persistAll x8 call site; loadAll di setup; /loaddata + btnLoadData OK;
+  refreshPresets/reloadScenes terdefinisi; BUILD_TAG v28 konsisten
+  (boot banner, header web __BUILD__, /health).
+
+### Protokol uji (user)
+1. Salin examples/dmx_web_rgb.ino -> Documents/Arduino/DMX512/DMX512.ino,
+   upload. Serial HARUS tampil `=== DMX Web Console v28 ===`.
+2. Boot pertama v28: harap baris "NVS: format lama terdeteksi -> clear()"
+   dan error phy_init 0x1105 HARUS hilang pada boot-boot berikutnya.
+3. Rekam ulang preset (format berubah, data lama dibuang) -> Save Data ->
+   cabut daya -> nyalakan -> preset harus tetap ada.
+4. Uji tombol Load Data: ubah sesuatu tanpa Save -> klik Load Data ->
+   kembali ke kondisi tersimpan terakhir.
+5. Opsional (sekali saja, jika phy_init masih muncul): Tools > Erase Flash,
+   lalu upload ulang & konfigurasi awal.
+
+## Session 29 - 2026-08-23 16:25 - Verifikasi Import/Export pasca-v28 (tanpa perubahan kode)
+
+- Permintaan lama user (import/export preset) SUDAH terimplementasi dan
+  kompatibel dgn format storage kompak v28:
+  * Tombol "Ekspor"/"Impor" di baris bank preset (#btnExport/#btnImport,
+    input file tersembunyi #fileIn, accept .json).
+  * GET /export -> onExport() -> exportJson(): 16 slot lengkap
+    {u=used,f=fade,h=hold,c[512]}, channel diekspor utk SEMUA preset
+    (termasuk used=0) agar scene antar-device tetap utuh; reserve 42000.
+  * POST /import (multipart, maks 64KB) -> importJson(): parse manual
+    tanpa alloc String per token; commit hanya slot yg ada di file;
+    persisten otomatis lewat persistAll() (sudah diganti dr savePresets
+    saat refactor v28) -> tidak perlu tekan Save Data setelah Impor.
+- Catatan: ini alur file via browser (komputer/HP). Simpan show langsung
+  di flash ESP32 (slot show LittleFS/SD) BELUM ada - opsional bila diminta.

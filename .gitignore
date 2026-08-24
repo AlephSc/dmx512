@@ -1,0 +1,15 @@
+# Arduino
+*.elf
+*.bin
+build/
+**/.pio/
+.pio/
+
+# Kilo tooling (internal, bukan source)
+.kilo/node_modules/
+.kilo/agent-manager.json
+
+# OS / editor
+Thumbs.db
+.DS_Store
+*.swp
