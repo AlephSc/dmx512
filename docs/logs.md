@@ -1033,3 +1033,46 @@ Paritas dengan Web UI `/export` — export data preset lengkap (semua 512 channel 
 Desktop will call this once on demand (Export button) and save to a `.json` file. Import over serial is deferred to phase 4 (HTTP) due to upload complexity.
 
 Upload v37 dan uji: ketik `EXPORT`, lalu copy output besar ke Notepad dan simpan sebagai `dmx-export.json`.
+
+## Session 38 - 2026-08-26 01:05 - Firmware v38 + Desktop Controller v1 (PySide6)
+
+### Firmware v38
+- FIX unit REC/PFH: kini menerima milidetik persis seperti web
+  (sebelumnya argumen dikali 10/20 -> hasil salah/clamped).
+- Perintah baru `ALL on/off` (paritas tombol Blackout & PAR Full web):
+  off = nol-kan semua manualWant; on = 255 hanya utk PAR (aman perangkat).
+- BUILD_TAG v38.
+
+### Desktop Controller v1 (folder desktop/)
+Aplikasi Windows (PySide6) kontroler penuh via USB serial, sinkron dua arah
+dengan Web UI lewat protokol paritas v35-v38:
+- transport.py  : SerialTransport (reader thread + request/response ber-lock),
+                  auto-detect COM via VID (CH340/CP210x/FTDI/Espressif).
+- worker.py     : SerialWorker di QThread; proses antrean perintah lalu
+                  polling GET 250ms -> sinkron realtime dua arah.
+- state.py      : DeviceState (fixtures/groups/presets/scenes/live) +
+                  channel_labels() mirror dari labelOf() web.
+- ui/widgets.py : VFader (slider vertikal console-style) + PadButton.
+- ui/mixer_tab  : Master, Strobe, Blackout, PAR Full, Chase, 8 fader grup,
+                  fader per-channel semua fixture (dibangun dari LISTF/LISTG).
+- ui/presets_tab: 16 pad (warna preview dari LISTP), klik=SELP+PSL,
+                  REC (idim+fade+hold), PDEL, PFH update timing.
+- ui/scenes_tab : 20 pad, PLAY/STOP, editor langkah (SPUSH/SPOP/SCLR),
+                  indikator langkah yang sedang main.
+- ui/system_tab : SAVE/LOAD NVS, EXPORT ke file .json, status + log.
+- main.py       : MainWindow, wiring sinyal, shortcut (Space=ALL off,
+                  Esc=SSTOP), refresh LISTP/LISTS otomatis setelah perintah
+                  yang mengubah data.
+- requirements.txt (PySide6, pyserial), build.bat (PyInstaller onefile),
+  README.md (cara pakai, build, tabel protokol lengkap).
+- Proteksi "active keys": slider yang sedang digeser tidak ditimpa sync.
+- Verifikasi: python -m py_compile semua file -> SYNTAX OK.
+
+### Uji (user)
+1. Upload firmware v38 ke ESP32.
+2. PC: `pip install -r desktop/requirements.txt` lalu
+   `python desktop/main.py` -> pilih COM -> SAMBUNG.
+3. Geser fader di .exe dan di web bergantian -> keduanya sinkron.
+4. REKAM preset dari .exe, mainkan scene, SAVE DATA, cabut-colok USB ->
+   sambung lagi, data tetap ada.
+5. Build exe: jalankan desktop/build.bat -> dist/DMX512Controller.exe.

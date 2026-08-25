@@ -51,7 +51,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v37"
+#define BUILD_TAG "v38"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -1718,9 +1718,11 @@ void handleSerialCmd(String cmd){
      return;
    }
 
-   // REC <n> <idim> <f> <h> -> rekam preset n dengan fade/hold (ms)
+   // REC <n> <idim> <f_ms> <h_ms> -> rekam preset n (fade/hold dalam ms, sama seperti web)
    if(op=="REC"){
-     int n=serArgInt(args,0)-1; bool idim=serArgInt(args,1)==1; long f=serArgInt(args,2)*10, h=serArgInt(args,3)*20;
+     int n=serArgInt(args,0)-1; bool idim=serArgInt(args,1)==1;
+     long f=serArgInt(args,2); if(f<0)f=0; if(f>2550)f=2550;
+     long h=serArgInt(args,3); if(h<100)h=100; if(h>5000)h=5000;
      if(n>=0&&n<N_PRESETS){
        capturePreset(n,idim,(uint16_t)f,(uint16_t)h);
        selectedPreset=n;
@@ -1729,16 +1731,18 @@ void handleSerialCmd(String cmd){
      return;
    }
 
-   // PFH <n> <f> <h> -> ubah fade/hold preset n tanpa mengubah data
+   // PFH <n> <f_ms> <h_ms> -> ubah fade/hold preset n tanpa mengubah data
    if(op=="PFH"){
-     int n=serArgInt(args,0)-1; long f=serArgInt(args,1)*10, h=serArgInt(args,2)*20;
+     int n=serArgInt(args,0)-1;
+     long f=serArgInt(args,1); if(f<0)f=0; if(f>2550)f=2550;
+     long h=serArgInt(args,2); if(h<100)h=100; if(h>5000)h=5000;
      if(n>=0&&n<N_PRESETS&&presets[n][0]){
        xSemaphoreTake(dmxMutex,portMAX_DELAY);
-       presets[n][513]=(uint8_t)(f/10); presets[n][514]=(uint8_t)(h/20);
+       presets[n][513]=(uint8_t)constrain(f/10,0,255); presets[n][514]=(uint8_t)constrain(h/20,5,250);
        xSemaphoreGive(dmxMutex);
        persistAll(); stateRevision++;
        Serial.println("{\"ok\":true}");
-     } else Serial.println("{\"ok\":false,\"err\":\"PFH <n> <f> <h>\"}");
+     } else Serial.println("{\"ok\":false,\"err\":\"PFH <n> <f_ms> <h_ms>\"}");
      return;
    }
 
@@ -1827,6 +1831,28 @@ void handleSerialCmd(String cmd){
      chaseOn = args.indexOf("on",0)>=0;
      if(chaseOn){ sceneOn=false; sceneIdx=-1; sceneStep=-1; chaseNextAt=millis(); }
      else { chaseOn=false; chaseIdx=-1; }
+     stateRevision++;
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+
+   // ALL on/off -> paritas /ctrl?all= (Blackout / PAR Full aman perangkat)
+   if(op=="ALL"){
+     bool on = args.indexOf("on")>=0;
+     xSemaphoreTake(dmxMutex,portMAX_DELAY);
+     for(int f=0;f<N_FIX;f++){
+       bool safe = (fix[f].type==FX_PAR);   // hanya PAR yg boleh "full"
+       for(uint16_t c=0;c<fix[f].foot;c++){
+         uint16_t ch=fix[f].start+c;
+         uint8_t v = on ? (safe?255:0) : 0;
+         manualWant[ch]=v; manualTouched[ch]=millis();
+       }
+     }
+     recomputeWant();
+     for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
+       uint16_t ch=fix[f].start+c; out[ch]=want[ch];   // snap langsung
+     }
+     xSemaphoreGive(dmxMutex);
      stateRevision++;
      Serial.println("{\"ok\":true}");
      return;
