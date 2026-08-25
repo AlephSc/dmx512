@@ -11,7 +11,8 @@ class SerialWorker(QObject):
     data_received = Signal(str, object)  # LISTF/LISTG/LISTP/LISTS/EXPORT
     command_done = Signal(str, object)   # cmd, respons JSON (atau None)
 
-    POLL_INTERVAL = 0.25  # detik antar GET
+    POLL_INTERVAL = 0.25  # detik antar GET (sinkron slider realtime)
+    DATA_INTERVAL = 3.0   # detik antar refresh LISTP/LISTS (data struktural)
 
     def __init__(self, transport):
         super().__init__()
@@ -27,6 +28,7 @@ class SerialWorker(QObject):
 
     def run(self):
         last_poll = 0.0
+        last_data = 0.0
         while self._running and self.transport.connected:
             # 1) perintah dari UI dulu (prioritas)
             try:
@@ -49,5 +51,12 @@ class SerialWorker(QObject):
                 # None bisa berarti ESP32 sibuk (mis. tulis NVS/EXPORT) -> lewati
                 if isinstance(st, dict) and "master" in st:
                     self.state_received.emit(st)
-            else:
-                time.sleep(0.02)
+            # 3) refresh data struktural (preset/scene) tiap DATA_INTERVAL
+            #    -> perubahan yang dibuat dari Web UI/device lain ikut
+            #    terdeteksi desktop tanpa perlu reconnect.
+            if now - last_data >= self.DATA_INTERVAL:
+                last_data = now
+                self.cmd_queue.put(("LISTP", "LISTP"))
+                self.cmd_queue.put(("LISTS", "LISTS"))
+                continue
+            time.sleep(0.02)

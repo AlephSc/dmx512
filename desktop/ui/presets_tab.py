@@ -117,14 +117,22 @@ class PresetsTab(QWidget):
                 p.set_used(pr.get("r", 0), pr.get("g", 0), pr.get("b", 0), i == sel)
             else:
                 p.clear_color(i == sel)
-        # isi spinbox fade/hold hanya saat pemilihan berubah (jangan ganggu editing)
-        if sel != self._last_sel:
-            self._last_sel = sel
-            if 0 <= sel < 16:
-                pr = st.preset(sel)
+        if 0 <= sel < 16:
+            pr = st.preset(sel)
+            # isi spinbox saat pemilihan berubah ATAU saat nilainya diubah dari
+            # sisi lain (web) — selama spinbox tidak sedang difokus user.
+            if sel != self._last_sel:
+                self._last_sel = sel
                 self.sel_lbl.setText(f"Terpilih: #{sel+1}")
                 if pr:
                     self.sp_f.setValue(int(pr.get("f", 600)))
                     self.sp_h.setValue(int(pr.get("h", 1500)))
-            else:
+            elif pr:
+                if not self.sp_f.hasFocus() and self.sp_f.value() != int(pr.get("f", 600)):
+                    self.sp_f.setValue(int(pr.get("f", 600)))
+                if not self.sp_h.hasFocus() and self.sp_h.value() != int(pr.get("h", 1500)):
+                    self.sp_h.setValue(int(pr.get("h", 1500)))
+        else:
+            if sel != self._last_sel:
+                self._last_sel = sel
                 self.sel_lbl.setText("Terpilih: -")
