@@ -1019,3 +1019,17 @@ Data ini dipanggil sekali saat koneksi dibuka ? disimpan lokal di desktop ? digu
 - Desktop akan memanggil GET, LISTF, LISTG setelah connect, lalu meng-cache seluruh state.
 
 Upload v36 dan uji `LISTF` + `LISTG` via Serial Monitor sebelum build desktop .exe.
+
+## Session 37 - 2026-08-26 00:05 - Firmware v36 -> v37 (EXPORT parity)
+
+### Tujuan
+Paritas dengan Web UI `/export` — export data preset lengkap (semua 512 channel per preset) ke serial untuk backup/transfer antar device via desktop .exe. Karena format sama dengan JSON web, desktop bisa parse dan save ke disk (`presets.json`). Note: response ~42KB ? sekitar 3-4 detik di 115200 baud. OK untuk MVP v1.
+
+### Perintah baru
+| Perintah | Deskripsi | Response |
+|---|---|---|
+| `EXPORT` | Balas full export JSON (`exportJson()`) | `{"app":"DMX-RGB","ver":PRESET_VER,"presets":[...]}` |
+
+Desktop will call this once on demand (Export button) and save to a `.json` file. Import over serial is deferred to phase 4 (HTTP) due to upload complexity.
+
+Upload v37 dan uji: ketik `EXPORT`, lalu copy output besar ke Notepad dan simpan sebagai `dmx-export.json`.
