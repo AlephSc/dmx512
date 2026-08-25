@@ -71,6 +71,9 @@ class MainWindow(QMainWindow):
             t.cmd.connect(self.send_cmd)
         self.tab_mixer.active.connect(self._on_active)
         self.tab_system.export_requested.connect(self._do_export)
+        self.tab_system.import_requested.connect(self._do_import)
+        # EDIT MODE scene -> klik pad preset menambah langkah (bukan play)
+        self.tab_scenes.edit_mode_changed.connect(self.tab_presets.set_scene_edit)
 
         # status bar
         self.status_lbl = QLabel("Siap.")
@@ -169,6 +172,55 @@ class MainWindow(QMainWindow):
         self._set_status("Meminta EXPORT dari ESP32 (±4 detik)...")
         self._worker.cmd_queue.put(("EXPORT", "EXPORT"))
 
+    def _do_import(self):
+        """Import file hasil EXPORT (.json) ke ESP32 via protokol batch serial.
+
+        Alur: IMPORT_BEGIN -> per preset: IMPORT_P + 8x IMPORT_C (64 ch/baris)
+        -> IMPORT_END (commit + persist NVS) -> refresh LISTP.
+        Round-trip penuh ±146 perintah ≈ 3-6 detik di 115200 baud.
+        """
+        if self._worker is None:
+            self._set_status("Belum terhubung.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Pilih file export preset", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"File tidak valid: {e}")
+            return
+        presets = data.get("presets") if isinstance(data, dict) else None
+        if not isinstance(presets, list) or not presets:
+            self._set_status("Format bukan file export DMX-RGB (kurang 'presets').")
+            return
+        q = self._worker.cmd_queue
+        q.put(("cmd", "IMPORT_BEGIN"))
+        n_total = 0
+        CHUNK = 64
+        for idx, pr in enumerate(presets[:16]):
+            if not isinstance(pr, dict):
+                continue
+            n = idx + 1
+            u = 1 if pr.get("u") else 0
+            f_ms = int(pr.get("f", 600))
+            h_ms = int(pr.get("h", 1500))
+            q.put(("cmd", f"IMPORT_P {n} {u} {f_ms} {h_ms}"))
+            chans = pr.get("c", [])
+            for off in range(0, 512, CHUNK):
+                seg = chans[off:off + CHUNK]
+                if not seg:
+                    break
+                vals = ",".join(str(int(v) & 0xFF) for v in seg)
+                q.put(("cmd", f"IMPORT_C {n} {off} {vals}"))
+            n_total += 1
+        q.put(("cmd", "IMPORT_END"))
+        q.put(("LISTP", "LISTP"))
+        self._set_status(f"Import {n_total} preset dikirim ke ESP32 (±5 detik)...")
+        self.tab_system.log(f"Import dari {path} ({n_total} preset) dikirim.")
+
     def _on_active(self, key, pressed):
         if pressed:
             self.active_keys.add(key)
@@ -254,6 +306,10 @@ QPushButton:hover { background:#343a44; }
 QPushButton:pressed { background:#22262d; }
 QPushButton#goBtn { background:#1b5e20; border-color:#2e7d32; }
 QPushButton#goBtn:hover { background:#2e7d32; }
+QPushButton#editBtn { background:#457b9d; color:#fff; }
+QPushButton#editBtn:hover { background:#1d3557; }
+QPushButton#showBtn { background:#2e7d32; color:#fff; }
+QPushButton#sceneTab { font-weight:bold; }
 QPushButton#dangerBtn { background:#7f1d1d; border-color:#b91c1c; }
 QPushButton#dangerBtn:hover { background:#b91c1c; }
 QComboBox, QSpinBox { background:#232733; color:#dfe3ea; border:1px solid #3a3f4b;

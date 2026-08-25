@@ -51,7 +51,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v38"
+#define BUILD_TAG "v39"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -1589,6 +1589,11 @@ TaskHandle_t dmxTaskHandle = NULL;
 // Tidak ada logika khusus serial; hanya menerjemahkan teks ke layer.
 static String serialLine = "";
 
+// --- Staging buffer untuk SERIAL IMPORT BATCH (v39) ---
+static uint8_t  serImport[N_PRESETS][PRESET_CHUNK];
+static bool     serImportActive=false;
+static bool     serImportProvided[N_PRESETS]={false};
+
 // Helper: ambil argumen integer ke-n dari string (split by space)
 static int serArgInt(const String& args, int idx){
   String s=args.trim();
@@ -1873,6 +1878,68 @@ void handleSerialCmd(String cmd){
    // EXPORT -> dump lengkap preset (paritas /export web, utk backup desktop)
    if(op=="EXPORT"){ Serial.println(exportJson()); return; }
 
+   // --- IMPORT BATCH via serial (v39, paritas /import web) ---
+   // Alur: IMPORT_BEGIN -> (IMPORT_P + IMPORT_C per preset) -> IMPORT_END
+   if(op=="IMPORT_BEGIN"){
+     memset(serImport,0,sizeof(serImport));
+     memset(serImportProvided,0,sizeof(serImportProvided));
+     serImportActive=true;
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+   if(op=="IMPORT_P"){            // IMPORT_P <n> <u> <f_ms> <h_ms>
+     if(!serImportActive){ Serial.println("{\"ok\":false,\"err\":\"IMPORT_BEGIN dulu\"}"); return; }
+     int n=serArgInt(args,0); int u=serArgInt(args,1);
+     long f=serArgInt(args,2); if(f<0)f=0; if(f>2550)f=2550;
+     long h=serArgInt(args,3); if(h<100)h=100; if(h>5000)h=5000;
+     if(n>=1&&n<=N_PRESETS){
+       uint8_t* row=serImport[n-1];
+       row[0]=u?1:0;
+       row[513]=(uint8_t)constrain(f/10,0,255);
+       row[514]=(uint8_t)constrain(h/20,5,250);
+       serImportProvided[n-1]=true;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"n 1-16\"}");
+     return;
+   }
+   if(op=="IMPORT_C"){            // IMPORT_C <n> <off> v1,v2,... (maks 64 nilai)
+     if(!serImportActive){ Serial.println("{\"ok\":false,\"err\":\"IMPORT_BEGIN dulu\"}"); return; }
+     int n=serArgInt(args,0); int off=serArgInt(args,1);
+     if(n<1||n>N_PRESETS||off<0||off>=512){ Serial.println("{\"ok\":false,\"err\":\"IMPORT_C <n> <off> ...\"}"); return; }
+     int p1=args.indexOf(' '); int p2=(p1>=0)?args.indexOf(' ',p1+1):-1;
+     if(p2<0){ Serial.println("{\"ok\":false,\"err\":\"tanpa nilai\"}"); return; }
+     String vals=args.substring(p2+1);
+     uint8_t* row=serImport[n-1];
+     int idx=off, start=0;
+     while(start<=(int)vals.length() && idx<512){
+       int comma=vals.indexOf(',',start);
+       String t=(comma<0)?vals.substring(start):vals.substring(start,comma);
+       t.trim();
+       if(t.length()>0){ row[1+idx]=(uint8_t)constrain(t.toInt(),0,255); idx++; }
+       if(comma<0) break;
+       start=comma+1;
+     }
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+   if(op=="IMPORT_END"){
+     if(!serImportActive){ Serial.println("{\"ok\":false,\"err\":\"IMPORT_BEGIN dulu\"}"); return; }
+     int found=0;
+     for(int i=0;i<N_PRESETS;i++) if(serImportProvided[i]) found++;
+     if(found==0){ Serial.println("{\"ok\":false,\"err\":\"tidak ada preset\"}"); return; }
+     // Commit: timpa HANYA baris yang dikirim (sisanya tidak disentuh),
+     // sama persis dengan semantik importJson() di web.
+     xSemaphoreTake(dmxMutex,portMAX_DELAY);
+     for(int i=0;i<N_PRESETS;i++)
+       if(serImportProvided[i]) memcpy(presets[i],serImport[i],PRESET_CHUNK);
+     xSemaphoreGive(dmxMutex);
+     serImportActive=false;
+     markStateChanged();
+     persistAll();
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+
    // --- End parity commands ---
 
    Serial.println("{\"ok\":false,\"err\":\"unknown cmd\"}");
@@ -1886,7 +1953,7 @@ void processSerialIn(){
     if(c=='\n'){
       if(serialLine.length()>0) handleSerialCmd(serialLine);
       serialLine="";
-    } else if(c!='\r' && serialLine.length()<256){
+    } else if(c!='\r' && serialLine.length()<384){
       serialLine+=c;
     }
   }

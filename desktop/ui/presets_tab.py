@@ -1,7 +1,7 @@
 # Tab PRESET: bank 16 pad + rekam/hapus + fade/hold per preset.
+# Integrasi scene-edit mode (paritas Web): saat EDIT MODE aktif, klik pad preset menambah langkah ke scene terpilih (SPUSH).
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-                               QLabel, QSpinBox, QCheckBox, QPushButton)
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSpinBox, QCheckBox, QPushButton
 
 from ui.widgets import PadButton
 
@@ -12,14 +12,21 @@ class PresetsTab(QWidget):
     def __init__(self):
         super().__init__()
         self.pads = []
-        self._last_sel = -2   # utk hindari overwrite spinbox saat user mengedit
+        self.scene_edit = False            # False = normal play mode; True = edit mode scene (klik pad = SPUSH)
+        self.sel_scene = -1                # scene ter-pilih utk SPUSH (dari ScenesTab)
+        self._last_sel = -2
+        self.hint_lbl = None
         self._build()
 
     def _build(self):
         root = QVBoxLayout(self)
-        lbl = QLabel("PRESET BANK (klik = pilih + mainkan)")
+        lbl = QLabel("PRESET BANK")
         lbl.setObjectName("sectLbl")
         root.addWidget(lbl)
+        self.hint_lbl = QLabel("(klik pad = pilih + mainkan preset)")
+        self.hint_lbl.setObjectName("hintLbl")
+        self.hint_lbl.setStyleSheet("color:#9aa4b2;font-size:11px;")
+        root.addWidget(self.hint_lbl)
 
         grid = QGridLayout()
         grid.setSpacing(6)
@@ -30,31 +37,21 @@ class PresetsTab(QWidget):
             self.pads.append(p)
         root.addLayout(grid)
 
-        # --- preset terpilih: fade/hold + hapus
-        sel = QHBoxLayout()
-        self.sel_lbl = QLabel("Terpilih: -")
-        sel.addWidget(self.sel_lbl)
-        sel.addStretch(1)
-        sel.addWidget(QLabel("Fade"))
-        self.sp_f = QSpinBox()
-        self.sp_f.setRange(0, 2550); self.sp_f.setSingleStep(50)
-        self.sp_f.setSuffix(" ms"); self.sp_f.setValue(600)
-        sel.addWidget(self.sp_f)
-        sel.addWidget(QLabel("Hold"))
-        self.sp_h = QSpinBox()
-        self.sp_h.setRange(100, 5000); self.sp_h.setSingleStep(100)
-        self.sp_h.setSuffix(" ms"); self.sp_h.setValue(1500)
-        sel.addWidget(self.sp_h)
+        row = QHBoxLayout()
         b_fh = QPushButton("Update F/H")
         b_fh.clicked.connect(self._on_fh)
-        sel.addWidget(b_fh)
+        row.addWidget(b_fh)
         b_del = QPushButton("HAPUS")
         b_del.setObjectName("dangerBtn")
         b_del.clicked.connect(self._on_del)
-        sel.addWidget(b_del)
-        root.addLayout(sel)
+        row.addWidget(b_del)
+        row.addStretch(1)
+        root.addLayout(row)
 
-        # --- rekam preset baru
+        self.info_lbl = QLabel("Terpilih: -")
+        self.info_lbl.setObjectName("infoLbl")
+        root.addWidget(self.info_lbl)
+
         rec = QHBoxLayout()
         rec.addWidget(QLabel("REKAM output saat ini ke preset:"))
         self.sp_rec = QSpinBox()
@@ -63,15 +60,15 @@ class PresetsTab(QWidget):
         self.chk_idim = QCheckBox("tanpa dimmer")
         rec.addWidget(self.chk_idim)
         rec.addWidget(QLabel("Fade"))
-        self.sp_rf = QSpinBox()
-        self.sp_rf.setRange(0, 2550); self.sp_rf.setSingleStep(50)
-        self.sp_rf.setSuffix(" ms"); self.sp_rf.setValue(600)
-        rec.addWidget(self.sp_rf)
+        self.sp_f = QSpinBox()
+        self.sp_f.setRange(0, 2550); self.sp_f.setSingleStep(50)
+        self.sp_f.setSuffix(" ms"); self.sp_f.setValue(600)
+        rec.addWidget(self.sp_f)
         rec.addWidget(QLabel("Hold"))
-        self.sp_rh = QSpinBox()
-        self.sp_rh.setRange(100, 5000); self.sp_rh.setSingleStep(100)
-        self.sp_rh.setSuffix(" ms"); self.sp_rh.setValue(1500)
-        rec.addWidget(self.sp_rh)
+        self.sp_h = QSpinBox()
+        self.sp_h.setRange(100, 5000); self.sp_h.setSingleStep(100)
+        self.sp_h.setSuffix(" ms"); self.sp_h.setValue(1500)
+        rec.addWidget(self.sp_h)
         b_rec = QPushButton("REKAM")
         b_rec.setObjectName("goBtn")
         b_rec.clicked.connect(self._on_rec)
@@ -80,8 +77,22 @@ class PresetsTab(QWidget):
         root.addLayout(rec)
         root.addStretch(1)
 
-    # ---- aksi ------------------------------------------------------------
+    def set_scene_edit(self, on):
+        self.scene_edit = on
+        if on:
+            self.hint_lbl.setText("(mode EDIT SCENE: klik pad = tambah langkah ke scene)")
+            self.chk_idim.setEnabled(False)
+        else:
+            self.hint_lbl.setText("(klik pad = pilih + mainkan preset)")
+            self.chk_idim.setEnabled(True)
+        self._update_info_label()
+
     def _on_pad(self, i):
+        if self.scene_edit:
+            # Mode EDIT SCENE: klik preset = tambahkan langkah ke scene terpilih
+            if self.sel_scene >= 0:
+                self.cmd.emit(f"SPUSH {self.sel_scene+1} {i+1}")
+            return
         self.cmd.emit(f"SELP {i+1}")
         self.cmd.emit(f"PSL {i+1}")
 
@@ -99,7 +110,7 @@ class PresetsTab(QWidget):
 
     def _on_rec(self):
         idim = 1 if self.chk_idim.isChecked() else 0
-        self.cmd.emit(f"REC {self.sp_rec.value()} {idim} {self.sp_rf.value()} {self.sp_rh.value()}")
+        self.cmd.emit(f"REC {self.sp_rec.value()} {idim} {self.sp_f.value()} {self.sp_h.value()}")
 
     def _selected(self):
         for i, p in enumerate(self.pads):
@@ -107,9 +118,15 @@ class PresetsTab(QWidget):
                 return i
         return -1
 
+    def _update_info_label(self):
+        sel = self._selected()
+        info = f"Terpilih: #{sel+1}" if sel >= 0 else "Terpilih: -"
+        self.info_label.setText(info)
+
     # ---- sinkron ------------------------------------------------------------
     def apply_state(self, st, active_keys):
         sel = st.selected_preset()
+        self.sel_scene = st.selected_scene()
         for i, p in enumerate(self.pads):
             pr = st.preset(i)
             p.setChecked(i == sel)
@@ -117,22 +134,20 @@ class PresetsTab(QWidget):
                 p.set_used(pr.get("r", 0), pr.get("g", 0), pr.get("b", 0), i == sel)
             else:
                 p.clear_color(i == sel)
-        if 0 <= sel < 16:
-            pr = st.preset(sel)
-            # isi spinbox saat pemilihan berubah ATAU saat nilainya diubah dari
-            # sisi lain (web) — selama spinbox tidak sedang difokus user.
-            if sel != self._last_sel:
-                self._last_sel = sel
-                self.sel_lbl.setText(f"Terpilih: #{sel+1}")
+        # Info label updated on each change; but don't overwrite user's spinbox edits when changing selection
+        if sel != self._last_sel:
+            self._last_sel = sel
+            self._update_info_label()
+            if 0 <= sel < 16:
+                pr = st.preset(sel)
                 if pr:
                     self.sp_f.setValue(int(pr.get("f", 600)))
                     self.sp_h.setValue(int(pr.get("h", 1500)))
-            elif pr:
+        elif 0 <= sel < 16:
+            # nilai timing diubah dari sisi lain (web) -> ikut update selama tidak sedang diedit
+            pr = st.preset(sel)
+            if pr:
                 if not self.sp_f.hasFocus() and self.sp_f.value() != int(pr.get("f", 600)):
                     self.sp_f.setValue(int(pr.get("f", 600)))
                 if not self.sp_h.hasFocus() and self.sp_h.value() != int(pr.get("h", 1500)):
                     self.sp_h.setValue(int(pr.get("h", 1500)))
-        else:
-            if sel != self._last_sel:
-                self._last_sel = sel
-                self.sel_lbl.setText("Terpilih: -")

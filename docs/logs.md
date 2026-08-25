@@ -1076,3 +1076,44 @@ dengan Web UI lewat protokol paritas v35-v38:
 4. REKAM preset dari .exe, mainkan scene, SAVE DATA, cabut-colok USB ->
    sambung lagi, data tetap ada.
 5. Build exe: jalankan desktop/build.bat -> dist/DMX512Controller.exe.
+
+## Session 39 - 2026-08-26 00:45 - Firmware v39 + Desktop: Import serial, EDIT/SHOW mode, ? Cek
+
+### Latar belakang
+User menemukan 3 gap paritas vs Web UI: (1) import JSON via serial belum ada,
+(2) scene tidak punya EDIT/SHOW mode (paling penting utk keselamatan panggung),
+(3) tidak ada tombol ? Cek utk tes scene.
+
+### Firmware v39
+- IMPORT batch via serial (paritas /import web, semantik sama persis):
+  * IMPORT_BEGIN  -> nol-kan staging
+  * IMPORT_P n u f_ms h_ms -> metadata preset n
+  * IMPORT_C n off v1,v2,... -> chunk maks 64 channel per baris
+  * IMPORT_END    -> commit HANYA baris yg dikirim (sisanya tidak disentuh),
+                     persistAll, markStateChanged
+- Staging: serImport[16][515] + serImportProvided[16] di RAM (~8.3KB, aman).
+- Buffer baris serial dinaikkan 256 -> 384 char (baris IMPORT_C ~280 char).
+- BUILD_TAG v39.
+
+### Desktop
+- scenes_tab: toggle EDIT MODE / SHOW MODE (default SHOW, paritas web):
+  * EDIT: klik scene = SELS saja tanpa output; masuk EDIT otomatis
+    SSTOP + CHASE off (safety, paritas stopAuto); editor langkah enabled.
+  * SHOW: klik scene = SPLAY; klik scene yg sedang main = SSTOP.
+  * ? Cek: play/stop scene terpilih utk tes, berlaku di KEDUA mode.
+- presets_tab: set_scene_edit(on) — saat EDIT MODE aktif, klik pad preset
+  mengirim SPUSH <scene> <preset> (tambah langkah), bukan SELP+PSL.
+- system_tab: tombol IMPORT preset dari file -> main._do_import():
+  parse JSON lokal -> antre IMPORT_BEGIN + IMPORT_P + 8x IMPORT_C per preset
+  + IMPORT_END + refresh LISTP (~146 perintah, ±5 detik).
+- main.py: wiring edit_mode_changed -> set_scene_edit; import_requested ->
+  _do_import; QSS editBtn/showBtn.
+- Verifikasi: py_compile semua file desktop OK; grep firmware OK.
+
+### Uji (user)
+1. Upload firmware v39.
+2. Serial Monitor: IMPORT_BEGIN -> IMPORT_P 1 1 600 1500 ->
+   IMPORT_C 1 0 255,0,0,0,... -> IMPORT_END -> cek preset 1 terisi.
+3. Desktop: buka tab Scene -> EDIT MODE -> klik scene (tidak ada output!) ->
+   klik pad preset utk menambah langkah -> ? Cek utk tes -> SHOW MODE utk live.
+4. Round-trip: EXPORT dari device A -> simpan file -> IMPORT ke device B.

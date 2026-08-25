@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBu
 class SystemTab(QWidget):
     cmd = Signal(str)
     export_requested = Signal()
+    import_requested = Signal()
 
     def __init__(self):
         super().__init__()
@@ -25,9 +26,12 @@ class SystemTab(QWidget):
         b_load.clicked.connect(lambda: self.cmd.emit("LOAD"))
         b_exp = QPushButton("EXPORT preset ke file...")
         b_exp.clicked.connect(self.export_requested)
+        b_imp = QPushButton("IMPORT preset dari file...")
+        b_imp.clicked.connect(self.import_requested)
         row.addWidget(b_save)
         row.addWidget(b_load)
         row.addWidget(b_exp)
+        row.addWidget(b_imp)
         row.addStretch(1)
         root.addLayout(row)
 

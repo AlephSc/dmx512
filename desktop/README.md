@@ -91,3 +91,46 @@ Catatan penting:
 ## Versi firmware minimal: v38
 
 Karena fitur seperti `ALL` (blackout/par full), paritas presisi REC/PFH (ms), serta metadata command (`LISTF/LISTG`) tersedia sejak v38. Pastikan firmware terupdate sebelum membangun desktop atau menggunakan .exe.
+
+## Protokol serial (ESP32 firmware v38+) — diperluas v39
+
+Perintah dikirim sebagai satu baris teks dengan `\n`. Semua respons adalah JSON `{ok:true/false}`.
+
+| Perintah | Contoh | Deskripsi |
+|---|---|---|
+| GET | `GET` | Balas state realtime (master,strb,chase,preset,scene,dll) |
+| LISTF | `LISTF` | Daftar fixture (untuk render mixer otomatis) |
+| LISTG | `LISTG` | Daftar grup fader |
+| LISTP | `LISTP` | Metadata preset (used, warna preview, f/h) |
+| LISTS | `LISTS` | Array scene 20×30 langkah |
+| MAST \<v\> | `MAST 200` | Master dimmer |
+| STRB \<v\> | `STRB 128` | Strobe master |
+| SET \<fi\_c\>=\<v\> | `SET 0_1=255` | Set channel tunggal |
+| GRP \<i\> \<v\> | `GRP 3 192` | Fader grup (tipe+offset) |
+| PSL \<n\> | `PSL 3` | Play/load preset n |
+| SELP \<n\> | `SELP 3` | Select preset (tanpa apply) |
+| REC \<n\> idim f h | `REC 7 0 600 1500` | Rekam output saat ini ke preset n (fade/hold dalam ms) |
+| PFH \<n\> f h | `PFH 5 500 1200` | Ubah fade/hold preset n saja |
+| PDEL \<n\> | `PDEL 4` | Sembunyikan preset (used=0) |
+| SPLAY \<n\> | `SPLAY 2` | Mainkan scene n |
+| SELS \<n\> | `SELS 8` | Select scene n |
+| SSTOP | `SSTOP` | Hentikan scene |
+| SPUSH \<s\> \<p\> | `SPUSH 1 5` | Tambah langkah ke scene s dengan preset p (mode EDIT SCENE) |
+| SPOP \<s\> | `SPOP 3` | Hapus langkah terakhir scene s |
+| SCLR \<s\> | `SCLR 5` | Kosongkan scene s |
+| CHASE on/off | `CHASE on` | Aktifkan/hentikan chase |
+| ALL on/off | `ALL off` | Blackout (0) / PAR Full (hanya PAR yang 255) |
+| SAVE | `SAVE` | Paksa simpan NVS (auto-save juga aktif tiap 60s jika dirty) |
+| LOAD | `LOAD` | Muat ulang snapshot NVS ke RAM |
+| EXPORT | `EXPORT` | Export semua preset lengkap (JSON besar, ~42KB) |
+| IMPORT_BEGIN | `IMPORT_BEGIN` | Mulai batch import (clear staging) |
+| IMPORT_P \<n\> u f h | `IMPORT_P 1 1 500 1500` | Tentukan metadata preset n (u=used,f/h dalam ms) |
+| IMPORT_C \<n\> <off> c1,c2,... | `IMPORT_C 1 0 0,10,255,...` | Tulis chunk 64 nilai mulai dari offset ch; ulangi sampai 512 ch terisi |
+| IMPORT_END | `IMPORT_END` | Commit staging ? presets[] (hanya yang telah dikirim); persist NVS |
+
+Catatan penting:
+- **Mode EDIT SCENE**: Klik pad scene tidak langsung main (aman). Tombol ? Cek tetap berfungsi untuk tes di kedua mode.
+- **Snap manualWant**: `SET` & `GRP` melakukan snap out[ch]=want[ch] agar slider terasa langsung (tanpa fade).
+- Firmware tidak mengubah mesin DMX/mixer/format preset/NVS. Hanya adapter serial ke web handler.
+
+Upload v39 dan uji command-by-command via Serial Monitor atau aplikasi desktop.
