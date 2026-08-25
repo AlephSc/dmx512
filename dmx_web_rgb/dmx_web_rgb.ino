@@ -51,7 +51,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v34"
+#define BUILD_TAG "v35"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -1589,6 +1589,20 @@ TaskHandle_t dmxTaskHandle = NULL;
 // Tidak ada logika khusus serial; hanya menerjemahkan teks ke layer.
 static String serialLine = "";
 
+// Helper: ambil argumen integer ke-n dari string (split by space)
+static int serArgInt(const String& args, int idx){
+  String s=args.trim();
+  int i=0,tok=0,len=s.length();
+  while(i<len){
+    int sp=s.indexOf(' ',i);
+    if(sp==-1) sp=len;
+    String t=s.substring(i,sp);
+    if(t.trim().length()>0 && tok==idx) return t.toInt();
+    tok++; i=sp+1;
+  }
+  return 0;
+}
+
 void handleSerialCmd(String cmd){
   cmd.trim();
   if(cmd.length()==0) return;
@@ -1635,6 +1649,7 @@ void handleSerialCmd(String cmd){
           uint16_t ch=fix[fi].start+c;
           manualWant[ch]=cv(v); manualTouched[ch]=millis();
           recomputeWant();
+          out[ch]=want[ch];                    // snap: fader manual terasa langsung
           xSemaphoreGive(dmxMutex);
           stateRevision++;
           Serial.println("{\"ok\":true}");
@@ -1665,13 +1680,169 @@ void handleSerialCmd(String cmd){
     } else Serial.println("{\"ok\":false,\"err\":\"scene invalid\"}");
     return;
   }
-  if(op=="SSTOP"){
-    sceneOn=false; sceneIdx=-1; sceneStep=-1;
-    stateRevision++;
-    Serial.println("{\"ok\":true}");
-    return;
-  }
-  Serial.println("{\"ok\":false,\"err\":\"unknown cmd\"}");
+   if(op=="SSTOP"){
+     sceneOn=false; sceneIdx=-1; sceneStep=-1;
+     stateRevision++;
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+
+   // --- Parity commands (v35) untuk desktop .exe ---
+
+   // LISTP -> daftar preset JSON (untuk populate panel)
+   if(op=="LISTP"){ Serial.println(presetsJson()); return; }
+   // LISTS -> daftar scene JSON
+   if(op=="LISTS"){ Serial.println(scnJson()); return; }
+
+   // GRP <i> <v> -> fader grup
+   if(op=="GRP"){
+     int i=serArgInt(args,0); int v=serArgInt(args,1);
+     if(i>=0&&i<N_GROUPS&&v>=0&&v<=255){
+       xSemaphoreTake(dmxMutex,portMAX_DELAY);
+       uint8_t val=cv(v);
+       for(int f=0;f<N_FIX;f++){
+         if(fix[f].type!=grp[i].typeFilter || grp[i].offset>=fix[f].foot) continue;
+         uint16_t ch=fix[f].start+grp[i].offset;
+         manualWant[ch]=val; manualTouched[ch]=millis();
+       }
+       recomputeWant();
+       for(int f=0;f<N_FIX;f++){              // snap agar grup terasa langsung
+         if(fix[f].type!=grp[i].typeFilter || grp[i].offset>=fix[f].foot) continue;
+         uint16_t ch=fix[f].start+grp[i].offset;
+         out[ch]=want[ch];
+       }
+       xSemaphoreGive(dmxMutex);
+       stateRevision++; nvsDirty=true;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"GRP <i> <v>\"}");
+     return;
+   }
+
+   // REC <n> <idim> <f> <h> -> rekam preset n dengan fade/hold (ms)
+   if(op=="REC"){
+     int n=serArgInt(args,0)-1; bool idim=serArgInt(args,1)==1; long f=serArgInt(args,2)*10, h=serArgInt(args,3)*20;
+     if(n>=0&&n<N_PRESETS){
+       capturePreset(n,idim,(uint16_t)f,(uint16_t)h);
+       selectedPreset=n;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"REC <n>\"}");
+     return;
+   }
+
+   // PFH <n> <f> <h> -> ubah fade/hold preset n tanpa mengubah data
+   if(op=="PFH"){
+     int n=serArgInt(args,0)-1; long f=serArgInt(args,1)*10, h=serArgInt(args,2)*20;
+     if(n>=0&&n<N_PRESETS&&presets[n][0]){
+       xSemaphoreTake(dmxMutex,portMAX_DELAY);
+       presets[n][513]=(uint8_t)(f/10); presets[n][514]=(uint8_t)(h/20);
+       xSemaphoreGive(dmxMutex);
+       persistAll(); stateRevision++;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"PFH <n> <f> <h>\"}");
+     return;
+   }
+
+   // PDEL <n> -> sembunyikan preset (used=0)
+   if(op=="PDEL"){
+     int n=serArgInt(args,0)-1;
+     if(n>=0&&n<N_PRESETS){
+       xSemaphoreTake(dmxMutex,portMAX_DELAY);
+       presets[n][0]=0;
+       if(selectedPreset==n) selectedPreset=-1;
+       xSemaphoreGive(dmxMutex);
+       persistAll(); stateRevision++;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"PDEL <n>\"}");
+     return;
+   }
+
+   // SPUSH <s> <p> -> tambahkan step ke scene s dengan preset p
+   if(op=="SPUSH"){
+     int s=serArgInt(args,0)-1, p=serArgInt(args,1);
+     if(s>=0&&s<N_SCENES&&p>=1&&p<=N_PRESETS){
+       xSemaphoreTake(dmxMutex,portMAX_DELAY);
+       int slot=-1,lastFilled=-1;
+       for(int k=0;k<SCENE_STEPS;k++){
+         if(scenes[s][k]!=0) lastFilled=k;
+         else if(slot<0) slot=k;
+       }
+       if(lastFilled>=0 && scenes[s][lastFilled]==(uint8_t)p){
+         xSemaphoreGive(dmxMutex);
+         Serial.println("{\"ok\":false,\"err\":\"scene_duplicate\"}");
+         return;
+       }
+       if(slot>=0) scenes[s][slot]=(uint8_t)p;
+       xSemaphoreGive(dmxMutex);
+       if(slot<0){ Serial.println("{\"ok\":false,\"err\":\"scene_full\"}"); return; }
+       persistAll(); stateRevision++;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"SPUSH <s> <p>\"}");
+     return;
+   }
+
+   // SPOP <s> -> hapus langkah terakhir scene s
+   if(op=="SPOP"){
+     int s=serArgInt(args,0)-1;
+     if(s>=0&&s<N_SCENES){
+       xSemaphoreTake(dmxMutex,portMAX_DELAY);
+       for(int k=SCENE_STEPS-1;k>=0;k--){ if(scenes[s][k]!=0){ scenes[s][k]=0; break; } }
+       xSemaphoreGive(dmxMutex);
+       persistAll(); stateRevision++;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"SPOP <s>\"}");
+     return;
+   }
+
+   // SCLR <s> -> kosongkan scene s
+   if(op=="SCLR"){
+     int s=serArgInt(args,0)-1;
+     if(s>=0&&s<N_SCENES){
+       xSemaphoreTake(dmxMutex,portMAX_DELAY);
+       memset(scenes[s],0,sizeof(scenes[s]));
+       xSemaphoreGive(dmxMutex);
+       persistAll(); stateRevision++;
+       Serial.println("{\"ok\":true}");
+     } else Serial.println("{\"ok\":false,\"err\":\"SCLR <s>\"}");
+     return;
+   }
+
+   // SELP <n> / SELS <s> -> select tanpa apply
+   if(op=="SELP"){
+     int n=serArgInt(args,0)-1;
+     if(n>=0&&n<N_PRESETS&&presets[n][0]) selectedPreset=n;
+     stateRevision++; nvsDirty=true;
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+   if(op=="SELS"){
+     int s=serArgInt(args,0)-1;
+     if(s>=0&&s<N_SCENES) selectedScene=s;
+     stateRevision++; nvsDirty=true;
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+
+   // CHASE on/off -> toggle chase
+   if(op=="CHASE"){
+     chaseOn = args.indexOf("on",0)>=0;
+     if(chaseOn){ sceneOn=false; sceneIdx=-1; sceneStep=-1; chaseNextAt=millis(); }
+     else { chaseOn=false; chaseIdx=-1; }
+     stateRevision++;
+     Serial.println("{\"ok\":true}");
+     return;
+   }
+
+   // LOAD -> muat ulang dari NVS (restore snapshot)
+   if(op=="LOAD"){
+     bool ok=loadData();
+     stateRevision++;
+     Serial.println(ok?"{\"ok\":true}":"{\"ok\":false}");
+     return;
+   }
+
+   // --- End parity commands ---
+
+   Serial.println("{\"ok\":false,\"err\":\"unknown cmd\"}");
 }
 
 // Parsing serial non-blocking: kumpulkan karakter sampai '\n', lalu proses.

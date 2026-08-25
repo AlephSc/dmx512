@@ -909,3 +909,93 @@ punya konfigurasi fade/hold sendiri sehingga scene playback punya timing bervari
 2. Mainkan scene/chase lalu naikkan Strobe -> semua lampu kedip;
    turunkan ke 0 -> kembali normal persis seperti sebelum strobe.
 3. Nilai kecil = lambat, besar = cepat. Buka 2 device -> posisi strobe sinkron.
+
+## Session 34 - 2026-08-25 21:35 - Bugfix v33 -> v34 (mixer LTP-only)
+
+### Bug yang diperbaiki: Preset menolak fader ke 0
+Setelah load preset (misal PAR1 = merah, channel 1 = 255), geser fader manual ke 0 tidak mengubah output — lampu tetap 255. UI ikut memantul kembali ke 255 saat slider dilepas karena server mengembalikan nilai tersebut.
+
+### Akar penyebab
+`recomputeWant()` memakai HTP (`max`) untuk semua channel level/intensitas:
+```cpp
+want[ch] = max(manualWant[ch], pbWant[ch]);
+// max(0, 255) = 255   ? MANUAL KALAH PADANYA PRESET
+```
+Karena `chIsHTP` mengklasifikasi PAR (dimmer+RGB) sebagai **level**, maka `max()` diterapkan. Hasilnya manual hanya bisa menambah terang, tidak bisa meredupkan/mematikan apa pun yang sedang dimainkan playback.
+
+### Perbaikan
+Ubah cabang HTP jadi **LTP berdasarkan timestamp** per-channel. Semua saluran sekarang menggunakan aturan tunggal: siapa yang disentuh terakhir menang. Dengan ini:
+- Fader manual = 0 ? lamp padam walau preset masih 255 (manual lebih baru). ?
+- Load preset/scene baru setelah pegang fader ? preset yang menang (playback lebih baru). ?
+- Tidak ada lagi perilaku "menolak" atau memantul balik.
+
+### Perubahan kode
+- `recomputeWant()`: hapus klasifikasi `chIsHTP`, langsung gunakan `if (manualTouched > pbTouched)` untuk semua channel.
+- Hapus fungsi `chIsHTP()` yang kini mati (dead code, memicu warning compiler).
+- BUILD_TAG naik ke **v34**.
+
+### Protokol uji
+Upload v34, buka web:
+1. Play preset merah (PAR1 R=255).
+2. Geser slider PAR Red ke 0 — harus mati.
+3. Mainkan scene/preset lain — posisi fader kembali mengikuti kondisi playback.
+4. Geser lagi, lalu refresh browser — status sinkron tanpa pemantulan.
+
+## Session 35 - 2026-08-25 23:45 - Firmware v34 -> v35 (paritas serial)
+
+### Tujuan
+Perluas protokol serial supaya USB kendali penuh — **paritas 1:1 dengan Web UI**, tidak ada fitur yang hilang saat operator pakai laptop lewat kabel. Desktop app nanti bisa jalankan semua fungsi dari Windows tanpa bergantung pada web browser/WiFi venue.
+
+### Perubahan protokol (semua satu-baris teks di Serial 115200)
+| Perintah | Deskripsi | Paritis HTTP |
+|---|---|---|
+| `LISTP` | Balas JSON daftar preset (`presetsJson()`) | `/presets` |
+| `LISTS` | Balas JSON daftar scene (`scnJson()`) | `/scenes` |
+| `GRP i v` | Fader grup ? manualWant + snap out[] | onGroup() |
+| `REC n idim f h` | Rekam preset n (fade f/hold h dalam ms) | onPresetSave() |
+| `PFH n f h` | Ubah fade/hold per-preset saja | onPresetFade() |
+| `PDEL n` | Sembunyikan preset (used=0) | onPresetClear() |
+| `SPUSH s p` | Tambah step ke scene s dengan preset p | onSPush() |
+| `SPOP s` | Hapus langkah terakhir scene s | onSPop() |
+| `SCLR s` | Kosongkan seluruh scene s | onSClear() |
+| `SELP n` / `SELS s` | Select preset/scene (tanpa apply) | onSelect() |
+| `CHASE on/off` | Aktifkan/hentikan chase | onChase() |
+| `LOAD` | Muat ulang snapshot NVS ke RAM | loadData() |
+
+Catatan kunci:
+- Semua perintah menulis layer `manualWant[]` atau `pbWant[]`, lalu `recomputeWant()` ? **mixer HTP/LTP** menentukan siapa menang.
+- Snap `out[ch]=want[ch]` ditambahkan untuk SET & GRP agar fader terasa langsung (tanpa fade).
+- Tidak ubah mesin DMX/mixer/format preset/NVS. Hanya adapter teks ? handler yang sudah ada.
+
+### Protokol uji (Serial Monitor 115200)
+```
+GET                    # balas state JSON lengkap
+LISTP                  # list 16 preset (JSON array)
+LISTS                  # list 20 scene (JSON array)
+SET 0_1=255            # PAR1 Red penuh
+MAST 200               # master dimmer 200
+STRB 128               # strobe sedang
+GRF 2 255              # grup fader 2 = 255 (terapkan ke semua fixture tipe filter)
+PSL 3                  # mainkan preset 3
+PSEL 5                 # pilih preset 5 (tanpa apply)
+REC 5 0 500 1500       # rekam preset 5 (dimmer ignored, fade 0.5s, hold 1.5s)
+PFH 5 500 1500         # update fade/hold preset 5 saja
+PDEL 5                 # sembunyikan preset 5
+SPUSH 1 3              # tambah langkah 3 ke scene 1
+SPOP 1                 # hapus langkah terakhir scene 1
+SCLR 1                 # kosongkan scene 1
+SPLAY 2                # mainkan scene 2
+SSTOP                  # stop scene
+CHASE on               # mulai chase
+CHASE off              # hentikan chase
+SAVE                   # paksa simpan ke NVS
+LOAD                   # muat ulang dari NVS (restore)
+ALLOFF                 # hitam semua (master 0 + all off)
+```
+
+### Verifikasi statis
+- All ops detected: LISTS, LISTP, GRP, REC, PFH, PDEL, SPUSH, SPOP, SCLR, SELP, SELS, CHASE, LOAD.
+- `serArgInt()` helper added; BUILD_TAG v35.
+- No structural change to mixer/DMX/NVS.
+
+Upload v35 dan uji command-by-command via Serial Monitor sebelum lanjut ke desktop .exe.
