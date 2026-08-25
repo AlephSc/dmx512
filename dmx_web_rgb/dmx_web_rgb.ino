@@ -51,7 +51,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v30"
+#define BUILD_TAG "v34"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -123,8 +123,38 @@ Fixture fix[N_FIX] = {
 // chunk: [0]=used, [1..512]=nilai channel, [513]=fade/10ms, [514]=hold/20ms
 #define PRESET_CHUNK 515
 
-static uint8_t want[513];         // target (dari slider/preset/chase)
+static uint8_t want[513];         // target hasil mix (diproses fadeTick -> out)
 static uint8_t out[513];          // nilai tampilan (hasil fade)
+
+// =============================================================
+// HTP/LTP MIXER (sejak v32)
+// Sumber channel DMX dipisah jadi dua layer lalu di-mix per channel:
+//   manualWant[] <- slider/fader manual (onSet, onGroup, onCtrl all)
+//   pbWant[]     <- playback: preset, scene, chase (applyPresetToWant)
+// Hasil mix masuk want[] (diproses fadeTick -> out -> buildFrame).
+//   * HTP (Highest Takes Precedence): channel LEVEL/intensitas.
+//     Nilai tertinggi menang -> dua look tidak saling meredupkan.
+//   * LTP (Latest Takes Precedence): channel ATRIBUT (pan/tilt/gobo/dll).
+//     Yang disentuh terakhir menang, berapa pun nilainya.
+// =============================================================
+static uint8_t manualWant[513];
+static uint8_t pbWant[513];
+static volatile uint32_t manualTouched[513];   // millis tulis manual terakhir
+static volatile uint32_t pbTouched[513];       // millis tulis playback terakhir
+
+// Gabung manual+playback ke want[] sesuai aturan HTP/LTP.
+// Panggil SETELAH salah satu layer ditulis (tetap di dalam mutex DMX).
+// Note (v34): semua channel dipakai LTP berdasarkan timestamp sentuh terakhir;
+//   manualWant/pbWant tidak lagi dipisahkan via max(). Dengan ini manual
+//   bisa meredupkan/mematikan playback, dan playback baru otomatis mengganti
+//   posisi fader manual yang sudah tidak digarap lagi.
+void recomputeWant(){
+  for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
+    uint16_t ch=fix[f].start+c;
+    // Keputusan tunggal per channel: siapa yang disentuh paling baru?
+    want[ch] = (manualTouched[ch]>pbTouched[ch]) ? manualWant[ch] : pbWant[ch];
+  }
+}
 static volatile uint8_t masterOut = 255; static volatile uint8_t masterWant = 255;
 
 // STROBE MASTER: 0=nonaktif; >0 = SELURUH output di-gate kotak on/off.
@@ -441,8 +471,12 @@ void applyPresetToWant(int idx){
       int d2 = abs((int)presets[idx][fix[f].start+2] - (int)want[fix[f].start+2]);
       if(d0>30 || d2>30) blackoutEnd[f] = now + 350;   // 350ms dimmer mati saat bergerak
     }
-    for(uint16_t c=0; c<fix[f].foot; c++)
-      want[fix[f].start+c] = presets[idx][fix[f].start+c];
+    for(uint16_t c=0; c<fix[f].foot; c++){
+      uint16_t ch=fix[f].start+c;
+      pbWant[ch]=presets[idx][ch];
+      pbTouched[ch]=now;
+    }
+    recomputeWant();
   }
   xSemaphoreGive(dmxMutex);
 }
@@ -727,7 +761,9 @@ void onGroup(){
     if(fix[f].type!=grp[i].typeFilter) continue;
     if(grp[i].offset>=fix[f].foot) continue;
     uint16_t ch=fix[f].start+grp[i].offset;
-    want[ch]=val; out[ch]=val;
+    manualWant[ch]=val; manualTouched[ch]=millis();
+    recomputeWant();
+    out[ch]=want[ch];
   }
   xSemaphoreGive(dmxMutex);
   stateRevision++; nvsDirty=true;
@@ -1388,7 +1424,9 @@ void onSet(){
       int fi=key.substring(0,us).toInt(); int c=key.substring(us+1).toInt();
       if(fi>=0&&fi<N_FIX&&c>=0&&c<fix[fi].foot){
         uint16_t ch=fix[fi].start+c;
-        want[ch]=cv(v); out[ch]=want[ch];
+        manualWant[ch]=cv(v); manualTouched[ch]=millis();
+        recomputeWant();
+        out[ch]=want[ch];
       }
     }
   }
@@ -1410,7 +1448,9 @@ void onCtrl(){
       for(uint16_t c=0;c<fix[f].foot;c++){
         uint16_t ch=fix[f].start+c;
         uint8_t v = on ? (safe?255:0) : 0;
-        want[ch]=v; out[ch]=v;
+        manualWant[ch]=v; manualTouched[ch]=millis();
+        recomputeWant();
+        out[ch]=want[ch];
       }
     }
     xSemaphoreGive(dmxMutex);
@@ -1540,6 +1580,115 @@ void dmxTask(void* arg){
 TaskHandle_t dmxTaskHandle = NULL;
 
 // ---------------------------------------------------------------
+// SERIAL CONTROL (v33) — jalur kendali kedua selain Web UI
+// ---------------------------------------------------------------
+// Protokol teks per baris (bisa JSON opsional di app desktop nanti).
+// Semua perintah menulis ke layer yang SAMA dengan Web UI:
+//   SET/GRP/MAST/STRB/ALL -> manualWant[]  (layer manual, HTP/LTP)
+//   PSL/PREC              -> pbWant[]       (layer playback)
+// Tidak ada logika khusus serial; hanya menerjemahkan teks ke layer.
+static String serialLine = "";
+
+void handleSerialCmd(String cmd){
+  cmd.trim();
+  if(cmd.length()==0) return;
+  String C=cmd; C.toUpperCase();
+
+  // GET -> balas state JSON saat ini (untuk sinkron aplikasi desktop)
+  if(C=="GET"){
+    Serial.println(buildStateJson());
+    return;
+  }
+  // SAVE -> paksa persist ke NVS (auto-save 60s tetap berlaku)
+  if(C=="SAVE"){
+    bool ok=persistAll();
+    Serial.println(ok?"{\"ok\":true}":"{\"ok\":false}");
+    return;
+  }
+
+  // ambil kata pertama sebagai perintah
+  int sp=C.indexOf(' ');
+  String op=(sp<0)?C:C.substring(0,sp);
+  String args=(sp<0)?"":C.substring(sp+1);
+
+  if(op=="MAST"){
+    int v=args.toInt(); masterWant=cv(v); masterOut=masterWant;
+    stateRevision++;
+    Serial.println("{\"ok\":true}");
+    return;
+  }
+  if(op=="STRB"){
+    strobeWant=cv(args.toInt());
+    stateRevision++;
+    Serial.println("{\"ok\":true}");
+    return;
+  }
+  if(op=="SET"){                      // SET <fi>_<ch>=<val>
+    int eq=args.indexOf('=');
+    if(eq>0){
+      String key=args.substring(0,eq); int us=key.indexOf('_');
+      int v=args.substring(eq+1).toInt();
+      if(us>0){
+        int fi=key.substring(0,us).toInt(); int c=key.substring(us+1).toInt();
+        if(fi>=0&&fi<N_FIX&&c>=0&&c<fix[fi].foot){
+          xSemaphoreTake(dmxMutex,portMAX_DELAY);
+          uint16_t ch=fix[fi].start+c;
+          manualWant[ch]=cv(v); manualTouched[ch]=millis();
+          recomputeWant();
+          xSemaphoreGive(dmxMutex);
+          stateRevision++;
+          Serial.println("{\"ok\":true}");
+          return;
+        }
+      }
+    }
+    Serial.println("{\"ok\":false,\"err\":\"SET <fi>_<ch>=<val>\"}");
+    return;
+  }
+  if(op=="PSL"){                      // playback preset -> layer pbWant
+    int n=args.toInt()-1;
+    if(n>=0&&n<N_PRESETS&&presets[n][0]){
+      selectedPreset=n;
+      applyPresetToWant(n);            // mutex+recompute di dalamnya
+      stateRevision++;
+      Serial.println("{\"ok\":true}");
+    } else Serial.println("{\"ok\":false,\"err\":\"preset kosong\"}");
+    return;
+  }
+  if(op=="SPLAY"){                    // mulai scene
+    int s=args.toInt()-1;
+    if(s>=0&&s<N_SCENES){
+      sceneOn=true; sceneIdx=s; sceneStep=-1; sceneError=0;
+      sceneNextAt=millis();
+      stateRevision++;
+      Serial.println("{\"ok\":true}");
+    } else Serial.println("{\"ok\":false,\"err\":\"scene invalid\"}");
+    return;
+  }
+  if(op=="SSTOP"){
+    sceneOn=false; sceneIdx=-1; sceneStep=-1;
+    stateRevision++;
+    Serial.println("{\"ok\":true}");
+    return;
+  }
+  Serial.println("{\"ok\":false,\"err\":\"unknown cmd\"}");
+}
+
+// Parsing serial non-blocking: kumpulkan karakter sampai '\n', lalu proses.
+// Dipanggil dari loop() (Core 1) -> tidak pernah memblok task DMX (Core 0).
+void processSerialIn(){
+  while(Serial.available()){
+    char c=(char)Serial.read();
+    if(c=='\n'){
+      if(serialLine.length()>0) handleSerialCmd(serialLine);
+      serialLine="";
+    } else if(c!='\r' && serialLine.length()<256){
+      serialLine+=c;
+    }
+  }
+}
+
+// ---------------------------------------------------------------
 // SETUP / LOOP
 // ---------------------------------------------------------------
 void setup(){
@@ -1629,4 +1778,9 @@ void loop(){
   server.handleClient();
   ws.cleanupClients();      // housekeeping AsyncWebSocket
   wsBroadcastTick();
+  processSerialIn();        // v33: kendali via serial (non-blocking, Core 1)
+  // AUTO-SAVE NVS (sisi server, safety-net): 60 detik setelah simpan terakhir,
+  // bila masih ada perubahan (nvsDirty) -> persistAll(). Menutup kasus browser
+  // ditutup sebelum timer client 60 s sempat mengirim /save.
+  if(nvsDirty && (millis()-lastSaveAt)>=60000) persistAll();
 }
