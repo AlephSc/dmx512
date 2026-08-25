@@ -1,15 +1,13 @@
-# Arduino
-*.elf
-*.bin
+# Python bytecode & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
 build/
-**/.pio/
-.pio/
+dist/
+venv/
+*.egg-info/
 
-# Kilo tooling (internal, bukan source)
-.kilo/node_modules/
-.kilo/agent-manager.json
-
-# OS / editor
-Thumbs.db
-.DS_Store
-*.swp
+# Kilo tooling (internal)
+.kilo/__pycache__/
