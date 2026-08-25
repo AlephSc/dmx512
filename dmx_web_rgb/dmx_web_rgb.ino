@@ -51,7 +51,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v35"
+#define BUILD_TAG "v36"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -1839,6 +1839,11 @@ void handleSerialCmd(String cmd){
      Serial.println(ok?"{\"ok\":true}":"{\"ok\":false}");
      return;
    }
+
+   // LISTF -> daftar fixture JSON (untuk render mixer desktop tanpa hardcode)
+   if(op=="LISTF"){ Serial.println(fixJson()); return; }
+   // LISTG -> daftar grup fader JSON
+   if(op=="LISTG"){ Serial.println(grpJson()); return; }
 
    // --- End parity commands ---
 

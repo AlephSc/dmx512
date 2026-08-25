@@ -999,3 +999,23 @@ ALLOFF                 # hitam semua (master 0 + all off)
 - No structural change to mixer/DMX/NVS.
 
 Upload v35 dan uji command-by-command via Serial Monitor sebelum lanjut ke desktop .exe.
+
+## Session 36 - 2026-08-25 23:55 - Firmware v35 -> v36 (LISTF/LISTG metadata)
+
+### Tujuan
+Tambahkan perintah serial untuk memuat daftar fixture dan grup fader secara dinamis dari ESP32 — tidak ada lagi hardcoding fixture/grup di aplikasi desktop. Ini memastikan sinkronisasi penuh dengan patch yang aktif.
+
+### Perintah baru
+| Perintah | Deskripsi | JSON format |
+|---|---|---|
+| `LISTF` | Balas semua fixture yang terpatch (N_FIX=18) | `[{"name":"PAR 1","type":0,"start":1,"foot":9},...]` |
+| `LISTG` | Balas semua grup fader (N_GROUPS=8) | `[{"name":"PAR Dim","type":0,"offset":0},...]` |
+
+Data ini dipanggil sekali saat koneksi dibuka ? disimpan lokal di desktop ? digunakan untuk render mixer tab + group faders. Tidak ubah mekanisme DMX/mixer/layer apa pun.
+
+### Verifikasi
+- LISTF returns fixJson(): N_FIX items per fixture index.
+- LISTG returns grpJson(): N_GROUPS items per group definition.
+- Desktop akan memanggil GET, LISTF, LISTG setelah connect, lalu meng-cache seluruh state.
+
+Upload v36 dan uji `LISTF` + `LISTG` via Serial Monitor sebelum build desktop .exe.
