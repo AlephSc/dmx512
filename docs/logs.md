@@ -1222,3 +1222,39 @@ Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
 4. MIDI-learn: pilih aksi "Master dimmer", klik LEARN, gerakkan knob ->
    mapping tersimpan otomatis ke midi_map.json.
 5. MIDI berfungsi sama baik saat transport aktif USB Serial maupun WiFi.
+
+---
+
+## Session 43 — Fix fatal: exe gagal start "DLL load failed while importing Shiboken"
+
+### Akar masalah (terbukti, bukan tebakan)
+- PySide6 6.10.3 dipasang di mesin build; shiboken6-nya mengimpor simbol
+  stable-ABI `PyCMethod_New` dari `python3.dll`.
+- Python 3.9.0 yang terpasang TIDAK mengekspor simbol itu dari python3.dll
+  (bug CPython: rilis awal 3.9 tidak mem-forward semua fungsi stable ABI).
+- Verifikasi: parse tabel import PE shiboken6.abi3.dll -> 185 simbol dari
+  python3.dll -> 1 hilang: `PyCMethod_New` -> WinError 127.
+- Bukan antivirus, bukan mode onefile, bukan versi Windows.
+- Uji "berhasil" sebelumnya false positive: cek PID saja tidak membedakan
+  GUI vs dialog error (proses tetap hidup).
+
+### Perbaikan
+- Pin `PySide6==6.6.3.1` di requirements.txt (versi terakhir resmi dukung
+  py3.9; shiboken-nya tidak mereferensi PyCMethod_New).
+- Entry point baru `run.py`: crash logger ke
+  `%LOCALAPPDATA%\DMX512Controller\crash.log` supaya kegagalan startup
+  berikutnya punya jejak tertulis.
+- Build diganti ONEDIR (`DMX512Controller.spec` + build.bat):
+  - tanpa ekstraksi DLL ke %TEMP% saat start -> tidak rawan blokir AV;
+  - upx=False (UPX pada DLL Qt pemicu error serupa);
+  - vcruntime140/140_1/msvcp140 modern dibundel di folder exe.
+- Uji tervalidasi benar: jendela `DMX512 Controller — ESP32` muncul,
+  diverifikasi via EnumWindows Win32 (bukan PID), crash.log nihil.
+
+### Distribusi
+- Hasil build kini FOLDER: `desktop/dist/DMX512Controller/`
+  (salin seluruh folder ke PC target, jalankan DMX512Controller.exe).
+
+### Catatan ke depan
+- Kalau build machine naik ke Python >= 3.10, pin PySide6 boleh dilepas
+  (hapus pin di requirements.txt) untuk dapat Qt terbaru.

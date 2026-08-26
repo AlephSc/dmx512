@@ -11,3 +11,6 @@ venv/
 
 # Kilo tooling (internal)
 .kilo/__pycache__/
+
+# Session logs
+ses/
