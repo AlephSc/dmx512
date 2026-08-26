@@ -1185,3 +1185,40 @@ di ESP32, laptop tetap bisa kontrol semua perangkat. Jarak dekat tetap USB+deskt
 3. Serial Monitor harus menampilkan "Ethernet tersambung. IP: http://x.x.x.x".
 4. Buka IP tsb di browser (Web UI) ATAU desktop app mode WiFi (HTTP).
 5. Cabut kabel LAN -> device kembali via WiFi SIGMA; tanpa keduanya -> AP darurat.
+
+## Session 42 - 2026-08-26 14:30 - Desktop: MIDI controller support
+
+### Tujuan
+Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
+(nanoKONTROL2, APC Mini, Launchpad, dll.) langsung mengendalikan rig DMX.
+
+### Komponen baru
+- midi_handler.py:
+  * MidiMapper — mapping JSON (midi_map.json): CC & Note -> aksi
+    (master/strb/group/chan/preset/scene_play/scene_stop/blackout/
+    all_full/chase_on/chase_off). Default ramah controller umum:
+    CC 0-7 = grup fader, CC 16/17 = master/strobe, Note 36-51 = preset 1-16,
+    Note 64-67 = blackout/full/chase, Note 70-89 = scene 1-20, Note 90 = stop.
+  * MidiInputWorker — QObject di QThread; baca port via mido, translate,
+    throttle CC 30ms (hindari banjir), mode MIDI-learn, deteksi device dicabut.
+  * Skala MIDI 0-127 -> DMX 0-255.
+- ui/midi_tab.py: tab MIDI — pilih device, status & aktivitas realtime,
+  tabel mapping (tambah/hapus/simpan/default), MIDI-learn (pilih aksi ->
+  klik LEARN -> gerakkan kontrol -> otomatis terpetakan & tersimpan).
+- main.py: tab MIDI + handler lengkap; perintah MIDI mengalir ke transport
+  AKTIF (USB Serial maupun WiFi/HTTP) -> MIDI bekerja di kedua jalur.
+- requirements.txt: + mido>=1.3.0, python-rtmidi>=1.5.0.
+- Verifikasi: py_compile semua file OK; mido 1.3.3 + python-rtmidi 1.5.8
+  terpasang di mesin dev.
+
+### Catatan build
+- PyInstaller perlu --hidden-import=mido.backends.rtmidi (backend dimuat dinamis).
+
+### Uji (user)
+1. Colok controller MIDI USB -> buka DMX512Controller.exe -> tab MIDI ->
+   Cari Device -> SAMBUNG MIDI.
+2. Geser fader controller (default CC 0-7) -> grup fader rig ikut bergerak.
+3. Tekan pad (Note 36-51) -> preset 1-16 dimainkan.
+4. MIDI-learn: pilih aksi "Master dimmer", klik LEARN, gerakkan knob ->
+   mapping tersimpan otomatis ke midi_map.json.
+5. MIDI berfungsi sama baik saat transport aktif USB Serial maupun WiFi.

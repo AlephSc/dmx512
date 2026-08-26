@@ -11,10 +11,12 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog,
                                QTabWidget, QVBoxLayout, QWidget)
 from state import DeviceState
 from transport import SerialTransport, list_candidate_ports, HttpTransport
+from midi_handler import MidiMapper, MidiInputWorker, MIDI_AVAILABLE
 from ui.mixer_tab import MixerTab
 from ui.presets_tab import PresetsTab
 from ui.scenes_tab import ScenesTab
 from ui.system_tab import SystemTab
+from ui.midi_tab import MidiTab
 from worker import SerialWorker
 
 
@@ -28,8 +30,15 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._thread = None
         self.active_keys = set()
+        # MIDI
+        self.midi_mapper = MidiMapper()
+        self._midi_worker = None
+        self._midi_thread = None
+        self._midi_learn_pending = None   # (action, p1, p2) saat mode learn aktif
         self._build_ui()
         self._refresh_ports()
+        self._midi_refresh_devices()
+        self.tab_midi.refresh_table(self.midi_mapper.map)
 
     # ---- UI statis ---------------------------------------------------------
     def _build_ui(self):
@@ -76,9 +85,11 @@ class MainWindow(QMainWindow):
         self.tab_presets = PresetsTab()
         self.tab_scenes = ScenesTab()
         self.tab_system = SystemTab()
+        self.tab_midi = MidiTab()
         self.tabs.addTab(self.tab_mixer, "Mixer")
         self.tabs.addTab(self.tab_presets, "Preset")
         self.tabs.addTab(self.tab_scenes, "Scene")
+        self.tabs.addTab(self.tab_midi, "MIDI")
         self.tabs.addTab(self.tab_system, "Sistem")
 
         # wiring: semua perintah serial dari tab -> antrean worker
@@ -89,6 +100,14 @@ class MainWindow(QMainWindow):
         self.tab_system.import_requested.connect(self._do_import)
         # EDIT MODE scene -> klik pad preset menambah langkah (bukan play)
         self.tab_scenes.edit_mode_changed.connect(self.tab_presets.set_scene_edit)
+        # MIDI wiring
+        self.tab_midi.refresh_requested.connect(self._midi_refresh_devices)
+        self.tab_midi.connect_requested.connect(self._midi_connect)
+        self.tab_midi.disconnect_requested.connect(self._midi_disconnect)
+        self.tab_midi.save_requested.connect(self._midi_save)
+        self.tab_midi.defaults_requested.connect(self._midi_defaults)
+        self.tab_midi.delete_requested.connect(self._midi_delete)
+        self.tab_midi.learn_requested.connect(self._midi_learn_start)
 
         # status bar
         self.status_lbl = QLabel("Siap.")
@@ -327,9 +346,113 @@ class MainWindow(QMainWindow):
     def _set_status(self, msg):
         self.status_lbl.setText(msg)
 
+    # ---- MIDI ---------------------------------------------------------------
+    def _midi_refresh_devices(self):
+        if not MIDI_AVAILABLE:
+            self.tab_midi.set_devices([])
+            return
+        try:
+            import mido
+            names = mido.get_input_names()
+        except Exception:  # noqa: BLE001
+            names = []
+        self.tab_midi.set_devices(names)
+
+    def _midi_connect(self, name):
+        if not MIDI_AVAILABLE:
+            self.tab_midi.set_status("library MIDI tidak tersedia")
+            return
+        self._midi_disconnect()
+        self._midi_worker = MidiInputWorker(self.midi_mapper)
+        self._midi_worker.set_port(name)
+        self._midi_thread = QThread(self)
+        self._midi_worker.moveToThread(self._midi_thread)
+        self._midi_thread.started.connect(self._midi_worker.run)
+        self._midi_worker.command_ready.connect(self._midi_on_command)
+        self._midi_worker.activity.connect(self.tab_midi.set_activity)
+        self._midi_worker.error_occurred.connect(self._midi_on_error)
+        self._midi_worker.started.connect(self._midi_on_started)
+        self._midi_worker.stopped.connect(self._midi_on_stopped)
+        self._midi_worker.learned.connect(self._midi_on_learned)
+        self._midi_thread.start()
+
+    def _midi_disconnect(self):
+        if self._midi_worker is not None:
+            self._midi_worker.stop()
+        if self._midi_thread is not None:
+            self._midi_thread.quit()
+            self._midi_thread.wait(1500)
+        self._midi_worker = None
+        self._midi_thread = None
+
+    def _midi_on_command(self, cmd):
+        # Teruskan perintah hasil translate MIDI ke transport aktif
+        self.send_cmd(cmd)
+
+    def _midi_on_started(self, name):
+        self.tab_midi.set_status(f"terhubung: {name}", connected=True)
+        self._set_status(f"MIDI terhubung: {name}")
+        self.tab_system.log(f"== MIDI terhubung: {name} ==")
+
+    def _midi_on_stopped(self):
+        self.tab_midi.set_status("tidak terhubung", connected=False)
+        self.tab_midi.set_learn_active(False)
+
+    def _midi_on_error(self, msg):
+        self.tab_midi.set_status(msg, connected=False)
+        self._set_status(f"MIDI: {msg}")
+        self.tab_system.log("MIDI ERROR: " + msg)
+
+    def _midi_on_learned(self, kind, num):
+        # Terapkan mapping yang baru dipelajari
+        if self._midi_learn_pending is None:
+            return
+        action, p1, p2 = self._midi_learn_pending
+        self._midi_learn_pending = None
+        if kind == "cc":
+            self.midi_mapper.set_cc(num, action, p1, p2)
+        else:
+            self.midi_mapper.set_note(num, action, p1, p2)
+        self.midi_mapper.save()
+        self.tab_midi.refresh_table(self.midi_mapper.map)
+        self.tab_midi.set_learn_active(False)
+        self._set_status(f"MIDI-learn: {kind.upper()} {num} -> {action}")
+
+    def _midi_learn_start(self, action, p1, p2):
+        if not action:  # batalkan
+            self._midi_learn_pending = None
+            if self._midi_worker is not None:
+                self._midi_worker.set_learn(False)
+            self.tab_midi.set_learn_active(False)
+            return
+        if self._midi_worker is None:
+            self._set_status("Sambungkan MIDI dulu sebelum learn.")
+            self.tab_midi.set_learn_active(False)
+            return
+        self._midi_learn_pending = (action, p1, p2)
+        self._midi_worker.set_learn(True)
+        self._set_status("MIDI-learn aktif: gerakkan fader / tekan pad...")
+
+    def _midi_save(self):
+        if self.midi_mapper.save():
+            self._set_status("Mapping MIDI tersimpan.")
+        else:
+            self._set_status("Gagal menyimpan mapping MIDI.")
+
+    def _midi_defaults(self):
+        self.midi_mapper.reset_defaults()
+        self.midi_mapper.save()
+        self.tab_midi.refresh_table(self.midi_mapper.map)
+        self._set_status("Mapping MIDI dikembalikan ke default.")
+
+    def _midi_delete(self, kind, num):
+        self.midi_mapper.remove(kind, num)
+        self.tab_midi.refresh_table(self.midi_mapper.map)
+
     # ---- tutup ---------------------------------------------------------------
     def closeEvent(self, ev):
         self._disconnect()
+        self._midi_disconnect()
         ev.accept()
 
 
