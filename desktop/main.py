@@ -354,7 +354,7 @@ class MainWindow(QMainWindow):
                 self.state.presets = payload
         elif kind == "LISTS":
             if isinstance(payload, list):
-                self.state.scenes = payload
+                self.state.set_scenes(payload)   # normalisasi -> list-of-int
         elif kind == "EXPORT":
             if isinstance(payload, dict) and "presets" in payload:
                 self._save_export(payload)

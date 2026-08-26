@@ -1213,20 +1213,25 @@ function buildGroups(){
     box.appendChild(lbl);
   });
 }
-// Posisi fader grup saat halaman dibuka = nilai member pertamanya (jujur, tidak palsu).
+// Sinkron fader grup dari state server. Aturan: fader grup hanya di-set bila
+// SEMUA membernya bernilai sama. Kalau member berbeda (mis. satu fixture
+// diubah lewat fader per-channel), posisi fader grup dibiarkan -> tidak ada
+// lompatan visual saat menggeser satu channel fixture.
 function syncGroups(j){
   if(!j.cur) return;
   GRP.forEach((g,i)=>{
+    let vals=[];
     for(let fi=0;fi<FIX.length;fi++){
       if(FIX[fi].type===g.type && g.offset<FIX[fi].foot){
-        const k=fi+'_'+g.offset;
-        if(j.cur[k]!==undefined){
-          const s=$('g'+i); s.value=j.cur[k];
-          document.getElementById('g'+i+'v').textContent=j.cur[k]; paintFill(s);
-        }
-        break;
+        const v=j.cur[fi+'_'+g.offset];
+        if(v!==undefined) vals.push(v);
       }
     }
+    if(vals.length===0) return;
+    const same=vals.every(v=>v===vals[0]);
+    if(!same) return;                       // member berbeda -> jangan sentuh fader grup
+    const s=$('g'+i); s.value=vals[0];
+    document.getElementById('g'+i+'v').textContent=vals[0]; paintFill(s);
   });
 }
 let chaseOn=false;
@@ -1608,6 +1613,11 @@ String fixJson(){
 
 void sendUi(){
   String page = FPSTR(INDEX_HTML);
+  // Satu alokasi besar di awal: tanpa reserve, tiap replace() merealokasi
+  // buffer yang terus membesar. Substitusi terbesar (__SCNDATA__ ~4 KB)
+  // paling rawan gagal alokasi saat heap terfragmentasi -> token tersisa
+  // di HTML dan memicu "Uncaught ReferenceError: __SCNDATA__ is not defined".
+  page.reserve(48000);
   page.replace("__IP__", activeIP().toString());
   page.replace("__BUILD__", BUILD_TAG);
   page.replace("__FIXDATA__", fixJson());

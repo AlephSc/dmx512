@@ -1341,3 +1341,31 @@ Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
    panel WiFi: isi SSID/sandi -> status berubah hijau bila sukses.
 3. Desktop (`python desktop\main.py`): klik pad preset/scene berfungsi,
    fader tanpa delay, tab Sistem bisa ubah WiFi ESP32.
+
+---
+
+## Session 46 — Fix 3 bug laporan user (ScenesTab str/int, WiFi tanpa status, __SCNDATA__)
+
+### Bug 1: apply_state ScenesTab "'>' not supported between str and int"
+- Data LISTS bisa tiba sebagai string (variasi versi firmware); `v > 0`
+  membandingkan str dgn int -> crash berulang di log Sistem.
+- Fix: `DeviceState.set_scenes()` menormalisasi scene jadi list-of-int
+  (parse string JSON, paksa int, nilai tak dikenal = 0). `_on_data` LISTS
+  kini memanggilnya. Uji 4 kasus (normal/string/str-dalam-list/sampah) lolos.
+
+### Bug 2: WiFi desktop hanya tampil "menerapkan kredensial..." tanpa status/IP
+- Respons `WIFIST` dirutekan worker ke `command_done`, bukan `data_received`,
+  sehingga `set_wifi()` tak pernah terpanggil -> label status diam.
+- Fix: tambahkan "WIFIST" ke tuple emit `data_received` di worker.run().
+  Setelah fix, polling pasca-apply menampilkan "Terhubung ke X · IP ... dBm".
+
+### Bug 3: Web "Uncaught ReferenceError: __SCNDATA__ is not defined"
+- replace(__SCNDATA__) = substitusi terbesar (+~4 KB). Tanpa reserve, String
+  direalokasi berulang saat membesar; realokasi terbesar rawan gagal saat heap
+  terfragmentasi -> token tersisa di HTML.
+- Fix: `page.reserve(48000)` di sendUi() -> satu alokasi besar di awal.
+- Catatan: bila masih muncul, pastikan flash firmware dari salinan .ino
+  TERBARU lalu hard-refresh browser (Ctrl+F5) utk singkirkan cache lama.
+
+### Build
+- desktop: rebuild onedir (dist/DMX512Controller/).

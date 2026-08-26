@@ -50,7 +50,7 @@ class SerialWorker(QObject):
                     continue
                 timeout = 10.0 if kind == "EXPORT" else 2.5
                 resp = self.transport.request(cmd, timeout=timeout)
-                if kind in ("LISTF", "LISTG", "LISTP", "LISTS", "EXPORT"):
+                if kind in ("LISTF", "LISTG", "LISTP", "LISTS", "EXPORT", "WIFIST"):
                     self.data_received.emit(kind, resp)
                 else:
                     self.command_done.emit(cmd, resp)
