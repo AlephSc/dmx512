@@ -1258,3 +1258,28 @@ Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
 ### Catatan ke depan
 - Kalau build machine naik ke Python >= 3.10, pin PySide6 boleh dilepas
   (hapus pin di requirements.txt) untuk dapat Qt terbaru.
+
+---
+
+## Session 44 — Fix 3 kelompok error kompilasi firmware (uji compile pertama user)
+
+### Error dan perbaikan
+1. **Orphan block baris 800-809**: duplikat isi `grpJson()` tanpa kepala fungsi
+   (sisa edit v41 yang tidak bersih) -> dihapus. `fixJson()` dipakai di baris 799
+   tapi didefinisikan di baris 1413 -> ditambahkan forward declaration eksplisit
+   (tidak boleh bergantung pada auto-prototype .ino).
+2. **serArgInt()**: `String s=args.trim()` pada `const String&` (trim() void &
+   non-const) -> salinan dulu lalu trim; rantai `t.trim().length()` -> pisahkan.
+3. **ETH.begin() salah tanda tangan**: API core esp32 3.3.7 untuk SPI PHY =
+   `begin(tipe, phy_addr, cs, irq, rst, SPI)` -> diubah ke
+   `ETH.begin(ETH_PHY_W5500, ETH_PHY_ADDR_AUTO, ETH_CS, ETH_IRQ, ETH_RST, SPI)`.
+   Verifikasi dari source core: `ETH_SPI_SUPPORTS_NO_IRQ=1` sehingga IRQ=-1 sah
+   (tanpa kabel INT), dan `ETH_PHY_ADDR_AUTO` didukung (deteksi PHY otomatis).
+
+### Audit tambahan
+- Scan seluruh file: tidak ada method-void-in-chain lain; `importJson(const
+  String&)` hanya membaca; `scnJson()` terdefinisi sebelum pemakainya.
+- BUILD_TAG v41 -> **v42**.
+
+### Open source
+- Ditambahkan `LICENSE` (MIT, copyright AlephSc) sesuai permintaan user.

@@ -64,7 +64,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v41"
+#define BUILD_TAG "v42"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -795,18 +795,12 @@ String grpJson(){
   j+="]";
   return j;
 }
+// fixJson() didefinisikan setelah blok HTML UI (~baris 1413); deklarasi
+// eksplisit supaya handler ini tidak bergantung pada auto-prototype .ino.
+String fixJson();
+
 void onGroupsGet(){ server.send(200,"application/json",grpJson()); }
 void onFixesGet(){ server.send(200,"application/json",fixJson()); }
-  String j="[";
-  for(int i=0;i<N_GROUPS;i++){
-    j+="{\"name\":\""+String(grp[i].name)+"\",";
-    j+="\"type\":"+String(grp[i].typeFilter)+",";
-    j+="\"offset\":"+String(grp[i].offset)+"}";
-    if(i<N_GROUPS-1) j+=",";
-  }
-  j+="]";
-  return j;
-}
 
 // ---------------------------------------------------------------
 // HTML UI
@@ -1622,13 +1616,14 @@ static bool     serImportProvided[N_PRESETS]={false};
 
 // Helper: ambil argumen integer ke-n dari string (split by space)
 static int serArgInt(const String& args, int idx){
-  String s=args.trim();
+  String s=args; s.trim();   // trim() mengubah in-place: butuh salinan non-const
   int i=0,tok=0,len=s.length();
   while(i<len){
     int sp=s.indexOf(' ',i);
     if(sp==-1) sp=len;
     String t=s.substring(i,sp);
-    if(t.trim().length()>0 && tok==idx) return t.toInt();
+    t.trim();
+    if(t.length()>0 && tok==idx) return t.toInt();
     tok++; i=sp+1;
   }
   return 0;
@@ -2016,7 +2011,10 @@ void setup(){
   // Ethernet W5500 (via SPI). Mulai non-blocking; cek link setelah WiFi.
   // Kalau Ethernet dapat IP, dia jadi jalur utama (latensi lebih rendah daripada WiFi).
   SPI.begin(18,19,23);                    // VSPI: SCLK=18, MISO=19, MOSI=23
-  ETH.begin(ETH_PHY_W5500, ETH_CS, ETH_IRQ, ETH_RST, SPI);
+  // API core esp32 3.x untuk SPI PHY: begin(tipe, phy_addr, cs, irq, rst, SPI)
+  // ETH_PHY_ADDR_AUTO = deteksi alamat PHY W5500 otomatis. IRQ/RST = -1 sah
+  // di core ini (ETH_SPI_SUPPORTS_NO_IRQ), jadi tidak perlu kabel INT.
+  ETH.begin(ETH_PHY_W5500, ETH_PHY_ADDR_AUTO, ETH_CS, ETH_IRQ, ETH_RST, SPI);
   Serial.println("Ethernet W5500: inisialisasi...");
 
   // Tunggu Ethernet dapat IP (non-blocking sampai 5 detik tambahan)
