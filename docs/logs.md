@@ -1142,3 +1142,46 @@ User menemukan 3 gap paritas vs Web UI: (1) import JSON via serial belum ada,
 
 ### Status akhir
 Firmware v39 + Desktop App + EXE sudah complete ? repo GitHub https://github.com/AlephSc/dmx512 siap dipakai.
+
+## Session 41 - 2026-08-26 12:00 - Firmware v40+v41 & Desktop transport WiFi/Ethernet
+
+### Permintaan user
+Kontrol jarak jauh (2-3m+) lewat router tanpa bergantung WiFi: modul RJ45 W5500
+di ESP32, laptop tetap bisa kontrol semua perangkat. Jarak dekat tetap USB+desktop.
+
+### Firmware v40 (endpoint metadata HTTP)
+- GET /fixes  -> fixJson()  (paritas LISTF serial)
+- GET /groups -> grpJson()  (paritas LISTG serial)
+- Dibutuhkan desktop transport HTTP agar bisa render mixer tanpa hardcode.
+
+### Firmware v41 (Ethernet W5500)
+- #include <ETH.h> (dukungan bawaan core ESP32 3.3.7, tanpa library tambahan).
+- Pin W5500: CS=GPIO5, RST/IRQ=-1; SPI VSPI: SCLK=18, MISO=19, MOSI=23.
+  (Tidak bentrok dgn DMX: GPIO17/16/4.)
+- setup(): SPI.begin + ETH.begin(ETH_PHY_W5500,...) setelah WiFi; tunggu link
+  5 detik + DHCP 3 detik; laporkan IP Ethernet di Serial.
+- activeIP() kini prioritas: Ethernet > WiFi STA > AP.
+- Fallback AP darurat HANYA bila WiFi gagal DAN Ethernet tidak link-up.
+- WebServer(port 80) & AsyncWebSocket(port 81) otomatis melayani semua
+  interface (bind 0.0.0.0) -> tidak ada perubahan handler.
+
+### Desktop
+- transport.py: HttpTransport — interface identik dgn SerialTransport;
+  menerjemahkan perintah serial-style ke endpoint REST; IMPORT via multipart
+  POST /import (lebih cepat dari batch serial); urllib stdlib (tanpa deps baru).
+- main.py: selector "USB Serial / WiFi (HTTP)" di toolbar + input IP;
+  _toggle_conn cabang per transport; _do_import via HTTP saat WiFi aktif.
+- Verifikasi: py_compile semua file desktop OK.
+
+### Arsitektur final (sesuai permintaan user)
+- Jarak dekat : USB -> desktop app (SerialTransport) — latensi terendah.
+- Jarak jauh  : W5500 -> router -> laptop via WiFi/HTTP+WS (HttpTransport).
+- Desktop TIDAK perlu tahu transport mana: cukup masukkan IP ESP32 (Ethernet
+  dari DHCP router). Web UI browser juga tetap bisa dipakai bersamaan.
+
+### Uji (user)
+1. Pasang W5500: VCC->3.3V, GND->GND, SCLK->18, MISO->19, MOSI->23, CS->5.
+2. Colok kabel LAN W5500 -> router; upload firmware v41.
+3. Serial Monitor harus menampilkan "Ethernet tersambung. IP: http://x.x.x.x".
+4. Buka IP tsb di browser (Web UI) ATAU desktop app mode WiFi (HTTP).
+5. Cabut kabel LAN -> device kembali via WiFi SIGMA; tanpa keduanya -> AP darurat.

@@ -6,7 +6,7 @@ Kontroler GUI Windows untuk ESP32 DMX512 console.
 
 - Windows 10/11 64-bit
 - Python 3.10 atau lebih baru (pastikan ada di PATH)
-- Firmware ESP32 versi **v38** ke atas
+- Firmware ESP32 versi **v41** ke atas (v40 utk WiFi HTTP, v41 utk Ethernet W5500)
 
 ## Cara pakai (langsung pakai exe)
 

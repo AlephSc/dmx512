@@ -48,10 +48,23 @@
 #include <Preferences.h>
 #include <Arduino.h>
 #include "Dmx_ESP32.h"
+#include <ETH.h>           // W5500 & TCP/IP stack (core 3.x+)
+
+// =============================================================
+// PIN ETHERNET W5500 (VSPI default ESP32) — sambungkan ke modul W5500:
+//   W5500 VCC → 3.3V  (modul ada regulator -> bisa terima 5V input via DC jack)
+//   W5500 GND → GND
+//   SCLK    → GPIO 18 (VSPI MISO: 19, MOSI: 23)
+//   CS      → GPIO 5  (chip select; tidak dipakai pin boot)
+//   RST     → tie to 3.3V via 10k pull-up (GPIO -1 = auto)
+// =============================================================
+#define ETH_CS    5
+#define ETH_RST   -1    // -1 = tidak gunakan GPIO reset
+#define ETH_IRQ   -1    // -1 = tidak gunakan IRQ (polling mode lebih stabil untuk kasus ini)
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v39"
+#define BUILD_TAG "v41"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -63,8 +76,9 @@ const char* WIFI_PASS = "1ngantos12";
 const char* AP_SSID = "DMX-RGB";
 const char* AP_PASS = "12345678";
 
-// IP aktif sesuai mode (STA atau AP fallback)
+// IP aktif sesuai mode (Ethernet > WiFi STA > AP fallback)
 IPAddress activeIP(){
+  if(ETH.linkUp() && ETH.localIP()!=IPAddress(0,0,0,0)) return ETH.localIP();   // Ethernet menang bila ada
   if((WiFi.getMode() & WIFI_STA) && WiFi.status()==WL_CONNECTED) return WiFi.localIP();
   return WiFi.softAPIP();
 }
@@ -771,6 +785,18 @@ void onGroup(){
 }
 
 String grpJson(){
+  String j="[";
+  for(int i=0;i<N_GROUPS;i++){
+    j+="{\"name\":\""+String(grp[i].name)+"\",";
+    j+="\"type\":"+String(grp[i].typeFilter)+",";
+    j+="\"offset\":"+String(grp[i].offset)+"}";
+    if(i<N_GROUPS-1) j+=",";
+  }
+  j+="]";
+  return j;
+}
+void onGroupsGet(){ server.send(200,"application/json",grpJson()); }
+void onFixesGet(){ server.send(200,"application/json",fixJson()); }
   String j="[";
   for(int i=0;i<N_GROUPS;i++){
     j+="{\"name\":\""+String(grp[i].name)+"\",";
@@ -1986,21 +2012,52 @@ void setup(){
     delay(250); Serial.print(".");
   }
   Serial.println();
+
+  // Ethernet W5500 (via SPI). Mulai non-blocking; cek link setelah WiFi.
+  // Kalau Ethernet dapat IP, dia jadi jalur utama (latensi lebih rendah daripada WiFi).
+  SPI.begin(18,19,23);                    // VSPI: SCLK=18, MISO=19, MOSI=23
+  ETH.begin(ETH_PHY_W5500, ETH_CS, ETH_IRQ, ETH_RST, SPI);
+  Serial.println("Ethernet W5500: inisialisasi...");
+
+  // Tunggu Ethernet dapat IP (non-blocking sampai 5 detik tambahan)
+  uint32_t ethStart=millis();
+  while(!ETH.linkUp() && millis()-ethStart<5000){ delay(100); }
+  if(ETH.linkUp()){
+    // link aktif; tunggu DHCP/IP sampai 3 detik lagi
+    uint32_t ipStart=millis();
+    while(ETH.localIP()==IPAddress(0,0,0,0) && millis()-ipStart<3000){ delay(100); }
+    if(ETH.localIP()!=IPAddress(0,0,0,0)){
+      Serial.print("Ethernet tersambung. IP: http://");
+      Serial.println(ETH.localIP());
+    } else {
+      Serial.println("Ethernet link aktif tapi belum dapat IP (DHCP).");
+    }
+  } else {
+    Serial.println("Ethernet: tidak terdeteksi link (kabel tidak dicolok?).");
+  }
+
   if(WiFi.status()==WL_CONNECTED){
-    Serial.print("Tersambung. Buka browser: http://");
+    Serial.print("WiFi tersambung. IP: http://");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("Gagal tersambung. Fallback ke AP darurat.");
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    Serial.print("AP: "); Serial.print(AP_SSID);
-    Serial.print(" | Buka browser: http://"); Serial.println(WiFi.softAPIP());
+    // Fallback AP darurat hanya kalau TIDAK ada Ethernet sama sekali
+    if(!ETH.linkUp()){
+      Serial.println("WiFi gagal & Ethernet tidak ada. Fallback ke AP darurat.");
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP(AP_SSID, AP_PASS);
+      Serial.print("AP: "); Serial.print(AP_SSID);
+      Serial.print(" | Buka browser: http://"); Serial.println(WiFi.softAPIP());
+    } else {
+      Serial.println("WiFi gagal, tapi Ethernet aktif — pakai Ethernet saja.");
+    }
   }
 
   server.on("/",      HTTP_GET, sendUi);
   server.on("/set",   HTTP_GET, onSet);
   server.on("/grp",   HTTP_GET, onGroup);
-  server.on("/scenes",HTTP_GET, onScenesGet);
+   server.on("/scenes",HTTP_GET, onScenesGet);
+   server.on("/fixes", HTTP_GET, onFixesGet);    // v40: metadata fixture (paritas LISTF serial)
+   server.on("/groups",HTTP_GET, onGroupsGet);   // v40: metadata grup fader (paritas LISTG serial)
   server.on("/spush", HTTP_GET, onSPush);
   server.on("/spop",  HTTP_GET, onSPop);
   server.on("/sclear",HTTP_GET, onSClear);

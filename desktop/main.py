@@ -1,16 +1,16 @@
 # DMX512 ESP32 Desktop Controller — jendela utama.
-# Firmware yang dibutuhkan: v38+ (protokol serial paritas penuh).
+# Firmware yang dibutuhkan: v40+ (serial paritas penuh + endpoint /fixes /groups).
+# Dua jalur koneksi: USB Serial (SerialTransport) & WiFi HTTP (HttpTransport).
 import json
 import sys
 
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog,
-                               QHBoxLayout, QLabel, QMainWindow, QPushButton,
+                               QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
                                QTabWidget, QVBoxLayout, QWidget)
-
 from state import DeviceState
-from transport import SerialTransport, list_candidate_ports
+from transport import SerialTransport, list_candidate_ports, HttpTransport
 from ui.mixer_tab import MixerTab
 from ui.presets_tab import PresetsTab
 from ui.scenes_tab import ScenesTab
@@ -36,19 +36,34 @@ class MainWindow(QMainWindow):
         # toolbar koneksi
         bar = QWidget()
         h = QHBoxLayout(bar)
+        # pemilih transport: USB Serial / WiFi HTTP
+        h.addWidget(QLabel("Via:"))
+        self.transport_combo = QComboBox()
+        self.transport_combo.addItems(["USB Serial", "WiFi (HTTP)"])
+        self.transport_combo.currentIndexChanged.connect(self._on_transport_changed)
+        h.addWidget(self.transport_combo)
+        # --- kontrol USB Serial ---
         h.addWidget(QLabel("Port:"))
         self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(280)
+        self.port_combo.setMinimumWidth(220)
         self.btn_refresh = QPushButton("Cari Port")
         self.btn_refresh.clicked.connect(self._refresh_ports)
+        h.addWidget(self.port_combo)
+        h.addWidget(self.btn_refresh)
+        # --- kontrol WiFi ---
+        h.addWidget(QLabel("IP:"))
+        self.ip_edit = QLineEdit()
+        self.ip_edit.setPlaceholderText("IP ESP32 (WiFi/Ethernet)")
+        self.ip_edit.setMaximumWidth(150)
+        self.ip_edit.setEnabled(False)
+        h.addWidget(self.ip_edit)
+        # --- tombol sambung ---
         self.btn_conn = QPushButton("SAMBUNG")
         self.btn_conn.setCheckable(True)
         self.btn_conn.setObjectName("goBtn")
         self.btn_conn.clicked.connect(self._toggle_conn)
         self.conn_lbl = QLabel("tidak terhubung")
         self.conn_lbl.setObjectName("connLbl")
-        h.addWidget(self.port_combo)
-        h.addWidget(self.btn_refresh)
         h.addWidget(self.btn_conn)
         h.addWidget(self.conn_lbl)
         h.addStretch(1)
@@ -102,16 +117,38 @@ class MainWindow(QMainWindow):
         if self.port_combo.count() == 0:
             self.port_combo.addItem("(tidak ada COM port)")
 
+    def _on_transport_changed(self, index):
+        # Enable/disable controls berdasarkan transport yang dipilih
+        is_serial = (index == 0)
+        self.port_combo.setEnabled(is_serial)
+        self.btn_refresh.setEnabled(is_serial)
+        self.ip_edit.setEnabled(not is_serial)
+
     def _toggle_conn(self, on):
         if on:
-            port = self.port_combo.currentData()
-            if not port:
-                self._set_status("Pilih COM port dulu.")
-                self.btn_conn.setChecked(False)
-                return
-            if not self.transport.open(port):
-                self.btn_conn.setChecked(False)
-                return
+            is_serial = (self.transport_combo.currentIndex() == 0)
+            if is_serial:
+                port = self.port_combo.currentData()
+                if not port:
+                    self._set_status("Pilih COM port dulu.")
+                    self.btn_conn.setChecked(False)
+                    return
+                self.transport = SerialTransport()
+                if not self.transport.open(port):
+                    self.btn_conn.setChecked(False)
+                    return
+                target = port
+            else:
+                ip = self.ip_edit.text().strip()
+                if not ip:
+                    self._set_status("Isi alamat IP ESP32 dulu.")
+                    self.btn_conn.setChecked(False)
+                    return
+                self.transport = HttpTransport()
+                if not self.transport.open(ip):
+                    self.btn_conn.setChecked(False)
+                    return
+                target = f"WiFi {ip}"
             self._thread = QThread(self)
             self._worker = SerialWorker(self.transport)
             self._worker.moveToThread(self._thread)
@@ -127,9 +164,9 @@ class MainWindow(QMainWindow):
                 self._worker.cmd_queue.put((kind, kind))
             self.btn_conn.setText("PUTUS")
             self.btn_conn.setObjectName("dangerBtn")
-            self.conn_lbl.setText(f"terhubung: {port}")
-            self._set_status(f"Terhubung ke {port}.")
-            self.tab_system.log(f"== Terhubung ke {port} ==")
+            self.conn_lbl.setText(f"terhubung: {target}")
+            self._set_status(f"Terhubung ke {target}.")
+            self.tab_system.log(f"== Terhubung ke {target} ==")
         else:
             self._disconnect()
 
@@ -173,11 +210,12 @@ class MainWindow(QMainWindow):
         self._worker.cmd_queue.put(("EXPORT", "EXPORT"))
 
     def _do_import(self):
-        """Import file hasil EXPORT (.json) ke ESP32 via protokol batch serial.
+        """Import file hasil EXPORT (.json) ke ESP32.
 
-        Alur: IMPORT_BEGIN -> per preset: IMPORT_P + 8x IMPORT_C (64 ch/baris)
-        -> IMPORT_END (commit + persist NVS) -> refresh LISTP.
-        Round-trip penuh ±146 perintah ≈ 3-6 detik di 115200 baud.
+        Via WiFi : upload file langsung (multipart POST /import) — cepat.
+        Via Serial: IMPORT_BEGIN -> per preset: IMPORT_P + 8x IMPORT_C (64 ch/baris)
+                    -> IMPORT_END (commit + persist NVS) -> refresh LISTP.
+                    Round-trip penuh ±146 perintah ≈ 3-6 detik di 115200 baud.
         """
         if self._worker is None:
             self._set_status("Belum terhubung.")
@@ -196,6 +234,16 @@ class MainWindow(QMainWindow):
         if not isinstance(presets, list) or not presets:
             self._set_status("Format bukan file export DMX-RGB (kurang 'presets').")
             return
+        # Via WiFi: upload file langsung lewat HTTP multipart (jauh lebih cepat)
+        if getattr(self.transport, "is_http", False):
+            if self.transport.import_file(path):
+                self._worker.cmd_queue.put(("LISTP", "LISTP"))
+                self._set_status("Import selesai (HTTP).")
+                self.tab_system.log(f"Import dari {path} via HTTP sukses.")
+            else:
+                self._set_status("Import HTTP gagal.")
+            return
+        # Via USB Serial: batch IMPORT_BEGIN / IMPORT_P / IMPORT_C / IMPORT_END
         q = self._worker.cmd_queue
         q.put(("cmd", "IMPORT_BEGIN"))
         n_total = 0
