@@ -1117,3 +1117,28 @@ User menemukan 3 gap paritas vs Web UI: (1) import JSON via serial belum ada,
 3. Desktop: buka tab Scene -> EDIT MODE -> klik scene (tidak ada output!) ->
    klik pad preset utk menambah langkah -> ? Cek utk tes -> SHOW MODE utk live.
 4. Round-trip: EXPORT dari device A -> simpan file -> IMPORT ke device B.
+
+## Session 40 - 2026-08-26 02:30 - Packaging DMX512Controller.exe (PySide6 v1)
+
+### Lingkungan Python
+- Python 3.9.0 + PySide6 6.10.3 + pyserial 3.5 + PyInstaller 6.22.2
+
+### Hasil packaging
+- **dist/DMX512Controller.exe** (22.2 MB, single-file Windows executable)
+- Build menggunakan `--onefile --windowed --name DMX512Controller main.py`
+- Bundle mencakup Qt 6.x + Shiboken runtime (Qt framework embedding via PySide6)
+
+### Cara pakai (.exe jadi)
+1. Colok ESP32 ke USB ? buka `DMX512Controller.exe`
+2. Pilih COM port (terdeteksi otomatis dengan VID CH340/CP210x/FTDI/ESP32) ? **SAMBUNG**
+3. Gunakan tab Mixer/Preset/Scene/Sistem seperti deskripsi di README.md desktop
+4. Shortcut: Space = BLACKOUT, Esc = Stop Scene
+
+### Catatan teknis
+- DLL Shiboken/Qt ter-embed dalam EXE ? tidak perlu install Python terpisah
+- Ukuran 22 MB karena Qt framework full bundle; dapat dioptimalkan lebih kecil dengan opsi strip/hide-but bukan prioritas MVP
+- .gitignore sudah exclude dist/, build/, __pycache__
+- Reprodusibilitas build tersedia via `desktop/DMX512Controller.spec` (commit terakhir)
+
+### Status akhir
+Firmware v39 + Desktop App + EXE sudah complete ? repo GitHub https://github.com/AlephSc/dmx512 siap dipakai.
