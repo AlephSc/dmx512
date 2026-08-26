@@ -32,7 +32,7 @@ class PresetsTab(QWidget):
         grid.setSpacing(6)
         for i in range(30):
             p = PadButton(str(i + 1), small=True)
-            p.clicked.connect(lambda _, i=i: self._on_pad(i))
+            p.clicked.connect(self._pad_handler(i))
             grid.addWidget(p, i // 6, i % 6)
             self.pads.append(p)
         root.addLayout(grid)
@@ -86,6 +86,13 @@ class PresetsTab(QWidget):
             self.hint_lbl.setText("(klik pad = pilih + mainkan preset)")
             self.chk_idim.setEnabled(True)
         self._update_info_label()
+
+    def _pad_handler(self, i):
+        # Factory: PySide6 6.6 mengirim argumen sinyal 'clicked' (bool checked)
+        # secara tidak konsisten ke lambda default-arg (bisa menggantikan nilai
+        # tangkapan, bisa tidak mengirim sama sekali). lambda *a menelan
+        # 0 atau 1 argumen -> indeks tangkapan selalu benar di semua versi.
+        return lambda *a: self._on_pad(i)
 
     def _on_pad(self, i):
         if self.scene_edit:

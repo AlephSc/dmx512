@@ -137,12 +137,15 @@ class MixerTab(QWidget):
                 self.b_chase.setChecked(on)
                 self.b_chase.setText("CHASE ON" if on else "CHASE OFF")
         cur = j.get("cur", {})
+        # Fader grup: hanya di-set bila SEMUA member seragam. Kalau member
+        # berbeda (satu fixture digeser manual), posisi fader grup dibiarkan
+        # -> tidak ada lompatan visual (paritas syncGroups web v43).
         for i, f in enumerate(self.group_faders):
             if f"grp{i}" in active_keys:
                 continue
-            v = st.group_value(i)
-            if v is not None:
-                f.set_value(v)
+            vals = st.group_values(i)
+            if vals and all(v == vals[0] for v in vals):
+                f.set_value(vals[0])
         for key, f in self.chan_faders.items():
             if key in active_keys:
                 continue

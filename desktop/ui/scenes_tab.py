@@ -52,7 +52,7 @@ class ScenesTab(QWidget):
         grid.setSpacing(4)
         for i in range(20):
             p = PadButton(f"S{i+1}", small=True)
-            p.clicked.connect(lambda _, i=i: self._on_pad(i))
+            p.clicked.connect(self._pad_handler(i))
             grid.addWidget(p, i // 5, i % 5)
             self.pads.append(p)
         root.addLayout(grid)
@@ -120,6 +120,11 @@ class ScenesTab(QWidget):
             self.info_lbl.setText("SHOW MODE: klik scene = langsung mainkan; klik lagi = stop.")
 
     # ---- aksi ---------------------------------------------------------------
+    def _pad_handler(self, i):
+        # Factory: lambda *a menelan argumen 'clicked' (bool checked) yang
+        # dikirim tidak konsisten oleh PySide6 6.6 -> indeks tangkapan aman.
+        return lambda *a: self._on_pad(i)
+
     def _on_pad(self, i):
         self.local_sel = i
         if self.scene_edit:
