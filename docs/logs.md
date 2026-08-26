@@ -1283,3 +1283,61 @@ Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
 
 ### Open source
 - Ditambahkan `LICENSE` (MIT, copyright AlephSc) sesuai permintaan user.
+
+---
+
+## Session 45 — Audit keandalan besar: hapus delay, fix tombol macet, WiFi kustom, kapasitas 30/50
+
+### Akar masalah yang ditemukan (audit kode aktual, bukan tebakan)
+1. **Delay fader desktop**: worker MENUNGU balasan (timeout 2.5 dtk) untuk
+   SETIAP perintah termasuk SET/MAST/STRB; serial GET 250ms payload ~2 KB
+   (~170 ms @115200) memenuhi link; HTTP tanpa keep-alive (handshake baru
+   tiap request, +30-80 ms di WiFi).
+2. **Tombol preset/scene "tidak bisa diklik"**: `presets_tab._update_info_label`
+   memanggil `self.info_label` padahal atributnya `info_lbl` -> AttributeError
+   tiap perubahan seleksi. Karena `_on_state` memanggil tab berurutan tanpa
+   proteksi, crash ini MEMBUNUH apply_state Scene & System di bawahnya.
+3. **Bug JS tersembunyi**: `N_PRESETS` dipakai di `syncSelectedState` tapi
+   tidak pernah didefinisikan -> ReferenceError membunuh sinkronisasi begitu
+   ada preset terpilih.
+4. Kapasitas NVS: satu value NVS maks ~4000 byte; 30 preset kompak = 5370 B
+   -> key harus dipecah (pc0/pc1).
+
+### Perbaikan firmware (BUILD_TAG v43)
+- **Kontrol via WebSocket** (`wsHandleCtl`): pesan `{"t":"s|mast|strb|all"}`
+  diaplikasikan langsung (mutex+snap); HTTP /set jadi fallback.
+- **WiFi kustom**: kredensial di NVS namespace terpisah `dmxwifi`; endpoint
+  `/wifistat` & `/wifiset`; reconnect non-blocking 6 percobaan di
+  `wifiReconnectTick()`, gagal -> kembali ke bawaan + AP darurat; paritas
+  serial `WIFIS`/`WIFIST`.
+- **Kapasitas**: N_PRESETS 16->30, SCENE_STEPS 30->50; STORAGE_VER 7->8
+  (preset lama direset sekali saat boot pertama v43 - rekam ulang).
+- Storage NVS dipecah: `pc0`/`pc1` @15 preset (2685 B) + `sc` (1000 B).
+- Injeksi `__NP__` ke JS (fix bug N_PRESETS).
+
+### Perbaikan Web UI
+- Slider channel/master/strobe + Blackout/Penuh/Off dikirim via WS (instan,
+  tanpa antrean HTTP); fallback otomatis bila WS putus.
+- Panel WiFi baru (status live + form SSID/sandi + panduan IP berubah).
+
+### Perbaikan desktop
+- Fix `info_lbl`; `_on_state` kini defensif per-tab (satu tab error tidak
+  membunuh sinkronisasi global; error tercatat ke log Sistem).
+- **Fire-and-forget** `FIRE_OPS` (SET/MAST/STRB/GRP/ALL/CHASE/SELP/SELS/SSTOP):
+  `transport.send()` tanpa tunggu balasan; polling serial 0.25->0.4 dtk.
+- HttpTransport keep-alive persisten (http.client) + `send()` thread latar.
+- Validasi bentuk payload di `_on_data` (anti respons basi pasca fire-and-forget).
+- Bank preset 30 pad (6 kolom), import cap 30, MIDI default Note 36-63 -> preset 1-28.
+- Tab Sistem: panel WiFi kustom (WIFIS/WIFIST + polling status 15x).
+- Tab MIDI dipoles: 3 section bernomor, riwayat aktivitas 8 event, tabel
+  selang-seling, LEARN nonaktif sampai tersambung.
+- Catatan: build .exe BELUM dijalankan ulang - jalankan `desktop\build.bat`
+  setelah semua teruji bila ingin exe terbaru.
+
+### Protokol uji
+1. Upload firmware v43 -> Serial: `=== DMX Web Console v43 ===`; rekam ulang
+   preset (migrasi storage) lalu Save Data.
+2. Web: geser fader = realtime via WS (cek Serial tidak banjir request HTTP);
+   panel WiFi: isi SSID/sandi -> status berubah hijau bila sukses.
+3. Desktop (`python desktop\main.py`): klik pad preset/scene berfungsi,
+   fader tanpa delay, tab Sistem bisa ubah WiFi ESP32.

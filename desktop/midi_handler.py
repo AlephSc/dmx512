@@ -26,7 +26,7 @@ ACTIONS = [
     ("strb", "Strobe master (CC)"),
     ("group", "Fader grup (CC, param=grup 0-7)"),
     ("chan", "Channel fixture (CC, param1=fixture, param2=ch)"),
-    ("preset", "Mainkan preset (Note, param=0-15)"),
+    ("preset", "Mainkan preset (Note, param=0-29)"),
     ("scene_play", "Mainkan scene (Note, param=0-19)"),
     ("scene_stop", "Stop scene (Note)"),
     ("blackout", "Blackout ALL off (Note)"),
@@ -46,8 +46,8 @@ def _default_map():
     # CC 16/17 -> master & strobe (knob pertama)
     cc["16"] = {"action": "master"}
     cc["17"] = {"action": "strb"}
-    # Note 36-51 -> preset 1-16 (pad grid 4x4)
-    for i in range(16):
+    # Note 36-63 -> preset 1-28 (pad grid; preset 29-30 via MIDI-learn)
+    for i in range(28):
         note[str(36 + i)] = {"action": "preset", "index": i}
     # Note 64-67 -> aksi global
     note["64"] = {"action": "blackout"}

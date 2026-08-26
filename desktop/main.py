@@ -4,7 +4,7 @@
 import json
 import sys
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
@@ -98,6 +98,13 @@ class MainWindow(QMainWindow):
         self.tab_mixer.active.connect(self._on_active)
         self.tab_system.export_requested.connect(self._do_export)
         self.tab_system.import_requested.connect(self._do_import)
+        # WiFi kustom ESP32 (v43)
+        self.tab_system.wifi_refresh_requested.connect(self._wifi_refresh)
+        self.tab_system.wifi_apply_requested.connect(self._wifi_apply)
+        self._wifi_polls = 0
+        self._wifi_timer = QTimer(self)
+        self._wifi_timer.setInterval(2000)
+        self._wifi_timer.timeout.connect(self._wifi_poll_tick)
         # EDIT MODE scene -> klik pad preset menambah langkah (bukan play)
         self.tab_scenes.edit_mode_changed.connect(self.tab_presets.set_scene_edit)
         # MIDI wiring
@@ -267,7 +274,7 @@ class MainWindow(QMainWindow):
         q.put(("cmd", "IMPORT_BEGIN"))
         n_total = 0
         CHUNK = 64
-        for idx, pr in enumerate(presets[:16]):
+        for idx, pr in enumerate(presets[:30]):
             if not isinstance(pr, dict):
                 continue
             n = idx + 1
@@ -294,13 +301,37 @@ class MainWindow(QMainWindow):
         else:
             self.active_keys.discard(key)
 
+    # ---- WiFi ESP32 (v43) ----------------------------------------------------
+    def _wifi_refresh(self):
+        if self._worker is not None:
+            self._worker.cmd_queue.put(("WIFIST", "WIFIST"))
+
+    def _wifi_apply(self, ssid, pw):
+        if self._worker is None:
+            self._set_status("Belum terhubung — WiFi tidak bisa diubah.")
+            return
+        self._worker.cmd_queue.put(("cmd", f"WIFIS {ssid} {pw}"))
+        self.tab_system.log(f"WiFi: menerapkan kredensial '{ssid}' ke ESP32...")
+        self._set_status("WiFi: koneksi baru dicoba — status diperbarui otomatis.")
+        self._wifi_polls = 0
+        self._wifi_timer.start()
+
+    def _wifi_poll_tick(self):
+        self._wifi_polls += 1
+        self._wifi_refresh()
+        if self._wifi_polls >= 15:      # ~30 detik cukup utk 6 percobaan reconnect
+            self._wifi_timer.stop()
+
     # ---- respons dari worker ----------------------------------------------
     def _on_state(self, j):
         self.state.live = j
-        self.tab_mixer.apply_state(self.state, self.active_keys)
-        self.tab_presets.apply_state(self.state, self.active_keys)
-        self.tab_scenes.apply_state(self.state, self.active_keys)
-        self.tab_system.apply_state(self.state, self.active_keys)
+        # Keandalan panggung: kegagalan di SATU tab tidak boleh membunuh
+        # sinkronisasi tab lainnya (pola defensif, log ke tab Sistem).
+        for tab in (self.tab_mixer, self.tab_presets, self.tab_scenes, self.tab_system):
+            try:
+                tab.apply_state(self.state, self.active_keys)
+            except Exception as e:  # noqa: BLE001
+                self.tab_system.log(f"apply_state {type(tab).__name__}: {e}")
         self.rev_lbl.setText(f"rev {j.get('revision','?')}"
                              + (" • belum disimpan" if j.get("nvsDirty") else ""))
 
@@ -308,18 +339,28 @@ class MainWindow(QMainWindow):
         if payload is None:
             self._set_status(f"{kind}: tidak ada respons.")
             return
+        # Validasi bentuk payload: dengan fire-and-forget, respons basi
+        # (mis. sisa {"ok":true}) bisa nyasar ke slot data -> tolak yang salah bentuk.
         if kind == "LISTF":
-            self.state.fixtures = payload
-            self.tab_mixer.build_fixtures(payload)
+            if isinstance(payload, list) and all(isinstance(x, dict) and "name" in x for x in payload):
+                self.state.fixtures = payload
+                self.tab_mixer.build_fixtures(payload)
         elif kind == "LISTG":
-            self.state.groups = payload
-            self.tab_mixer.build_groups(payload)
+            if isinstance(payload, list) and all(isinstance(x, dict) for x in payload):
+                self.state.groups = payload
+                self.tab_mixer.build_groups(payload)
         elif kind == "LISTP":
-            self.state.presets = payload
+            if isinstance(payload, list):
+                self.state.presets = payload
         elif kind == "LISTS":
-            self.state.scenes = payload
+            if isinstance(payload, list):
+                self.state.scenes = payload
         elif kind == "EXPORT":
-            self._save_export(payload)
+            if isinstance(payload, dict) and "presets" in payload:
+                self._save_export(payload)
+        elif kind == "WIFIST":
+            if isinstance(payload, dict):
+                self.tab_system.set_wifi(payload)
 
     def _on_cmd_done(self, cmd, resp):
         if isinstance(resp, dict) and resp.get("ok") is False:

@@ -1,8 +1,10 @@
-# Tab MIDI: pilih device, lihat aktivitas realtime, edit mapping, MIDI-learn.
+# Tab MIDI: perangkat, aktivitas realtime, tabel mapping, MIDI-learn.
+# v43-polish: layout 3 section jelas, riwayat aktivitas (bukan satu baris),
+# tabel warna selang-seling, kontrol learn nonaktif saat belum tersambung.
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (QComboBox, QGridLayout, QHBoxLayout, QHeaderView,
                                QLabel, QPushButton, QSpinBox, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout, QWidget)
+                               QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
 from midi_handler import ACTIONS, MIDI_AVAILABLE
 
@@ -21,20 +23,22 @@ class MidiTab(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._act_lines = []
         self._build()
 
     def _build(self):
         root = QVBoxLayout(self)
-        lbl = QLabel("KONTROLER MIDI")
-        lbl.setObjectName("sectLbl")
-        root.addWidget(lbl)
+        root.setSpacing(10)
 
         if not MIDI_AVAILABLE:
             warn = QLabel("Library MIDI tidak tersedia — install: pip install mido python-rtmidi")
-            warn.setStyleSheet("color:#ff8a65;")
+            warn.setStyleSheet("color:#ff8a65;font-weight:bold;")
             root.addWidget(warn)
 
-        # --- baris device ---
+        # ============ SECTION 1: PERANGKAT ============
+        s1 = QLabel("1 · PERANGKAT")
+        s1.setObjectName("sectLbl")
+        root.addWidget(s1)
         dev = QHBoxLayout()
         dev.addWidget(QLabel("Device:"))
         self.device_combo = QComboBox()
@@ -51,26 +55,31 @@ class MidiTab(QWidget):
         dev.addStretch(1)
         root.addLayout(dev)
 
-        # --- status & aktivitas ---
         st = QHBoxLayout()
         self.status_lbl = QLabel("tidak terhubung")
-        self.status_lbl.setObjectName("connLbl")
+        self.status_lbl.setStyleSheet("color:#9aa4b2;")
         st.addWidget(self.status_lbl)
         st.addStretch(1)
-        st.addWidget(QLabel("Aktivitas:"))
-        self.activity_lbl = QLabel("-")
-        self.activity_lbl.setMinimumWidth(240)
-        self.activity_lbl.setStyleSheet("color:#8ab4f8;")
-        st.addWidget(self.activity_lbl)
         root.addLayout(st)
 
-        # --- tabel mapping ---
-        root.addWidget(QLabel("MAPPING (CC = fader/knob, Note = pad/tombol):"))
+        root.addWidget(QLabel("Aktivitas terakhir (realtime):"))
+        self.activity_box = QTextEdit()
+        self.activity_box.setReadOnly(True)
+        self.activity_box.setFixedHeight(74)
+        self.activity_box.setPlaceholderText("belum ada event MIDI...")
+        root.addWidget(self.activity_box)
+
+        # ============ SECTION 2: MAPPING ============
+        s2 = QLabel("2 · MAPPING (CC = fader/knob · Note = pad/tombol)")
+        s2.setObjectName("sectLbl")
+        root.addWidget(s2)
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Tipe", "Nomor", "Aksi", "Param"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
         root.addWidget(self.table, 1)
 
         tbl_btns = QHBoxLayout()
@@ -88,9 +97,12 @@ class MidiTab(QWidget):
         tbl_btns.addStretch(1)
         root.addLayout(tbl_btns)
 
-        # --- MIDI learn ---
+        # ============ SECTION 3: MIDI-LEARN ============
+        s3 = QLabel("3 · MIDI-LEARN")
+        s3.setObjectName("sectLbl")
+        root.addWidget(s3)
         learn = QHBoxLayout()
-        learn.addWidget(QLabel("MIDI-LEARN — pilih aksi, klik Learn, lalu gerakkan fader/tekan pad:"))
+        learn.addWidget(QLabel("Aksi:"))
         self.action_combo = QComboBox()
         for k, lbltxt in ACTIONS:
             self.action_combo.addItem(lbltxt, k)
@@ -106,14 +118,16 @@ class MidiTab(QWidget):
         self.btn_learn = QPushButton("LEARN")
         self.btn_learn.setCheckable(True)
         self.btn_learn.setObjectName("editBtn")
+        self.btn_learn.setEnabled(False)   # aktif setelah MIDI tersambung
         self.btn_learn.clicked.connect(self._on_learn)
         learn.addWidget(self.btn_learn)
         learn.addStretch(1)
         root.addLayout(learn)
 
         hint = QLabel(
-            "P1/P2 dipakai sesuai aksi: group=P1(0-7), preset=P1(0-15), scene_play=P1(0-19), "
-            "chan=P1=fixture & P2=channel. Aksi tanpa param mengabaikan P1/P2.")
+            "Cara pakai: pilih aksi → klik LEARN → gerakkan fader/tekan pad di controller → "
+            "mapping langsung tersimpan. P1/P2 dipakai sesuai aksi: group=P1(0-7), preset=P1(0-29), "
+            "scene_play=P1(0-19), chan=P1=fixture & P2=channel. Aksi tanpa param mengabaikan P1/P2.")
         hint.setStyleSheet("color:#9aa4b2;font-size:11px;")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -133,8 +147,14 @@ class MidiTab(QWidget):
         row = self.table.currentRow()
         if row < 0:
             return
-        kind = self.table.item(row, 0).data(Qt.UserRole)
-        num = int(self.table.item(row, 1).text())
+        it = self.table.item(row, 0)
+        if it is None:
+            return
+        kind = it.data(Qt.UserRole)
+        try:
+            num = int(self.table.item(row, 1).text())
+        except (ValueError, AttributeError):
+            return
         self.delete_requested.emit(kind, num)
 
     def _on_learn(self, on):
@@ -158,13 +178,23 @@ class MidiTab(QWidget):
             self.device_combo.addItem("(tidak ada device MIDI)")
 
     def set_status(self, text, connected=False):
-        self.status_lbl.setText(text)
+        col = "#7bd88f" if connected else "#9aa4b2"
+        self.status_lbl.setText(("● " if connected else "○ ") + text)
+        self.status_lbl.setStyleSheet(f"color:{col};font-weight:bold;")
         self.btn_conn.setChecked(connected)
         self.btn_conn.setText("PUTUS MIDI" if connected else "SAMBUNG MIDI")
         self.btn_conn.setObjectName("dangerBtn" if connected else "goBtn")
+        self.btn_learn.setEnabled(connected)
+        if not connected:
+            self.set_learn_active(False)
 
     def set_activity(self, text):
-        self.activity_lbl.setText(text)
+        # Riwayat bergulir: simpan 8 event terakhir, terbaru paling bawah.
+        self._act_lines.append(text)
+        self._act_lines = self._act_lines[-8:]
+        self.activity_box.setPlainText("\n".join(self._act_lines))
+        sb = self.activity_box.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def set_learn_active(self, on):
         self.btn_learn.setChecked(on)

@@ -1,4 +1,4 @@
-# Tab PRESET: bank 16 pad + rekam/hapus + fade/hold per preset.
+# Tab PRESET: bank 30 pad + rekam/hapus + fade/hold per preset.
 # Integrasi scene-edit mode (paritas Web): saat EDIT MODE aktif, klik pad preset menambah langkah ke scene terpilih (SPUSH).
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QSpinBox, QCheckBox, QPushButton
@@ -30,10 +30,10 @@ class PresetsTab(QWidget):
 
         grid = QGridLayout()
         grid.setSpacing(6)
-        for i in range(16):
-            p = PadButton(str(i + 1))
+        for i in range(30):
+            p = PadButton(str(i + 1), small=True)
             p.clicked.connect(lambda _, i=i: self._on_pad(i))
-            grid.addWidget(p, i // 4, i % 4)
+            grid.addWidget(p, i // 6, i % 6)
             self.pads.append(p)
         root.addLayout(grid)
 
@@ -55,7 +55,7 @@ class PresetsTab(QWidget):
         rec = QHBoxLayout()
         rec.addWidget(QLabel("REKAM output saat ini ke preset:"))
         self.sp_rec = QSpinBox()
-        self.sp_rec.setRange(1, 16); self.sp_rec.setValue(1)
+        self.sp_rec.setRange(1, 30); self.sp_rec.setValue(1)
         rec.addWidget(self.sp_rec)
         self.chk_idim = QCheckBox("tanpa dimmer")
         rec.addWidget(self.chk_idim)
@@ -121,7 +121,7 @@ class PresetsTab(QWidget):
     def _update_info_label(self):
         sel = self._selected()
         info = f"Terpilih: #{sel+1}" if sel >= 0 else "Terpilih: -"
-        self.info_label.setText(info)
+        self.info_lbl.setText(info)
 
     # ---- sinkron ------------------------------------------------------------
     def apply_state(self, st, active_keys):
@@ -138,12 +138,12 @@ class PresetsTab(QWidget):
         if sel != self._last_sel:
             self._last_sel = sel
             self._update_info_label()
-            if 0 <= sel < 16:
+            if 0 <= sel < 30:
                 pr = st.preset(sel)
                 if pr:
                     self.sp_f.setValue(int(pr.get("f", 600)))
                     self.sp_h.setValue(int(pr.get("h", 1500)))
-        elif 0 <= sel < 16:
+        elif 0 <= sel < 30:
             # nilai timing diubah dari sisi lain (web) -> ikut update selama tidak sedang diedit
             pr = st.preset(sel)
             if pr:

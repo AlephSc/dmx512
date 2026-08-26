@@ -11,8 +11,13 @@ class SerialWorker(QObject):
     data_received = Signal(str, object)  # LISTF/LISTG/LISTP/LISTS/EXPORT
     command_done = Signal(str, object)   # cmd, respons JSON (atau None)
 
-    POLL_INTERVAL = 0.25  # detik antar GET (sinkron slider realtime)
     DATA_INTERVAL = 3.0   # detik antar refresh LISTP/LISTS (data struktural)
+
+    # Perintah kontrol kontinu = FIRE-AND-FORGET (tanpa tunggu balasan).
+    # Inilah inti perbaikan delay fader desktop: sebelumnya tiap geseran
+    # mengantre round-trip 5-15 ms (bisa 2.5 dtk bila ESP32 sibuk tulis NVS).
+    # Sinkronisasi nilai tetap dijamin polling GET berkala.
+    FIRE_OPS = {"SET", "MAST", "STRB", "GRP", "ALL", "CHASE", "SELP", "SELS", "SSTOP"}
 
     def __init__(self, transport):
         super().__init__()
@@ -29,6 +34,9 @@ class SerialWorker(QObject):
     def run(self):
         last_poll = 0.0
         last_data = 0.0
+        # WiFi keep-alive cepat -> polling rapat; serial berbagi bandwidth
+        # dengan payload GET ~2 KB (~170 ms @115200) -> polling lebih renggang.
+        poll_interval = 0.25 if self.transport.is_http else 0.4
         while self._running and self.transport.connected:
             # 1) perintah dari UI dulu (prioritas)
             try:
@@ -36,6 +44,10 @@ class SerialWorker(QObject):
             except queue.Empty:
                 kind, cmd = None, None
             if cmd is not None:
+                op = cmd.split(" ", 1)[0].upper()
+                if op in self.FIRE_OPS:
+                    self.transport.send(cmd)     # tanpa round-trip
+                    continue
                 timeout = 10.0 if kind == "EXPORT" else 2.5
                 resp = self.transport.request(cmd, timeout=timeout)
                 if kind in ("LISTF", "LISTG", "LISTP", "LISTS", "EXPORT"):
@@ -45,10 +57,11 @@ class SerialWorker(QObject):
                 continue
             # 2) polling GET berkala utk sinkron dua arah
             now = time.monotonic()
-            if now - last_poll >= self.POLL_INTERVAL:
+            if now - last_poll >= poll_interval:
                 last_poll = now
                 st = self.transport.request("GET", timeout=1.0)
-                # None bisa berarti ESP32 sibuk (mis. tulis NVS/EXPORT) -> lewati
+                # None bisa berarti ESP32 sibuk (mis. tulis NVS/EXPORT) -> lewati;
+                # respons basi (mis. sisa fire-and-forget) tidak punya "master" -> lewati.
                 if isinstance(st, dict) and "master" in st:
                     self.state_received.emit(st)
             # 3) refresh data struktural (preset/scene) tiap DATA_INTERVAL

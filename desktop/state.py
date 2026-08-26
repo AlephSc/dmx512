@@ -21,7 +21,7 @@ class DeviceState:
         self.fixtures = []   # LISTF: [{name,type,start,foot}]
         self.groups = []     # LISTG: [{name,type,offset}]
         self.presets = []    # LISTP: [{n,used,r,g,b,f,h}]
-        self.scenes = []     # LISTS: 20 x 30 int (0=kosong, 1..16=preset)
+        self.scenes = []     # LISTS: 20 x 50 int (0=kosong, 1..30=preset)
         self.live = {}       # GET  : state realtime
 
     # ---- akses nyaman ----------------------------------------------------

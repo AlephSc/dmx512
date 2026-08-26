@@ -2,8 +2,15 @@
 # 1) SerialTransport  — USB serial (protokol baris, firmware v35+)
 # 2) HttpTransport    — WiFi HTTP (endpoint REST yang sama dengan Web UI, v40+)
 # Worker/UI tidak perlu tahu transport mana yang aktif.
+#
+# v43-latency: dua metode kirim di kedua transport:
+#   request(cmd) = kirim + tunggu balasan   (perintah data: GET/LIST*/EXPORT)
+#   send(cmd)    = kirim tanpa menunggu     (kontrol fader: SET/MAST/STRB/GRP)
+# Fire-and-forget menghapus antrean round-trip yang membuat fader terasa delay.
+import http.client
 import json
 import threading
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -127,12 +134,24 @@ class SerialTransport(QObject):
                 return self._resp
         return None
 
+    def send(self, cmd: str):
+        """Fire-and-forget: tulis perintah tanpa menunggu balasan.
+        Dipakai utk kontrol kontinu (fader) agar tidak ada delay round-trip."""
+        if not self.connected:
+            return
+        with self._lock:
+            try:
+                self._ser.write((cmd + "\n").encode())
+            except Exception as e:  # noqa: BLE001
+                self.error_occurred.emit(f"Serial write error: {e}")
+
 
 class HttpTransport(QObject):
     """Transport WiFi (HTTP) — paritas penuh dengan Web UI + serial v35+.
 
-    Menggunakan endpoint REST yang sama dengan browser. Tidak perlu tambahan
-    dependensi (urllib stdlib). Perintah serial-style diterjemahkan ke URL GET/POST.
+    v43-latency: koneksi keep-alive persisten (http.client) — tanpa handshake
+    TCP baru per request, memangkas 30-80 ms latensi WiFi per perintah.
+    Perintah serial-style diterjemahkan ke URL GET/POST.
     """
 
     connection_changed = Signal(bool)
@@ -140,31 +159,41 @@ class HttpTransport(QObject):
 
     def __init__(self):
         super().__init__()
-        self.base = None           # "http://192.168.0.12"
+        self.host = None           # "192.168.0.12"
+        self.base = None           # "http://192.168.0.12" (kompatibilitas lama)
         self._connected = False
+        self._conn = None          # HTTPConnection keep-alive persisten
+        self._conn_lock = threading.Lock()
 
     # ---- lifecycle -------------------------------------------------------
     def open(self, ip: str) -> bool:
         ip = ip.strip()
         if not ip:
             return False
-        base = f"http://{ip}"
+        self.host = ip
+        self.base = f"http://{ip}"
         try:
-            with urllib.request.urlopen(base + "/health", timeout=3) as r:
-                data = json.loads(r.read().decode())
-                if not data.get("ok"):
-                    raise RuntimeError("health tidak ok")
-        except Exception as e:
+            status, body = self._http("GET", "/health", timeout=3)
+            data = json.loads(body.decode())
+            if status != 200 or not data.get("ok"):
+                raise RuntimeError("health tidak ok")
+        except Exception as e:  # noqa: BLE001
             self.error_occurred.emit(f"Tidak bisa terhubung ke {ip}: {e}")
+            self._conn = None
             return False
-        self.base = base
         self._connected = True
         self.connection_changed.emit(True)
         return True
 
     def close(self):
-        self.base = None
         self._connected = False
+        with self._conn_lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._conn = None
         self.connection_changed.emit(False)
 
     @property
@@ -174,6 +203,25 @@ class HttpTransport(QObject):
     @property
     def is_http(self) -> bool:
         return True
+
+    # ---- http inti (keep-alive, sekali retry bila koneksi basi) -----------
+    def _http(self, method, path, timeout=5.0, body=None, headers=None):
+        with self._conn_lock:
+            if self._conn is None:
+                self._conn = http.client.HTTPConnection(self.host, timeout=timeout)
+            for attempt in (1, 2):
+                try:
+                    self._conn.request(method, path, body=body, headers=headers or {})
+                    r = self._conn.getresponse()
+                    return r.status, r.read()
+                except Exception:  # noqa: BLE001
+                    if attempt == 2:
+                        raise
+                    try:
+                        self._conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._conn = http.client.HTTPConnection(self.host, timeout=timeout)
 
     # ---- request/response ----------------------------------------------
     def request(self, cmd: str, timeout: float = 3.0):
@@ -186,15 +234,31 @@ class HttpTransport(QObject):
             return None
         last = None
         for method, path in steps:
-            url = self.base + path
             try:
-                req = urllib.request.Request(url, method=method)
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    last = json.loads(r.read().decode())
-            except Exception as e:
+                status, body = self._http(method, path, timeout=timeout)
+                last = json.loads(body.decode())
+            except Exception as e:  # noqa: BLE001
                 self.error_occurred.emit(f"HTTP {path}: {e}")
                 return None
         return last
+
+    def send(self, cmd: str):
+        """Fire-and-forget via WiFi: jalankan di thread latar singkat agar
+        UI/worker tidak menunggu round-trip HTTP sama sekali."""
+        if not self._connected:
+            return
+        steps = self._translate(cmd)
+        if steps is None:
+            return
+
+        def _fire():
+            for method, path in steps:
+                try:
+                    self._http(method, path, timeout=2.5)
+                except Exception:  # noqa: BLE001
+                    return   # kontrol sesaat gagal = tidak fatal; state sync menyusul
+
+        threading.Thread(target=_fire, daemon=True).start()
 
     def _translate(self, cmd):
         """Translate → [(method, path), ...]. Return None bila tidak didukung."""
@@ -225,13 +289,20 @@ class HttpTransport(QObject):
         if op == "SPOP": return [("GET", f"/spop?s={parts[1]}")]
         if op == "SCLR": return [("GET", f"/sclear?s={parts[1]}")]
         if op == "CHASE": return [("GET", "/chase?on=1" if parts[1].lower() == "on" else "/chase?off=1")]
+        if op == "WIFIST": return [("GET", "/wifistat")]
+        if op == "WIFIS":
+            ssid = urllib.parse.quote(cmd.split(" ", 2)[1] if len(cmd.split(" ", 2)) > 1 else "")
+            rest = cmd.split(" ", 2)
+            pw = urllib.parse.quote(rest[2]) if len(rest) > 2 else ""
+            return [("GET", f"/wifiset?ssid={ssid}&pass={pw}")]
         return None
 
     # ---- import file via HTTP multipart POST ---------------------------
     def import_file(self, path) -> bool:
         """Upload file JSON lewat /import (multipart) — lebih cepat daripada batch serial."""
         try:
-            with open(path, "rb") as f: content = f.read()
+            with open(path, "rb") as f:
+                content = f.read()
         except Exception as e:  # noqa: BLE001
             self.error_occurred.emit(f"Buka file gagal: {e}")
             return False
@@ -242,15 +313,11 @@ class HttpTransport(QObject):
             f'Content-Disposition: form-data; name="file"; filename="presets.json"{crlf}'
             f"Content-Type: application/json{crlf}{crlf}"
         ).encode() + content + f"{crlf}--{boundary}--{crlf}".encode()
-        req = urllib.request.Request(
-            self.base + "/import",
-            data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=15) as r:
-                return r.status == 200
-        except Exception as e:
+            status, _ = self._http(
+                "POST", "/import", timeout=15, body=body,
+                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            return status == 200
+        except Exception as e:  # noqa: BLE001
             self.error_occurred.emit(f"Import HTTP gagal: {e}")
             return False

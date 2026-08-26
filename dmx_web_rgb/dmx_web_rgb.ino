@@ -64,7 +64,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v42"
+#define BUILD_TAG "v43"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -82,6 +82,22 @@ IPAddress activeIP(){
   if((WiFi.getMode() & WIFI_STA) && WiFi.status()==WL_CONNECTED) return WiFi.localIP();
   return WiFi.softAPIP();
 }
+
+// v43: kredensial WiFi kustom (diatur dari Web UI / desktop, persist di NVS
+// namespace terpisah "dmxwifi" agar tidak ikut terhapus migrasi storage).
+Preferences wifiNvs;
+String customSsid, customPass;        // kosong = pakai default bawaan
+bool     wifiPending=false;           // reconnect kustom sedang berlangsung
+uint32_t wifiTryAt=0;
+int      wifiTryCount=0;
+void loadWifiCreds(){
+  wifiNvs.begin("dmxwifi",true);
+  customSsid = wifiNvs.getString("ssid","");
+  customPass = wifiNvs.getString("pass","");
+  wifiNvs.end();
+}
+const char* effSsid(){ return customSsid.length()>0 ? customSsid.c_str() : WIFI_SSID; }
+const char* effPass(){ return customSsid.length()>0 ? customPass.c_str() : WIFI_PASS; }
 
 // ---------------------------------------------------------------
 // PIN ESP32 -> MAX485
@@ -133,7 +149,7 @@ Fixture fix[N_FIX] = {
 // ---------------------------------------------------------------
 // PRESET & STATE
 // ---------------------------------------------------------------
-#define N_PRESETS 16
+#define N_PRESETS 30
 // chunk: [0]=used, [1..512]=nilai channel, [513]=fade/10ms, [514]=hold/20ms
 #define PRESET_CHUNK 515
 
@@ -187,11 +203,11 @@ static uint8_t presets[N_PRESETS][PRESET_CHUNK];   // chunk: [0]=used, [1..512]=
 static volatile uint32_t blackoutEnd[N_FIX] = {0};
 
 // ---------------------------------------------------------------
-// SCENE: rangkaian hingga 30 langkah preset (referensi nomor, bukan salinan)
+// SCENE: rangkaian hingga 50 langkah preset (referensi nomor, bukan salinan)
 // 0 = langkah kosong; 1..N_PRESETS = nomor preset. Disimpan terpisah di NVS.
 // ---------------------------------------------------------------
 #define N_SCENES 20
-#define SCENE_STEPS 30
+#define SCENE_STEPS 50
 static uint8_t scenes[N_SCENES][SCENE_STEPS];
 static volatile bool sceneOn = false;
 static volatile int sceneIdx = -1;     // scene yang sedang diputar
@@ -226,9 +242,77 @@ WebServer server(80);
 // ---------------------------------------------------------------
 AsyncWebServer wsSrv(81);
 AsyncWebSocket ws("/ws");
-void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* c, AwsEventType t, void*, uint8_t*, size_t){
-  if(t==WS_EVT_CONNECT)         Serial.printf("WS: client %u tersambung\n",(unsigned)c->id());
-  else if(t==WS_EVT_DISCONNECT) Serial.printf("WS: client %u putus\n",(unsigned)c->id());
+
+// v43: KONTROL via WebSocket. Slider UI mengirim pesan kecil (fire-and-forget,
+// tanpa overhead & antrean HTTP) sehingga fader terasa realtime. Format:
+//   {"t":"s","k":"<fi>_<c>","v":n}   set satu channel fixture
+//   {"t":"mast","v":n}               master dimmer
+//   {"t":"strb","v":n}               strobe master
+//   {"t":"all","v":0|1}              blackout / PAR penuh
+static int wsInt(const char* s, const char* key, int dflt){
+  String pat = String("\"") + key + "\":";
+  const char* p = strstr(s, pat.c_str());
+  return p ? atoi(p + pat.length()) : dflt;
+}
+static bool wsKeyStr(const char* s, String& out){
+  const char* p = strstr(s, "\"k\":\"");
+  if(!p) return false;
+  p += 5;
+  const char* e = strchr(p, '"');
+  if(!e || e-p > 12) return false;
+  out = "";
+  for(const char* c=p; c<e; c++) out += *c;
+  return true;
+}
+void wsHandleCtl(const uint8_t* data, size_t len){
+  if(len==0 || len>95) return;
+  char buf[96]; memcpy(buf, data, len); buf[len]=0;
+  if(strstr(buf, "\"t\":\"s\"")){
+    String k; if(!wsKeyStr(buf,k)) return;
+    int v=wsInt(buf,"v",-1); if(v<0||v>255) return;
+    int us=k.indexOf('_'); if(us<=0) return;
+    int fi=k.substring(0,us).toInt(); int c=k.substring(us+1).toInt();
+    if(fi<0||fi>=N_FIX||c<0||c>=fix[fi].foot) return;
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    uint16_t ch=fix[fi].start+c;
+    manualWant[ch]=cv(v); manualTouched[ch]=millis();
+    recomputeWant();
+    out[ch]=want[ch];                      // snap: tanpa fade utk geseran manual
+    xSemaphoreGive(dmxMutex);
+    stateRevision++;
+  } else if(strstr(buf, "\"t\":\"mast\"")){
+    masterWant=cv(wsInt(buf,"v",0)); masterOut=masterWant;
+    stateRevision++; nvsDirty=true;
+  } else if(strstr(buf, "\"t\":\"strb\"")){
+    strobeWant=cv(wsInt(buf,"v",0));
+    stateRevision++;
+  } else if(strstr(buf, "\"t\":\"all\"")){
+    bool on = wsInt(buf,"v",0)==1;
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    for(int f=0;f<N_FIX;f++){
+      bool safe=(fix[f].type==FX_PAR);     // aman perangkat: hanya PAR yg dipenuhkan
+      for(uint16_t c=0;c<fix[f].foot;c++){
+        uint16_t ch=fix[f].start+c;
+        uint8_t v = on ? (safe?255:0) : 0;
+        manualWant[ch]=v; manualTouched[ch]=millis();
+        recomputeWant();
+        out[ch]=want[ch];
+      }
+    }
+    xSemaphoreGive(dmxMutex);
+    stateRevision++; nvsDirty=true;
+  }
+}
+void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* c, AwsEventType t, void* arg, uint8_t* data, size_t len){
+  if(t==WS_EVT_CONNECT){ Serial.printf("WS: client %u tersambung\n",(unsigned)c->id()); return; }
+  if(t==WS_EVT_DISCONNECT){ Serial.printf("WS: client %u putus\n",(unsigned)c->id()); return; }
+  if(t==WS_EVT_DATA){
+    AwsFrameInfo* info=(AwsFrameInfo*)arg;
+    // hanya terima frame teks tunggal utuh berukuran kecil (pesan kontrol)
+    if(info->final && info->index==0 && info->len==len && info->opcode==WS_TEXT){
+      wsHandleCtl(data,len);
+    }
+  }
 }
 
 Preferences nvs;
@@ -276,9 +360,13 @@ FaderGroup grp[N_GROUPS] = {
 // Layout per preset: [0]=used [1]=fade/10ms [2]=hold/20ms [3..]=CH1..CH_PATCH_END
 #define PATCH_CH_TOTAL 176                 // channel tertinggi patch: FOG2=174 (+margin)
 #define COMPACT_CHUNK (3+PATCH_CH_TOTAL)   // 179 byte/preset vs 515 byte format lama
+// NVS membatasi satu value <= 4000 byte. 30 preset x 179 = 5370 byte ->
+// preset dipecah ke 2 key (pc0/pc1), masing-masing 15 preset (2685 byte).
+#define PRESETS_PER_KEY 15
+#define COMPACT_KEY_BYTES (PRESETS_PER_KEY*COMPACT_CHUNK)
 static uint8_t compactPresets[N_PRESETS][COMPACT_CHUNK];  // buffer staging NVS
 static uint8_t compactScenes[sizeof(scenes)];             // buffer staging NVS
-const uint8_t STORAGE_VER = 7;             // naikkan bila layout berubah lagi
+const uint8_t STORAGE_VER = 8;             // naikkan bila layout berubah lagi
 
 bool persistAll(){
   // Snapshot konsisten diambil di bawah mutex DMX; penulisan flash dilakukan
@@ -296,7 +384,8 @@ bool persistAll(){
   bool ok=true;
   nvs.begin(NVS_NS,false);
   ok = nvs.putUChar("sver2",STORAGE_VER) > 0 && ok;
-  ok = nvs.putBytes("pc",(uint8_t*)compactPresets,sizeof(compactPresets)) == sizeof(compactPresets) && ok;
+  ok = nvs.putBytes("pc0",(uint8_t*)compactPresets,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES && ok;
+  ok = nvs.putBytes("pc1",(uint8_t*)compactPresets+COMPACT_KEY_BYTES,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES && ok;
   ok = nvs.putBytes("sc",compactScenes,sizeof(compactScenes)) == sizeof(compactScenes) && ok;
   ok = nvs.putInt("selP",selP) > 0 && ok;
   ok = nvs.putInt("selS",selS) > 0 && ok;
@@ -333,7 +422,8 @@ void loadAll(){
     nvs.end();
     return;
   }
-  bool ok = nvs.getBytes("pc",(uint8_t*)compactPresets,sizeof(compactPresets)) == sizeof(compactPresets)
+  bool ok = nvs.getBytes("pc0",(uint8_t*)compactPresets,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES
+         && nvs.getBytes("pc1",(uint8_t*)compactPresets+COMPACT_KEY_BYTES,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES
          && nvs.getBytes("sc",compactScenes,sizeof(compactScenes)) == sizeof(compactScenes);
   if(ok){
     unpackCompactIntoRam();
@@ -348,7 +438,8 @@ bool loadData(){
   nvs.begin(NVS_NS,true);
   bool ok=(nvs.getUChar("sver2",0)==STORAGE_VER);
   if(ok){
-    ok = nvs.getBytes("pc",(uint8_t*)compactPresets,sizeof(compactPresets)) == sizeof(compactPresets)
+    ok = nvs.getBytes("pc0",(uint8_t*)compactPresets,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES
+      && nvs.getBytes("pc1",(uint8_t*)compactPresets+COMPACT_KEY_BYTES,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES
       && nvs.getBytes("sc",compactScenes,sizeof(compactScenes)) == sizeof(compactScenes);
   }
   if(ok){
@@ -645,6 +736,64 @@ void sendApiOk(){
   server.send(200,"application/json",j);
 }
 
+// ---------------------------------------------------------------
+// v43: KONFIGURASI WIFI KUSTOM (Web UI & desktop)
+// GET  /wifistat          -> status koneksi saat ini (JSON)
+// POST /wifiset?ssid&pass -> simpan kredensial ke NVS + reconnect non-blocking
+// Reconnect dicoba bertahap di loop() (tidak memblok DMX); bila 6x gagal,
+// perangkat kembali ke kredensial bawaan lalu AP darurat supaya operator
+// TIDAK PERNAH terkunci di luar perangkat.
+// ---------------------------------------------------------------
+void onWifiStat(){
+  bool sta=(WiFi.getMode() & WIFI_STA) && WiFi.status()==WL_CONNECTED;
+  String j="{\"ok\":true";
+  j+=",\"connected\":"; j+= sta?"true":"false";
+  j+=",\"ssid\":\"";    j+= sta?WiFi.SSID():String(effSsid()); j+="\"";
+  j+=",\"custom\":";    j+= customSsid.length()>0?"true":"false";
+  j+=",\"pending\":";   j+= wifiPending?"true":"false";
+  j+=",\"ip\":\"";      j+= activeIP().toString(); j+="\"";
+  j+=",\"rssi\":";      j+= String(sta?WiFi.RSSI():0);
+  j+=",\"apActive\":";  j+= (WiFi.getMode() & WIFI_AP)?"true":"false";
+  j+="}";
+  server.send(200,"application/json",j);
+}
+void onWifiSet(){
+  String ssid=server.arg("ssid"); ssid.trim();
+  String pass=server.arg("pass");
+  if(ssid.length()==0 || ssid.length()>32){ sendApiError(400,"wifi_no_ssid","SSID kosong atau terlalu panjang"); return; }
+  if(pass.length()>63){ sendApiError(400,"wifi_pass_long","Password terlalu panjang"); return; }
+  wifiNvs.begin("dmxwifi",false);
+  bool ok = wifiNvs.putString("ssid",ssid)>0 && wifiNvs.putString("pass",pass)>0;
+  wifiNvs.end();
+  if(!ok){ sendApiError(500,"wifi_nvs_fail","Gagal menyimpan kredensial ke flash"); return; }
+  customSsid=ssid; customPass=pass;
+  wifiPending=true; wifiTryAt=millis(); wifiTryCount=0;
+  WiFi.disconnect();                       // putuskan koneksi lama; reconnect di loop()
+  sendApiOk();
+}
+void wifiReconnectTick(){
+  if(!wifiPending) return;
+  if((WiFi.getMode() & WIFI_STA) && WiFi.status()==WL_CONNECTED){
+    wifiPending=false;
+    Serial.print("WiFi kustom tersambung: "); Serial.print(customSsid);
+    Serial.print(" IP: http://"); Serial.println(WiFi.localIP());
+    stateRevision++;                       // UI ikut refresh status
+    return;
+  }
+  if(millis()-wifiTryAt < 2000) return;    // jeda antar percobaan
+  wifiTryAt=millis(); wifiTryCount++;
+  if(wifiTryCount>6){
+    wifiPending=false;
+    Serial.println("WiFi kustom GAGAL setelah 6 percobaan -> kembali ke kredensial bawaan + AP darurat");
+    WiFi.begin(WIFI_SSID, WIFI_PASS);      // coba lagi jalur default
+    if(!ETH.linkUp()){ WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID, AP_PASS); }
+    return;
+  }
+  Serial.printf("WiFi kustom: percobaan %d/6 -> %s\n", wifiTryCount, customSsid.c_str());
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(customSsid.c_str(), customPass.c_str());
+}
+
 void onSelect(){
   if(server.hasArg("p")){
     int p=server.arg("p").toInt()-1;
@@ -902,6 +1051,15 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="status" id="saveStatus">Data tersimpan</div>
   </section>
 
+  <section class="panel" id="wifiPanel">
+    <h3>WiFi <span style="color:var(--muted);font-weight:400">status &amp; kredensial kustom</span></h3>
+    <div class="status" id="wifiStat">memuat status...</div>
+    <label><span class="lab">SSID</span><input type="text" id="wssid" maxlength="32" placeholder="nama WiFi tujuan" style="background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;grid-column:2/4"></label>
+    <label><span class="lab">Sandi</span><input type="password" id="wpass" maxlength="63" placeholder="password WiFi" style="background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;grid-column:2/4"></label>
+    <div class="actions"><button class="btn-go act" id="btnWifiSet">Sambungkan &amp; Simpan</button></div>
+    <p class="sub">Kredensial tersimpan di flash &amp; dipakai tiap boot. Gagal 6x percobaan = otomatis kembali ke bawaan + AP darurat.</p>
+  </section>
+
   <section class="panel" id="presetPanel">
     <h3>Preset <span style="color:var(--muted);font-weight:400">fade &amp; hold per preset</span></h3>
     <div class="bankhead"><div class="ctrlgroup">
@@ -997,6 +1155,7 @@ const FIX=__FIXDATA__;
 const GRP=__GRPDATA__;
 const SCN=__SCNDATA__;
 const NSCN=SCN.length, NSTEPS=SCN[0].length;
+const N_PRESETS=__NP__;   // jumlah pad preset (diinjeksi server; selaras firmware)
 const N=FIX.length, COLS=['#ffb400','#e0463f','#3fae57','#3f7fd4','#9b59b6','#e67e22','#1abc9c','#95a5a6'];
 const sliders={}; let allKeys=[];
 function keyOf(fi,c){return fi+'_'+c;}
@@ -1075,7 +1234,15 @@ let sceneOn=false, selScene=-1, sceneEdit=false;
 let activeKey=null;   // slider yang sedang digeser user (dilewati polling)
 // Throttle: maks 1 request /set beredar; nilai terakhir dikirim setelahnya.
 let setInFlight=false,setPending=null;
+// v43: kontrol dikirim via WebSocket bila tersambung (tanpa overhead & antrean
+// HTTP -> fader realtime). HTTP /set tetap jadi fallback otomatis.
+function wsCtl(obj){
+  if(wsOk && ws && ws.readyState===1){ try{ ws.send(JSON.stringify(obj)); return true; }catch(_){} }
+  return false;
+}
+function pushLive(obj,fallbackQ){ if(!wsCtl(obj)) pushCtrl(fallbackQ); }
 function pushOne(fi,c,v){
+  if(wsCtl({t:'s',k:fi+'_'+c,v:+v})) return;   // instan tanpa round-trip
   if(setInFlight){ setPending=[fi,c,v]; return; }
   setInFlight=true;
   api('/set?'+fi+'_'+c+'='+v).catch(e=>showError(e.message)).finally(()=>{
@@ -1150,11 +1317,11 @@ function setPFadeLabel(v){$('pfadev').textContent=(v/1000).toFixed(1)+'s';}
 function setPHoldLabel(v){$('pholdv').textContent=(v/1000).toFixed(1)+'s';}
 function applyPFadeUI(){ $('pfade').value=pfade; setPFadeLabel(pfade); paintFill($('pfade'));
                          $('phold').value=phold; setPHoldLabel(phold); paintFill($('phold')); }
-$('master').addEventListener('input',()=>{activeKey='master';$('masterv').textContent=$('master').value;paintFill($('master'));pushCtrl('mast='+$('master').value);});
+$('master').addEventListener('input',()=>{activeKey='master';$('masterv').textContent=$('master').value;paintFill($('master'));pushLive({t:'mast',v:+$('master').value},'mast='+$('master').value);});
 $('master').addEventListener('change',()=>onRelease($('master')));
 $('master').addEventListener('blur',()=>onRelease($('master')));
 // STROBE MASTER: 0=off; >0 = kedip global, makin besar makin cepat.
-$('mstrb').addEventListener('input',()=>{activeKey='mstrb';$('mstrbv').textContent=$('mstrb').value;paintFill($('mstrb'));pushCtrl('strb='+$('mstrb').value);});
+$('mstrb').addEventListener('input',()=>{activeKey='mstrb';$('mstrbv').textContent=$('mstrb').value;paintFill($('mstrb'));pushLive({t:'strb',v:+$('mstrb').value},'strb='+$('mstrb').value);});
 $('mstrb').addEventListener('change',()=>onRelease($('mstrb')));
 $('mstrb').addEventListener('blur',()=>onRelease($('mstrb')));
 // input = update label saja; persist ke NVS hanya saat lepas (change) -> hindari tulis flash tiap tick
@@ -1172,10 +1339,10 @@ $('pfade').addEventListener('input',()=>{pfade=+$('pfade').value;setPFadeLabel(p
 $('pfade').addEventListener('change',persistTiming);
 $('phold').addEventListener('input',()=>{phold=+$('phold').value;setPHoldLabel(phold);paintFill($('phold'));});
 $('phold').addEventListener('change',persistTiming);
-$('btnBlack').addEventListener('click',()=>{$('master').value=0;$('masterv').textContent=0;pushCtrl('mast=0');});
+$('btnBlack').addEventListener('click',()=>{$('master').value=0;$('masterv').textContent=0;pushLive({t:'all',v:0},'all=off');});
 // Aman perangkat: "Penuh" hanya untuk PAR (dimmer+RGB); moving/fog/strobe tetap 0.
-$('btnWhite').addEventListener('click',()=>{allKeys.forEach(k=>{const fi=+k.split('_')[0];sliders[k].value=(FIX[fi].type===0)?255:0;});paintAll();pushCtrl('all=on');});
-$('btnOff').addEventListener('click',()=>{allKeys.forEach(k=>sliders[k].value=0);paintAll();pushCtrl('all=off');});
+$('btnWhite').addEventListener('click',()=>{allKeys.forEach(k=>{const fi=+k.split('_')[0];sliders[k].value=(FIX[fi].type===0)?255:0;});paintAll();pushLive({t:'all',v:1},'all=on');});
+$('btnOff').addEventListener('click',()=>{allKeys.forEach(k=>sliders[k].value=0);paintAll();pushLive({t:'all',v:0},'all=off');});
 $('btnChase').addEventListener('click',()=>setChase(!chaseOn));
 let editMode=false,ignoreDimmer=false;const $idim=$('idim');$idim.addEventListener('change',()=>{ignoreDimmer=$idim.checked;$('idimTag').classList.toggle('on',ignoreDimmer);});
 let presetsData=[],selPreset=-1;
@@ -1399,6 +1566,28 @@ function scheduleWsRetry(){
 startWs();
 // Fallback polling: hanya jalan saat WebSocket belum/gagal tersambung.
 setInterval(()=>{ if(wsOk||document.hidden||httpBusy||httpQueue.length>0) return; api('/cur').then(j=>syncFromServer(j,true)).catch(()=>{}); },1000);
+// v43: panel WiFi kustom — status live + simpan kredensial baru.
+function wifiRefresh(){
+  api('/wifistat').then(j=>{
+    const st=$('wifiStat'); if(!st) return;
+    if(j.connected){ st.textContent='Terhubung ke "'+j.ssid+'" \u00b7 IP '+j.ip+' \u00b7 '+j.rssi+' dBm'+(j.custom?' \u00b7 kustom':''); st.style.color='#7bd88f'; }
+    else if(j.pending){ st.textContent='Mencoba menyambung ke "'+j.ssid+'"...'; st.style.color='#ffd54f'; }
+    else { st.textContent=(j.apActive?'Mode AP darurat \u00b7 IP '+j.ip:'Tidak terhubung'); st.style.color='#ff8a65'; }
+  }).catch(()=>{});
+}
+$('btnWifiSet').addEventListener('click',()=>{
+  const ssid=$('wssid').value.trim(), pass=$('wpass').value;
+  if(!ssid){ toast('Isi SSID dulu'); return; }
+  $('wifiStat').textContent='Menyimpan kredensial & mencoba menyambung...'; $('wifiStat').style.color='#ffd54f';
+  api('/wifiset?ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass))
+    .then(()=>{
+      toast('Tersimpan. Mencoba koneksi baru...');
+      let n=0; const t=setInterval(()=>{ n++; wifiRefresh(); if(n>=15) clearInterval(t); },2000);
+      setTimeout(()=>toast('Bila IP berubah, buka alamat IP baru (lihat Serial Monitor)'),3500);
+    })
+    .catch(e=>{ showError(e.message); wifiRefresh(); });
+});
+wifiRefresh();
 </script>
 </body></html>
 )HTML";
@@ -1424,6 +1613,7 @@ void sendUi(){
   page.replace("__FIXDATA__", fixJson());
   page.replace("__GRPDATA__", grpJson());
   page.replace("__SCNDATA__", scnJson());
+  page.replace("__NP__", String(N_PRESETS));
   // Cegah cache browser: setelah firmware di-update, UI lama bisa bertahan
   // dan bentrok dengan endpoint baru (sumber bug "fitur hilang" yang aneh).
   server.sendHeader("Cache-Control","no-store, must-revalidate");
@@ -1896,8 +2086,41 @@ void handleSerialCmd(String cmd){
    if(op=="LISTF"){ Serial.println(fixJson()); return; }
    // LISTG -> daftar grup fader JSON
    if(op=="LISTG"){ Serial.println(grpJson()); return; }
-   // EXPORT -> dump lengkap preset (paritas /export web, utk backup desktop)
-   if(op=="EXPORT"){ Serial.println(exportJson()); return; }
+    // EXPORT -> dump lengkap preset (paritas /export web, utk backup desktop)
+    if(op=="EXPORT"){ Serial.println(exportJson()); return; }
+
+    // WIFIST -> status koneksi WiFi (paritas /wifistat web)
+    if(op=="WIFIST"){
+      bool sta=(WiFi.getMode() & WIFI_STA) && WiFi.status()==WL_CONNECTED;
+      String j="{\"ok\":true,\"connected\":"; j+= sta?"true":"false";
+      j+=",\"ssid\":\""; j+= sta?WiFi.SSID():String(effSsid()); j+="\"";
+      j+=",\"custom\":"; j+= customSsid.length()>0?"true":"false";
+      j+=",\"pending\":"; j+= wifiPending?"true":"false";
+      j+=",\"ip\":\""; j+= activeIP().toString(); j+="\"";
+      j+=",\"rssi\":"; j+= String(sta?WiFi.RSSI():0);
+      j+=",\"apActive\":"; j+= (WiFi.getMode() & WIFI_AP)?"true":"false";
+      j+="}";
+      Serial.println(j);
+      return;
+    }
+    // WIFIS <ssid> <pass> -> simpan kredensial kustom + reconnect (SSID tanpa spasi)
+    if(op=="WIFIS"){
+      args.trim();
+      int sp=args.indexOf(' ');
+      String ssid = (sp<0) ? args : args.substring(0,sp);
+      String pass = (sp<0) ? String("") : args.substring(sp+1);
+      ssid.trim(); pass.trim();
+      if(ssid.length()==0 || ssid.length()>32){ Serial.println("{\"ok\":false,\"err\":\"SSID kosong/panjang\"}"); return; }
+      wifiNvs.begin("dmxwifi",false);
+      bool ok = wifiNvs.putString("ssid",ssid)>0 && wifiNvs.putString("pass",pass)>0;
+      wifiNvs.end();
+      if(!ok){ Serial.println("{\"ok\":false,\"err\":\"gagal simpan NVS\"}"); return; }
+      customSsid=ssid; customPass=pass;
+      wifiPending=true; wifiTryAt=millis(); wifiTryCount=0;
+      WiFi.disconnect();
+      Serial.println("{\"ok\":true}");
+      return;
+    }
 
    // --- IMPORT BATCH via serial (v39, paritas /import web) ---
    // Alur: IMPORT_BEGIN -> (IMPORT_P + IMPORT_C per preset) -> IMPORT_END
@@ -1997,11 +2220,14 @@ void setup(){
   masterWant=255; masterOut=255;
   loadAll();
 
-  // WiFi STA: konek ke router "SIGMA"; bila gagal -> fallback AP darurat.
+  // WiFi STA: pakai kredensial kustom bila sudah pernah diatur dari UI
+  // (tersimpan di NVS), otherwise bawaan; gagal -> fallback AP darurat.
+  loadWifiCreds();
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);            // respons web lebih responsif
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("WiFi: menyambung ke "); Serial.print(WIFI_SSID);
+  WiFi.begin(effSsid(), effPass());
+  Serial.print("WiFi: menyambung ke "); Serial.print(effSsid());
+  if(customSsid.length()>0) Serial.print(" (kustom)");
   uint32_t t0=millis();
   while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){
     delay(250); Serial.print(".");
@@ -2056,6 +2282,8 @@ void setup(){
    server.on("/scenes",HTTP_GET, onScenesGet);
    server.on("/fixes", HTTP_GET, onFixesGet);    // v40: metadata fixture (paritas LISTF serial)
    server.on("/groups",HTTP_GET, onGroupsGet);   // v40: metadata grup fader (paritas LISTG serial)
+  server.on("/wifistat",HTTP_GET, onWifiStat);   // v43: status koneksi WiFi
+  server.on("/wifiset", HTTP_ANY, onWifiSet);    // v43: simpan kredensial + reconnect
   server.on("/spush", HTTP_GET, onSPush);
   server.on("/spop",  HTTP_GET, onSPop);
   server.on("/sclear",HTTP_GET, onSClear);
@@ -2104,6 +2332,7 @@ void loop(){
   server.handleClient();
   ws.cleanupClients();      // housekeeping AsyncWebSocket
   wsBroadcastTick();
+  wifiReconnectTick();      // v43: reconnect WiFi kustom (non-blocking)
   processSerialIn();        // v33: kendali via serial (non-blocking, Core 1)
   // AUTO-SAVE NVS (sisi server, safety-net): 60 detik setelah simpan terakhir,
   // bila masih ada perubahan (nvsDirty) -> persistAll(). Menutup kasus browser
