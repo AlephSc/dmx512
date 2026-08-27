@@ -767,8 +767,10 @@ void onWifiSet(){
   wifiNvs.end();
   if(!ok){ sendApiError(500,"wifi_nvs_fail","Gagal menyimpan kredensial ke flash"); return; }
   customSsid=ssid; customPass=pass;
-  wifiPending=true; wifiTryAt=millis(); wifiTryCount=0;
-  WiFi.disconnect();                       // putuskan koneksi lama; reconnect di loop()
+  wifiPending=true; wifiTryCount=0;
+  // GRACE 800 ms sebelum tick pertama: biar respons HTTP/serial ini sempat
+  // terkirim dulu; pemutusan koneksi lama dilakukan wifiReconnectTick().
+  wifiTryAt=millis()+800;
   sendApiOk();
 }
 void wifiReconnectTick(){
@@ -785,12 +787,17 @@ void wifiReconnectTick(){
   if(wifiTryCount>6){
     wifiPending=false;
     Serial.println("WiFi kustom GAGAL setelah 6 percobaan -> kembali ke kredensial bawaan + AP darurat");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);      // coba lagi jalur default
+    // URUTAN PENTING: aktifkan AP dulu (bila tanpa Ethernet) agar operator
+    // tidak pernah terkunci, BARU coba kredensial bawaan sebagai STA.
     if(!ETH.linkUp()){ WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID, AP_PASS); }
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
     return;
   }
   Serial.printf("WiFi kustom: percobaan %d/6 -> %s\n", wifiTryCount, customSsid.c_str());
-  WiFi.mode(WIFI_STA);
+  if(wifiTryCount==1) WiFi.disconnect();   // lepas koneksi lama (grace sudah lewat)
+  // Pertahankan AP bila sedang aktif (operator konfigurasi lewat AP darurat
+  // tidak kehilangan akses selama percobaan berlangsung).
+  WiFi.mode((WiFi.getMode() & WIFI_AP) ? WIFI_AP_STA : WIFI_STA);
   WiFi.begin(customSsid.c_str(), customPass.c_str());
 }
 

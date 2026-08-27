@@ -1383,3 +1383,15 @@ Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
   `"build":"vNN"`; toolbar desktop menampilkan `fw vNN · rev N`. Deteksi dini
   flash basi (UI baru di firmware lama / sebaliknya) tanpa tebak-tebakan.
 - BUILD_TAG v43 -> v44.
+
+---
+
+## Session 48 — WiFi reconnect aman + README publik disinkronkan
+
+- `onWifiSet()` tidak lagi langsung memutus koneksi sebelum respons HTTP/serial
+  terkirim; diberi grace 800 ms.
+- Fallback WiFi mengaktifkan AP darurat SEBELUM mencoba kredensial bawaan,
+  sehingga operator tidak kehilangan akses ketika kredensial kustom gagal.
+- Mode AP dipertahankan selama percobaan koneksi kustom.
+- README diperbarui ke fitur aktual: v44+, 30 preset, scene 50 langkah,
+  WebSocket, WiFi kustom, W5500, desktop, MIDI, wiring, dan prosedur upload.
