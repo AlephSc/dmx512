@@ -184,6 +184,9 @@ class MidiTab(QWidget):
         self.btn_conn.setChecked(connected)
         self.btn_conn.setText("PUTUS MIDI" if connected else "SAMBUNG MIDI")
         self.btn_conn.setObjectName("dangerBtn" if connected else "goBtn")
+        self.btn_conn.style().unpolish(self.btn_conn)
+        self.btn_conn.style().polish(self.btn_conn)
+        self.btn_conn.update()
         self.btn_learn.setEnabled(connected)
         if not connected:
             self.set_learn_active(False)

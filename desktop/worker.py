@@ -17,7 +17,9 @@ class SerialWorker(QObject):
     # Inilah inti perbaikan delay fader desktop: sebelumnya tiap geseran
     # mengantre round-trip 5-15 ms (bisa 2.5 dtk bila ESP32 sibuk tulis NVS).
     # Sinkronisasi nilai tetap dijamin polling GET berkala.
-    FIRE_OPS = {"SET", "MAST", "STRB", "GRP", "ALL", "CHASE", "SELP", "SELS", "SSTOP"}
+    # Hanya kontrol kontinu boleh fire-and-forget. Aksi preset/scene harus
+    # menunggu ACK agar error seperti "preset kosong" terlihat operator.
+    FIRE_OPS = {"SET", "MAST", "STRB", "GRP", "ALL"}
 
     def __init__(self, transport):
         super().__init__()

@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton,
-                               QTabWidget, QVBoxLayout, QWidget)
+                               QTabWidget, QVBoxLayout, QWidget, QStyle)
 from state import DeviceState
 from transport import SerialTransport, list_candidate_ports, HttpTransport
 from midi_handler import MidiMapper, MidiInputWorker, MIDI_AVAILABLE
@@ -143,6 +143,11 @@ class MainWindow(QMainWindow):
         if self.port_combo.count() == 0:
             self.port_combo.addItem("(tidak ada COM port)")
 
+    def _refresh_style(self, widget):
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
+
     def _on_transport_changed(self, index):
         # Enable/disable controls berdasarkan transport yang dipilih
         is_serial = (index == 0)
@@ -190,6 +195,7 @@ class MainWindow(QMainWindow):
                 self._worker.cmd_queue.put((kind, kind))
             self.btn_conn.setText("PUTUS")
             self.btn_conn.setObjectName("dangerBtn")
+            self._refresh_style(self.btn_conn)
             self.conn_lbl.setText(f"terhubung: {target}")
             self._set_status(f"Terhubung ke {target}.")
             self.tab_system.log(f"== Terhubung ke {target} ==")
@@ -206,8 +212,9 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._thread = None
         self.btn_conn.setChecked(False)
-        self.btn_conn.setText("SAMBUNG")
-        self.btn_conn.setObjectName("goBtn")
+         self.btn_conn.setText("SAMBUNG")
+         self.btn_conn.setObjectName("goBtn")
+         self._refresh_style(self.btn_conn)
         self.conn_lbl.setText("tidak terhubung")
         self._set_status("Terputus.")
         self.tab_system.log("== Terputus ==")
@@ -368,8 +375,12 @@ class MainWindow(QMainWindow):
 
     def _on_cmd_done(self, cmd, resp):
         if isinstance(resp, dict) and resp.get("ok") is False:
-            self._set_status(f"GAGAL [{cmd}]: {resp.get('err','?')}")
-            self.tab_system.log(f"[{cmd}] gagal: {resp.get('err')}")
+            msg = f"GAGAL [{cmd}]: {resp.get('err', resp.get('message', '?'))}"
+            self._set_status(msg)
+            self.tab_system.log(msg)
+        elif isinstance(resp, dict) and resp.get("ok") is True:
+            # ACK terlihat operator tanpa mengganggu refresh state berkala.
+            self._set_status(f"OK: {cmd}")
 
     def _on_serial_error(self, msg):
         self._set_status(msg)

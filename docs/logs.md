@@ -1395,3 +1395,19 @@ Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
 - Mode AP dipertahankan selama percobaan koneksi kustom.
 - README diperbarui ke fitur aktual: v44+, 30 preset, scene 50 langkah,
   WebSocket, WiFi kustom, W5500, desktop, MIDI, wiring, dan prosedur upload.
+
+---
+
+## Session 49 — Audit UI desktop lanjutan: mode scene, ACK aksi, style tombol
+
+- Ditemukan lambda `clicked` pada `ScenesTab` mode EDIT/SHOW tidak menerima
+  argumen bool PySide6 -> klik mode berpotensi TypeError. Diperbaiki menjadi
+  lambda yang menelan `_checked`.
+- Fire-and-forget dibatasi hanya kontrol kontinu `SET/MAST/STRB/GRP/ALL`.
+  Aksi preset/scene (`PSL/SPLAY/SELS/SSTOP/CHASE`) kembali menunggu ACK agar
+  error preset kosong/scene invalid terlihat di status, tanpa mengorbankan
+  latensi fader.
+- Status sukses/gagal command kini tampil di status bar + log Sistem.
+- Style tombol disegarkan setelah objectName berubah (`goBtn`/`dangerBtn`),
+  sehingga warna status koneksi MIDI/ESP32 benar-benar ikut berubah.
+- Compile-check 13 file Python lolos; tes klik pad/scene lolos.
