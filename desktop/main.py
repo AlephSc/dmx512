@@ -15,6 +15,7 @@ from midi_handler import MidiMapper, MidiInputWorker, MIDI_AVAILABLE
 from ui.mixer_tab import MixerTab
 from ui.presets_tab import PresetsTab
 from ui.scenes_tab import ScenesTab
+from ui.patch_tab import PatchTab
 from ui.system_tab import SystemTab
 from ui.midi_tab import MidiTab
 from worker import SerialWorker
@@ -84,17 +85,22 @@ class MainWindow(QMainWindow):
         self.tab_mixer = MixerTab()
         self.tab_presets = PresetsTab()
         self.tab_scenes = ScenesTab()
+        self.tab_patch = PatchTab()
         self.tab_system = SystemTab()
         self.tab_midi = MidiTab()
         self.tabs.addTab(self.tab_mixer, "Mixer")
         self.tabs.addTab(self.tab_presets, "Preset")
         self.tabs.addTab(self.tab_scenes, "Scene")
+        self.tabs.addTab(self.tab_patch, "Patch")
         self.tabs.addTab(self.tab_midi, "MIDI")
         self.tabs.addTab(self.tab_system, "Sistem")
 
         # wiring: semua perintah serial dari tab -> antrean worker
         for t in (self.tab_mixer, self.tab_presets, self.tab_scenes, self.tab_system):
             t.cmd.connect(self.send_cmd)
+        # Patch tab: FIXSET via serial, atau POST /fixes via HTTP
+        self.tab_patch.cmd.connect(self.send_cmd)
+        self.tab_patch.http_fixtures.connect(self._patch_apply_http)
         self.tab_mixer.active.connect(self._on_active)
         self.tab_system.export_requested.connect(self._do_export)
         self.tab_system.import_requested.connect(self._do_import)
@@ -180,6 +186,8 @@ class MainWindow(QMainWindow):
                     self.btn_conn.setChecked(False)
                     return
                 target = f"WiFi {ip}"
+                self.tab_patch.is_http = True   # v45: patch via POST /fixes
+            self.tab_patch.is_http = (not is_serial)
             self._thread = QThread(self)
             self._worker = SerialWorker(self.transport)
             self._worker.moveToThread(self._thread)
@@ -212,9 +220,9 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._thread = None
         self.btn_conn.setChecked(False)
-         self.btn_conn.setText("SAMBUNG")
-         self.btn_conn.setObjectName("goBtn")
-         self._refresh_style(self.btn_conn)
+        self.btn_conn.setText("SAMBUNG")
+        self.btn_conn.setObjectName("goBtn")
+        self._refresh_style(self.btn_conn)
         self.conn_lbl.setText("tidak terhubung")
         self._set_status("Terputus.")
         self.tab_system.log("== Terputus ==")
@@ -231,6 +239,8 @@ class MainWindow(QMainWindow):
             self._worker.cmd_queue.put(("LISTP", "LISTP"))
         elif op in ("SPUSH", "SPOP", "SCLR"):
             self._worker.cmd_queue.put(("LISTS", "LISTS"))
+        elif op == "FIXSET":
+            self._worker.cmd_queue.put(("LISTF", "LISTF"))   # v45: refresh patch
         elif op == "LOAD":
             self._worker.cmd_queue.put(("LISTP", "LISTP"))
             self._worker.cmd_queue.put(("LISTS", "LISTS"))
@@ -302,6 +312,30 @@ class MainWindow(QMainWindow):
         self._set_status(f"Import {n_total} preset dikirim ke ESP32 (±5 detik)...")
         self.tab_system.log(f"Import dari {path} ({n_total} preset) dikirim.")
 
+    def _patch_apply_http(self, fixtures):
+        """Kirim konfigurasi fixture via HTTP POST /fixes (transport WiFi)."""
+        import json as _json
+        import urllib.request
+        ip = self.ip_edit.text().strip()
+        if not ip:
+            self._set_status("Isi alamat IP dulu untuk simpan patch via HTTP.")
+            return
+        payload = _json.dumps({"count": len(fixtures), "fixtures": fixtures}).encode()
+        url = f"http://{ip}/fixes"
+        try:
+            req = urllib.request.Request(url, data=payload, method="POST",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = resp.read().decode()
+            self._set_status("Patch tersimpan via HTTP. Memuat ulang daftar fixture...")
+            self.tab_system.log("Patch tersimpan via HTTP POST /fixes.")
+            # Refresh daftar fixture
+            if self._worker:
+                self._worker.cmd_queue.put(("LISTF", "LISTF"))
+        except Exception as e:  # noqa: BLE001
+            self._set_status(f"Gagal simpan patch HTTP: {e}")
+            self.tab_system.log(f"ERROR patch HTTP: {e}")
+
     def _on_active(self, key, pressed):
         if pressed:
             self.active_keys.add(key)
@@ -356,6 +390,7 @@ class MainWindow(QMainWindow):
             if isinstance(payload, list) and all(isinstance(x, dict) and "name" in x for x in payload):
                 self.state.fixtures = payload
                 self.tab_mixer.build_fixtures(payload)
+                self.tab_patch.build_from_listf(payload)   # v45: isi tab Patch
         elif kind == "LISTG":
             if isinstance(payload, list) and all(isinstance(x, dict) for x in payload):
                 self.state.groups = payload

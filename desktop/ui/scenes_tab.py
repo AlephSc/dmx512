@@ -179,6 +179,13 @@ class ScenesTab(QWidget):
         self._playing_scene = scn if self._scene_on else -1
         stp = int(j.get("stp", -1))
 
+        # Tombol Cek berubah jadi Stop saat scene terpilih sedang diputar
+        # (paritas WebUI: btnSPlay berubah teks jadi STOP).
+        if self._scene_on and self._playing_scene == self.local_sel:
+            self.b_cek.setText("■ Stop")
+        else:
+            self.b_cek.setText("▶ Cek")
+
         for i, p in enumerate(self.pads):
             has_steps = False
             if i < len(st.scenes):

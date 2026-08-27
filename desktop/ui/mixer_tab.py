@@ -6,6 +6,9 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from state import channel_labels
 from ui.widgets import VFader
 
+# Nama tipe fixture (mirror enum FX di firmware). Dipakai utk label baris.
+FIX_TYPE_NAMES = {0: "PAR LED", 1: "MOVING HEAD", 2: "BEAM", 3: "STROBE", 4: "FOG"}
+
 
 class MixerTab(QWidget):
     cmd = Signal(str)            # perintah serial keluar
@@ -59,14 +62,17 @@ class MixerTab(QWidget):
         self.grp_row = QHBoxLayout()
         root.addLayout(self.grp_row)
 
-        # --- fader per-fixture (scroll horizontal)
+        # --- fader per-fixture: baris per tipe (v45, Saran 1) ---
+        # Layout vertikal: tiap tipe fixture (PAR/Moving/Beam/Strobe/Fog)
+        # mendapat satu baris horizontal berisi semua fixture tipe itu.
         flbl = QLabel("FADER FIXTURE (per channel)")
         flbl.setObjectName("sectLbl")
         root.addWidget(flbl)
         self.fix_scroll = QScrollArea()
         self.fix_scroll.setWidgetResizable(True)
         self.fix_host = QWidget()
-        self.fix_layout = QHBoxLayout(self.fix_host)
+        self.fix_layout = QVBoxLayout(self.fix_host)   # baris per tipe
+        self.fix_layout.setSpacing(6)
         self.fix_scroll.setWidget(self.fix_host)
         root.addWidget(self.fix_scroll, 1)
 
@@ -93,36 +99,86 @@ class MixerTab(QWidget):
         self.grp_row.addStretch(1)
 
     def build_fixtures(self, fixtures):
+        """Bangun ulang fader per-fixture, dikelompokkan per baris tipe (v45).
+
+        Saran 1: tiap tipe fixture (PAR/Moving/Beam/Strobe/Fog) tampil sebagai
+        satu baris horizontal. Layout vertikal (QVBoxLayout) menumpuk baris.
+        """
+        # Bersihkan widget lama
         while self.fix_layout.count():
             it = self.fix_layout.takeAt(0)
             w = it.widget()
             if w:
                 w.deleteLater()
+            elif it.layout():
+                # bersihkan sub-layout (baris tipe) beserta isinya
+                self._clear_sub_layout(it.layout())
         self.chan_faders = {}
+
+        # Kelompokkan fixture berdasarkan tipe, pertahankan urutan kemunculan
+        from collections import OrderedDict
+        type_groups = OrderedDict()
         for fi, fx in enumerate(fixtures):
-            box = QFrame()
-            box.setObjectName("fixBox")
-            v = QVBoxLayout(box)
-            v.setSpacing(2)
-            nm = QLabel(fx.get("name", f"F{fi}"))
-            nm.setObjectName("fixName")
-            v.addWidget(nm, alignment=Qt.AlignHCenter)
-            row = QHBoxLayout()
-            row.setSpacing(2)
-            labels = channel_labels(fx.get("type", 0), fx.get("foot", 1))
-            for c in range(fx.get("foot", 0)):
-                lab = labels[c] if c < len(labels) else f"C{c}"
-                f = VFader(lab, color="#f5a623", small=True)
-                key = f"{fi}_{c}"
-                f.set_key(key)
-                f.slider.valueChanged.connect(lambda v, key=key: self.cmd.emit(f"SET {key}={v}"))
-                f.pressed.connect(lambda key=key: self.active.emit(key, True))
-                f.released.connect(lambda key=key: self.active.emit(key, False))
-                row.addWidget(f)
-                self.chan_faders[key] = f
-            v.addLayout(row)
-            self.fix_layout.addWidget(box)
+            ftype = fx.get("type", 0)
+            type_groups.setdefault(ftype, []).append((fi, fx))
+
+        for ftype, members in type_groups.items():
+            type_name = FIX_TYPE_NAMES.get(ftype, f"TIPE {ftype}")
+            # Label baris tipe
+            row_lbl = QLabel(f"— {type_name} ({len(members)} unit) —")
+            row_lbl.setObjectName("fixTypeLbl")
+            row_lbl.setStyleSheet("color:#78909c;font-size:11px;font-weight:bold;padding-top:4px;")
+            self.fix_layout.addWidget(row_lbl)
+
+            # Baris horizontal berisi fixture tipe ini
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setSpacing(6)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            for fi, fx in members:
+                box = QFrame()
+                box.setObjectName("fixBox")
+                v = QVBoxLayout(box)
+                v.setSpacing(2)
+                addr_start = fx.get("start", 0)
+                foot = fx.get("foot", 0)
+                addr_end = addr_start + foot - 1 if foot > 0 else addr_start
+                nm = QLabel(f"{fx.get('name', f'F{fi}')}\n{addr_start}-{addr_end}")
+                nm.setObjectName("fixName")
+                nm.setAlignment(Qt.AlignHCenter)
+                v.addWidget(nm)
+                row = QHBoxLayout()
+                row.setSpacing(2)
+                labels = channel_labels(fx.get("type", 0), foot)
+                for c in range(foot):
+                    lab = labels[c] if c < len(labels) else f"C{c}"
+                    f = VFader(lab, color="#f5a623", small=True)
+                    key = f"{fi}_{c}"
+                    f.set_key(key)
+                    f.slider.valueChanged.connect(lambda v, key=key: self.cmd.emit(f"SET {key}={v}"))
+                    f.pressed.connect(lambda key=key: self.active.emit(key, True))
+                    f.released.connect(lambda key=key: self.active.emit(key, False))
+                    row.addWidget(f)
+                    self.chan_faders[key] = f
+                v.addLayout(row)
+                row_layout.addWidget(box)
+
+            row_layout.addStretch(1)
+            self.fix_layout.addWidget(row_widget)
+
         self.fix_layout.addStretch(1)
+
+    @staticmethod
+    def _clear_sub_layout(layout):
+        """Kosongkan sub-layout rekursif (dipakai saat rebuild baris tipe)."""
+        while layout.count():
+            it = layout.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+            elif it.layout():
+                MixerTab._clear_sub_layout(it.layout())
 
     # ---- sinkron dari GET --------------------------------------------------
     def apply_state(self, st, active_keys):

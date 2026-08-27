@@ -88,3 +88,15 @@ class PadButton(QPushButton):
 
     def clear_color(self, selected):
         self.setStyleSheet(f"QPushButton{{background:#2a2e35;color:#aaa;border:2px solid {'#ffd54f' if selected else '#3a3f4b'};border-radius:8px;}}")
+
+    def set_hidden_in_scene(self, selected):
+        """Preset disembunyikan (used=0) tapi masih dirujuk scene.
+
+        Data channel/fade/hold tetap utuh di firmware; scene tetap memainkannya.
+        Tampilan: latar gelap + border putus-putus oranye agar operator tahu
+        slot ini tidak benar-benar kosong (v45, Bug 2).
+        """
+        bd = "#ffd54f" if selected else "#e67e22"
+        self.setStyleSheet(
+            f"QPushButton{{background:#1e2126;color:#e67e22;border:2px dashed {bd};border-radius:8px;font-weight:bold;}}"
+        )

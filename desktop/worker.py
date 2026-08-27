@@ -11,7 +11,9 @@ class SerialWorker(QObject):
     data_received = Signal(str, object)  # LISTF/LISTG/LISTP/LISTS/EXPORT
     command_done = Signal(str, object)   # cmd, respons JSON (atau None)
 
-    DATA_INTERVAL = 3.0   # detik antar refresh LISTP/LISTS (data struktural)
+    DATA_INTERVAL = 1.5   # detik antar refresh LISTP/LISTS (data struktural)
+    # v45: dipercepat dari 3.0 -> 1.5 detik agar perubahan preset/scene dari
+    # WebUI lebih cepat terlihat di desktop (mengurangi "tidak sinkron" antar-app).
 
     # Perintah kontrol kontinu = FIRE-AND-FORGET (tanpa tunggu balasan).
     # Inilah inti perbaikan delay fader desktop: sebelumnya tiap geseran

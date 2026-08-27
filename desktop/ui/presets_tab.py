@@ -134,11 +134,24 @@ class PresetsTab(QWidget):
     def apply_state(self, st, active_keys):
         sel = st.selected_preset()
         self.sel_scene = st.selected_scene()
+
+        # Kumpulkan slot preset yang dirujuk scene (0-based). Preset "terhapus"
+        # (used=0) yang masih dirujuk scene tetap dimainkan -> tandai agar
+        # operator tahu slot itu tidak benar-benar kosong (v45, Bug 2).
+        scene_refs = set()
+        for sc in st.scenes:
+            for v in sc:
+                if 1 <= v <= 30:
+                    scene_refs.add(v - 1)
+
         for i, p in enumerate(self.pads):
             pr = st.preset(i)
             p.setChecked(i == sel)
             if pr and pr.get("used"):
                 p.set_used(pr.get("r", 0), pr.get("g", 0), pr.get("b", 0), i == sel)
+            elif i in scene_refs:
+                # Disembunyikan tapi masih dirujuk scene -> border putus-putus
+                p.set_hidden_in_scene(i == sel)
             else:
                 p.clear_color(i == sel)
         # Info label updated on each change; but don't overwrite user's spinbox edits when changing selection
