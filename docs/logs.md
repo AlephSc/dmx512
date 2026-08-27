@@ -1369,3 +1369,17 @@ Fitur pembeda untuk produk jual: fader/knob/pad fisik dari controller MIDI
 
 ### Build
 - desktop: rebuild onedir (dist/DMX512Controller/).
+
+---
+
+## Session 47 — Penguatan keandalan: banner error JS + indikator versi firmware
+
+### Perubahan
+- **Banner error JS (v44)**: handler `window.error` & `unhandledrejection`
+  ditingkatkan dari teks status kecil ke banner merah fixed di atas layar.
+  Dipasang SEBELUM const data -> tetap aktif walau script mati di tengah
+  (pelajaran dari kasus __SCNDATA__: error hanya terlihat di console).
+- **Indikator versi firmware**: `buildStateJson` kini menyertakan
+  `"build":"vNN"`; toolbar desktop menampilkan `fw vNN · rev N`. Deteksi dini
+  flash basi (UI baru di firmware lama / sebaliknya) tanpa tebak-tebakan.
+- BUILD_TAG v43 -> v44.

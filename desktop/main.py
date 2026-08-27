@@ -332,7 +332,11 @@ class MainWindow(QMainWindow):
                 tab.apply_state(self.state, self.active_keys)
             except Exception as e:  # noqa: BLE001
                 self.tab_system.log(f"apply_state {type(tab).__name__}: {e}")
-        self.rev_lbl.setText(f"rev {j.get('revision','?')}"
+        # Tampilkan versi firmware (build) + revision: deteksi dini flash basi
+        # (kasus UI baru di firmware lama / sebaliknya) tanpa tebak-tebakan.
+        fw = j.get("build", "")
+        self.rev_lbl.setText((f"fw {fw} · " if fw else "")
+                             + f"rev {j.get('revision','?')}"
                              + (" • belum disimpan" if j.get("nvsDirty") else ""))
 
     def _on_data(self, kind, payload):

@@ -64,7 +64,7 @@
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v43"
+#define BUILD_TAG "v44"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -1113,10 +1113,32 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <script>
 const $=id=>document.getElementById(id);
 // Self-diagnostik: error JS ditampilkan langsung di layar (bukan diam-diam).
-window.addEventListener('error',e=>{
-  const el=document.getElementById('statTxt');
-  if(el){ el.textContent='JS ERROR: '+e.message; el.style.color='#e74c3c'; }
-});
+// v44: banner merah menonjol di atas layar + unhandledrejection, supaya
+// kegagalan (mis. token substitusi tak terganti spt __SCNDATA__) langsung
+// terlihat saat perform tanpa harus membuka console browser. Handler ini
+// dipasang SEBELUM semua const data agar tetap aktif walau script mati di tengah.
+(function(){
+  function showBanner(msg){
+    try{
+      var b=document.getElementById('errBanner');
+      if(!b){
+        b=document.createElement('div'); b.id='errBanner';
+        b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;background:#b71c1c;color:#fff;font:12px/1.4 monospace;padding:8px 12px;border-bottom:2px solid #ff5252;';
+        (document.body||document.documentElement).appendChild(b);
+      }
+      b.textContent='JS ERROR: '+msg;
+    }catch(_){}
+    var el=document.getElementById('statTxt');
+    if(el){ el.textContent='JS ERROR: '+msg; el.style.color='#e74c3c'; }
+  }
+  window.addEventListener('error',function(e){
+    showBanner(e.message+' (baris '+(e.lineno||'?')+')');
+  });
+  window.addEventListener('unhandledrejection',function(e){
+    var r=e.reason, m=(r&&r.message)?r.message:String(r||'unknown');
+    showBanner('Promise: '+m);
+  });
+})();
 // WebServer Arduino melayani koneksi satu per satu. Serialkan semua fetch
 // agar polling, slider, preset, dan scene tidak saling berebut koneksi.
 const nativeFetch=window.fetch.bind(window);
@@ -1697,6 +1719,7 @@ String buildStateJson(){
   bool so=sceneOn;
   xSemaphoreGive(dmxMutex);
   String j="{";
+  j+="\"build\":\""+String(BUILD_TAG)+"\",";   // v44: UI/desktop bisa verifikasi versi firmware aktif
   j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision)+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
