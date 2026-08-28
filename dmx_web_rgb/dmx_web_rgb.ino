@@ -49,6 +49,7 @@
 #include <Arduino.h>
 #include "Dmx_ESP32.h"
 #include <ETH.h>           // W5500 & TCP/IP stack (core 3.x+)
+#include <atomic>          // v47: stateRevision/sceneRev lintas-core atomic
 
 // v45: forward declaration utk Arduino IDE auto-prototype generation.
 // Tanpa ini, prototype fungsi yang memakai `Fixture*` di-generate sebelum
@@ -69,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v45"
+#define BUILD_TAG "v48"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -162,6 +163,41 @@ static const Fixture FIX_DEFAULT[MAX_FIX] = {
 };
 Fixture fix[MAX_FIX];   // patch table aktif (runtime, bisa diubah)
 
+// ---------------------------------------------------------------
+// v48: CUSTOM FIXTURE TYPE — tipe fixture yang didefinisikan user
+// Slot tipe 5..15 (FX_PAR..FX_FOG = 0..4; t>=5 merujuk customSlots[t-5]).
+// Mode per-channel: 0=fader (0-255 bebas), 1=switch (binary 0/255 — untuk
+// beban on/off seperti relay 12V yang rusak jika dapat nilai antara).
+// ---------------------------------------------------------------
+#define CUSTOM_TYPE_MIN 5
+#define CUSTOM_TYPE_MAX 15              // 11 slot custom (5..15)
+#define N_CUSTOM_TYPES (CUSTOM_TYPE_MAX - CUSTOM_TYPE_MIN + 1)
+#define CUSTOM_IDX(t) ((t)-CUSTOM_TYPE_MIN)   // type -> index array
+#define CUSTOM_MAX_CH 32               // label/mode per tipe, maks 32 channel
+struct CustomType {
+  uint8_t  used;                // slot terpakai?
+  char     name[17];            // nama tipe, maks 16 char
+  uint8_t  channels;            // 1..CUSTOM_MAX_CH
+  uint8_t  mode[CUSTOM_MAX_CH]; // 0=fader, 1=switch, per channel
+  char     labels[CUSTOM_MAX_CH][9]; // nama slider per channel (8 char + NUL)
+};
+static CustomType customSlots[N_CUSTOM_TYPES];
+
+// helper: mode channel (0 fader / 1 switch) utk tipe custom; tipe bawaan = 0
+bool customTypeMode(uint8_t type, uint16_t ch){
+  if(type<CUSTOM_TYPE_MIN||type>CUSTOM_TYPE_MAX) return 0;
+  CustomType &c=customSlots[CUSTOM_IDX(type)];
+  if(!c.used || ch>=CUSTOM_MAX_CH) return 0;
+  return c.mode[ch];
+}
+// v48: snap binary utk channel mode-switch (relay/on-off). FIRMWARE = sumber
+// kebenaran — desktop/API lama yang kirim nilai tengah tetap di-snap di sini,
+// mencegah beban on-off (relay) menerima tegangan antara.
+static inline uint8_t snapSwitchMode(uint8_t type, uint16_t localCh, int v){
+  if(v>=0 && customTypeMode(type,(uint16_t)localCh)) return (v<128)?0:255;
+  return cv(v);
+}
+
 void loadDefaultFixtures(){
   N_FIX = DEFAULT_N_FIX;
   for(int i=0; i<DEFAULT_N_FIX; i++) fix[i] = FIX_DEFAULT[i];
@@ -242,14 +278,20 @@ static volatile int sceneStep = -1;    // posisi langkah terakhir
 static volatile uint32_t sceneMs = 1500;
 
 // State UI yang authoritative di ESP32, bukan hanya di browser.
+// v47: stateRevision & sceneRev kini std::atomic — dua-satunya counter yang
+// di-increment dari Core 0 (dmxTask: applyPresetToWant) DAN dibaca Core 1
+// (web/ws/serial). `volatile` tidak menjamin atomicity ++ di Xtensa.
 static volatile int selectedPreset = -1;
 static volatile int selectedScene = -1;
-static volatile uint32_t stateRevision = 1;
+static std::atomic<uint32_t> stateRevision{1};
 static volatile bool nvsDirty = false;
 static volatile bool lastSaveOk = true;
 static volatile uint32_t lastSaveAt = 0;
 static volatile uint32_t dmxHeartbeat = 0;
 
+// v46: sceneRev ikut naik saat isi scenes[] berubah (termasuk alih referensi
+// COW dari client lain) -> client tahu kapan harus reload /scenes.
+static std::atomic<uint32_t> sceneRev{1};
 // Deadline playback di-reset ketika PLAY/CHASE dimulai. Ini mencegah timer
 // static lama membuat langkah pertama kadang terlambat atau tidak konsisten.
 static volatile uint32_t chaseNextAt = 0;
@@ -302,7 +344,9 @@ void wsHandleCtl(const uint8_t* data, size_t len){
     if(fi<0||fi>=N_FIX||c<0||c>=fix[fi].foot) return;
     xSemaphoreTake(dmxMutex,portMAX_DELAY);
     uint16_t ch=fix[fi].start+c;
-    manualWant[ch]=cv(v); manualTouched[ch]=millis();
+    // v48: snap binary utk channel custom mode-switch (relay)
+    manualWant[ch]=snapSwitchMode(fix[fi].type,(uint16_t)c,v);
+    manualTouched[ch]=millis();
     recomputeWant();
     out[ch]=want[ch];                      // snap: tanpa fade utk geseran manual
     xSemaphoreGive(dmxMutex);
@@ -333,6 +377,28 @@ void wsHandleCtl(const uint8_t* data, size_t len){
        }
     xSemaphoreGive(dmxMutex);
     stateRevision++; nvsDirty=true;
+  } else if(strstr(buf, "\"t\":\"b\"")){
+    // v48: BANK — tulis channel yang sama di SEMUA fixture tipe tsb.
+    // Satu pesan WS menggantikan N request /set (latensi & heap lebih baik).
+    int ty=wsInt(buf,"ty",-1), c=wsInt(buf,"c",-1), v=wsInt(buf,"v",-1);
+    if(ty<0||c<0||v<0||v>255) return;
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    uint32_t touched=millis();
+    for(int f=0;f<N_FIX;f++){
+      if(fix[f].type!=(uint8_t)ty || c>=fix[f].foot) continue;
+      uint16_t ch=fix[f].start+c;
+      // snap binary utk channel custom mode-switch (relay)
+      manualWant[ch]=snapSwitchMode(fix[f].type,(uint16_t)c,v);
+      manualTouched[ch]=touched;
+    }
+    recomputeWant();
+    for(int f=0;f<N_FIX;f++){
+      if(fix[f].type!=(uint8_t)ty || c>=fix[f].foot) continue;
+      uint16_t ch=fix[f].start+c;
+      out[ch]=want[ch];                     // snap: bank terasa langsung
+    }
+    xSemaphoreGive(dmxMutex);
+    stateRevision++;
   }
 }
 void onWsEvent(AsyncWebSocket*, AsyncWebSocketClient* c, AwsEventType t, void* arg, uint8_t* data, size_t len){
@@ -400,6 +466,26 @@ static uint8_t compactPresets[N_PRESETS][COMPACT_CHUNK];  // buffer staging NVS
 static uint8_t compactScenes[sizeof(scenes)];             // buffer staging NVS
 const uint8_t STORAGE_VER = 8;             // naikkan bila layout berubah lagi
 
+// v46: TRANSAKSIONAL COMMIT. persistAll() lama menulis 6 key berurutan; kalau
+// listrik mati di tengah, boot bisa memuat kombinasi data baru/lama tanpa ada
+// yang menyadarinya. Skema commit-marker:
+//   1. snapshot RAM -> compact* (di bawah mutex)
+//   2. tulis sver2/pc0/pc1/sc/selP/selS
+//   3. read-back semua blob -> harus identik (memcmp, lebih kuat dari CRC)
+//   4. tulis "gen" = generation number naik (marker komit paling akhir)
+// Boot memuat data HANYA bila gen valid; selain itu mulai bersih.
+// Tidak dipakai double-buffer (2x5,4 KB blob tak muat di partisi
+// NVS ~20 KB ini — persis masalah v27 NOT_ENOUGH_SPACE).
+// ponytail: gen+read-back cukup untuk prototipe closed-network; upgrade ke
+// A/B slot saat butuh survive tanpa kehilangan data apa pun pada tegangan
+// jatuh di tengah tulis.
+static uint32_t storageGen = 0;
+// v46: migrasi data v45 (gen==0) ditunda keluar dari setup() — tulis NVS
+// saat boot adalah momen arus paling kritis; pada PSU marginal hal ini
+// memicu brownout loop (laporan user: "E BOD ... rst:0x3" berulang).
+static bool pendingGenMigration = false;
+static uint32_t bootAtMs = 0;
+
 bool persistAll(){
   // Snapshot konsisten diambil di bawah mutex DMX; penulisan flash dilakukan
   // DI LUAR mutex agar timing frame Core 0 tidak terganggu operasi NVS.
@@ -413,20 +499,35 @@ bool persistAll(){
   memcpy(compactScenes,(uint8_t*)scenes,sizeof(scenes));
   int selP=selectedPreset, selS=selectedScene;
   xSemaphoreGive(dmxMutex);
-  bool ok=true;
   if(!nvs.begin(NVS_NS,false)){
     lastSaveOk=false;
     return false;
   }
+  bool ok=true;
   ok = nvs.putUChar("sver2",STORAGE_VER) > 0 && ok;
   ok = nvs.putBytes("pc0",(uint8_t*)compactPresets,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES && ok;
   ok = nvs.putBytes("pc1",(uint8_t*)compactPresets+COMPACT_KEY_BYTES,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES && ok;
   ok = nvs.putBytes("sc",compactScenes,sizeof(compactScenes)) == sizeof(compactScenes) && ok;
   ok = nvs.putInt("selP",selP) > 0 && ok;
   ok = nvs.putInt("selS",selS) > 0 && ok;
+  // v46: read-back verify blob -> tangkap tulisan flash gagal senyap.
+  static uint8_t rb[COMPACT_KEY_BYTES];
+  if(ok){
+    ok = nvs.getBytes("pc0",rb,COMPACT_KEY_BYTES)==COMPACT_KEY_BYTES
+      && memcmp(rb,compactPresets,COMPACT_KEY_BYTES)==0;
+    if(ok) ok = nvs.getBytes("pc1",rb,COMPACT_KEY_BYTES)==COMPACT_KEY_BYTES
+      && memcmp(rb,(uint8_t*)compactPresets+COMPACT_KEY_BYTES,COMPACT_KEY_BYTES)==0;
+    if(ok) ok = nvs.getBytes("sc",rb,sizeof(compactScenes))==sizeof(compactScenes)
+      && memcmp(rb,compactScenes,sizeof(compactScenes))==0;
+  }
+  // Commit marker PALING AKHIR: gen hanya naik bila seluruh tulisan verified.
+  // Boot memuat data hanya bila gen tersimpan valid -> snapshot yang terpotong
+  // listrik di tengah tidak pernah dikomit.
+  if(ok) ok = nvs.putUInt("gen",++storageGen) > 0;
   nvs.end();
   lastSaveOk=ok;
   if(ok){ nvsDirty=false; lastSaveAt=millis(); }
+  else Serial.println("NVS: persist GAGAL verify -> commit tidak dinaikkan");
   return ok;
 }
 
@@ -463,10 +564,17 @@ void loadAll(){
   bool ok = nvs.getBytes("pc0",(uint8_t*)compactPresets,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES
          && nvs.getBytes("pc1",(uint8_t*)compactPresets+COMPACT_KEY_BYTES,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES
          && nvs.getBytes("sc",compactScenes,sizeof(compactScenes)) == sizeof(compactScenes);
+  uint32_t gen = nvs.getUInt("gen",0);
+  if(ok && gen==0)
+    Serial.println("NVS: data v45 tanpa gen -> muat sekali, komit migrasi ditunda 10 dtk");
+  if(ok && gen>0) storageGen = gen;
   if(ok){
     unpackCompactIntoRam();
     selectedPreset=nvs.getInt("selP",-1);
     selectedScene=nvs.getInt("selS",-1);
+    if(gen==0) pendingGenMigration = true;   // v46: tulis setelah daya stabil (loop)
+  } else {
+    Serial.println("NVS: blob rusak/tak lengkap -> mulai bersih (commit tidak valid)");
   }
   nvs.end();
 }
@@ -480,11 +588,18 @@ bool loadData(){
       && nvs.getBytes("pc1",(uint8_t*)compactPresets+COMPACT_KEY_BYTES,COMPACT_KEY_BYTES) == COMPACT_KEY_BYTES
       && nvs.getBytes("sc",compactScenes,sizeof(compactScenes)) == sizeof(compactScenes);
   }
+  if(ok && nvs.getUInt("gen",0)==0){
+    // v46: tanpa commit marker = snapshot tak pernah terkomit valid -> tolak.
+    nvs.end();
+    return false;
+  }
   if(ok){
+    storageGen = nvs.getUInt("gen",0);
     unpackCompactIntoRam();
     selectedPreset=nvs.getInt("selP",-1);
     selectedScene=nvs.getInt("selS",-1);
     stateRevision++;
+    sceneRev++;      // v46: isi scene bisa berbeda dari state RAM -> paksa reload client
   }
   nvs.end();
   if(ok) nvsDirty=false;
@@ -514,7 +629,8 @@ bool validateFixtures(const Fixture* fx, uint8_t count, int& errIdx, const char*
   errIdx=-1; errCode=nullptr;
   if(count==0 || count>MAX_FIX){ errCode="count_out_of_range"; return false; }
   for(int i=0;i<count;i++){
-    if(fx[i].type>FX_FOG){ errIdx=i; errCode="type_invalid"; return false; }
+    // v48: tipe custom 5..15 sah (customSlots harus used — dicek terpisah
+    // di applyFixtures agar pesan error lebih jelas).
     if(fx[i].hasMove>1){ errIdx=i; errCode="move_invalid"; return false; }
     if(fx[i].name[0]==0){ errIdx=i; errCode="name_empty"; return false; }
     if(fx[i].start<1 || fx[i].foot<1 || (uint32_t)fx[i].start+fx[i].foot-1 > 512){
@@ -525,6 +641,67 @@ bool validateFixtures(const Fixture* fx, uint8_t count, int& errIdx, const char*
       uint16_t b1=fx[j].start, b2=fx[j].start+fx[j].foot-1;
       if(a1<=b2 && b1<=a2){ errIdx=i; errCode="address_overlap"; return false; }
     }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------
+// v48: PERSISTENSI CUSTOM TYPE (NVS)
+// Layout key "ctcfg" (binary kompak, satu key):
+//   [0]      = versi format (1)
+//   per slot (18 + 32*10 = 338 byte):
+//     [0]     used
+//     [1..16] name[16]
+//     [17]    channels
+//     [18..49]  mode[32]
+//     [50..]    labels[32][8] (tanpa NUL per item — panjang tetap 8, padded 0)
+// Total: 1 + 11*338 = 3.719 byte (muat satu NVS value, batas ~4.000).
+// ---------------------------------------------------------------
+#define CTCFG_VER 1
+#define CTCFG_SLOT (18 + CUSTOM_MAX_CH*10)     // 338 byte/slot
+#define CTCFG_MAX_BYTES (1 + N_CUSTOM_TYPES*CTCFG_SLOT)
+static_assert(CTCFG_MAX_BYTES <= 4000, "ctcfg blob melebihi batas NVS value");
+
+bool persistCustomTypes(){
+  uint8_t buf[CTCFG_MAX_BYTES];
+  memset(buf,0,sizeof(buf));
+  buf[0]=CTCFG_VER;
+  for(int s=0;s<N_CUSTOM_TYPES;s++){
+    uint8_t* e=buf+1+(size_t)s*CTCFG_SLOT;
+    CustomType &c=customSlots[s];
+    e[0]=c.used?1:0;
+    strncpy((char*)e+1, c.name, 16); ((char*)e)[16]=0;
+    e[17]=c.channels;
+    memcpy(e+18, c.mode, CUSTOM_MAX_CH);
+    for(int k=0;k<CUSTOM_MAX_CH;k++)
+      memcpy(e+18+CUSTOM_MAX_CH+(size_t)k*8, c.labels[k], 8);
+  }
+  if(!nvs.begin(NVS_NS,false)){ lastSaveOk=false; return false; }
+  bool ok = nvs.putBytes("ctcfg",buf,sizeof(buf))==sizeof(buf);
+  nvs.end();
+  if(!ok) lastSaveOk=false;
+  return ok;
+}
+
+bool loadCustomTypes(){
+  if(!nvs.begin(NVS_NS,true)) return false;
+  size_t len=nvs.getBytesLength("ctcfg");
+  if(len!=CTCFG_MAX_BYTES){ nvs.end(); return false; }   // belum ada -> default kosong
+  uint8_t buf[CTCFG_MAX_BYTES];
+  if(nvs.getBytes("ctcfg",buf,len)!=len){ nvs.end(); return false; }
+  nvs.end();
+  if(buf[0]!=CTCFG_VER) return false;
+  for(int s=0;s<N_CUSTOM_TYPES;s++){
+    uint8_t* e=buf+1+(size_t)s*CTCFG_SLOT;
+    CustomType &c=customSlots[s];
+    memset(&c,0,sizeof(CustomType));
+    c.used=e[0];
+    strncpy(c.name,(char*)e+1,16); c.name[16]=0;
+    c.channels=e[17];
+    if(c.channels>CUSTOM_MAX_CH) c.channels=CUSTOM_MAX_CH;
+    memcpy(c.mode, e+18, CUSTOM_MAX_CH);
+    for(int k=0;k<CUSTOM_MAX_CH;k++)
+      memcpy(c.labels[k], e+18+CUSTOM_MAX_CH+(size_t)k*8, 8);
   }
   return true;
 }
@@ -586,6 +763,16 @@ bool loadFixtures(){
 // Return true bila sukses; errIdx/errCode diisi bila gagal.
 bool applyFixtures(const Fixture* newFix, uint8_t newCount, int& errIdx, const char*& errCode){
   if(!validateFixtures(newFix,newCount,errIdx,errCode)) return false;
+  // v48: tipe custom harus slot-nya used
+  for(int i=0;i<newCount;i++){
+    if(newFix[i].type>=CUSTOM_TYPE_MIN && newFix[i].type<=CUSTOM_TYPE_MAX){
+      if(!customSlots[CUSTOM_IDX(newFix[i].type)].used){
+        errIdx=i; errCode="custom_type_not_defined"; return false;
+      }
+    } else if(newFix[i].type>FX_FOG){
+      errIdx=i; errCode="type_invalid"; return false;
+    }
+  }
   Fixture oldFix[MAX_FIX]; uint8_t oldCount;
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
   oldCount=N_FIX; memcpy(oldFix,fix,sizeof(fix));
@@ -735,8 +922,53 @@ void applyPresetToWant(int idx){
   recomputeWant();
   xSemaphoreGive(dmxMutex);
 }
-void capturePreset(int idx, bool ignoreDimmer, uint16_t fMs, uint16_t hMs){
+// v46: COPY-ON-WRITE preset — scene menyimpan REFERENSI nomor preset, bukan
+// salinan. Tanpa proteksi ini, merekam ulang preset (warna/fade/hold baru)
+// menular ke semua scene yang merujuk slot itu. Solusi: sebelum data lama
+// ditimpa, pindahkan chunk lama ke slot BAYANGAN (used=0) lalu alihkan
+// referensi scene ke slot bayangan. Scene tetap memainkan data lama, slot
+// asli bebas direkam ulang. sceneTick sudah mengabaikan flag used sehingga
+// slot bayangan tetap diputar. Return: index bayangan, atau COW_FULL bila
+// tidak ada slot bebas.
+#define COW_FULL -2
+int presetSceneRefCount(int idx){
+  // caller wajib pegang dmxMutex
+  int n=0;
+  for(int s=0;s<N_SCENES;s++)
+    for(int k=0;k<SCENE_STEPS;k++)
+      if(scenes[s][k]==idx+1) n++;
+  return n;
+}
+int cowShadowPreset(int idx){
+  // caller wajib pegang dmxMutex. Cari slot bebas (used=0 dan TIDAK
+  // direferensikan scene mana pun — jangan pakai slot bayangan lain).
+  for(int sh=0; sh<N_PRESETS; sh++){
+    if(sh==idx) continue;
+    if(presets[sh][0]) continue;                 // slot dipakai preset visible
+    if(presetSceneRefCount(sh)>0) continue;      // slot = bayangan scene lain
+    memcpy(presets[sh],presets[idx],PRESET_CHUNK);
+    presets[sh][0]=0;                            // bayangan: hidden by design
+    for(int s=0;s<N_SCENES;s++)
+      for(int k=0;k<SCENE_STEPS;k++)
+        if(scenes[s][k]==idx+1) scenes[s][k]=sh+1;
+    sceneRev++;
+    return sh;
+  }
+  return COW_FULL;
+}
+// return true bila rekam sukses; false bila COW gagal (slot bayangan habis,
+// data lama tidak tersentuh sehingga scene tetap utuh).
+bool capturePreset(int idx, bool ignoreDimmer, uint16_t fMs, uint16_t hMs){
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
+  // COW: bila slot lama masih dirujuk scene (visible ATAU bayangan), salin
+  // dulu ke slot bayangan. Syarat used=0 TIDAK dipakai: slot bayangan yang
+  // masih dirujuk scene wajib terlindungi juga (data scene milik scene).
+  if(presetSceneRefCount(idx)>0){
+    if(cowShadowPreset(idx)==COW_FULL){
+      xSemaphoreGive(dmxMutex);
+      return false;  // gagal: data lama TIDAK ditimpa (scene tetap utuh)
+    }
+  }
   memset(presets[idx],0,PRESET_CHUNK);
   presets[idx][0]=1;
   presets[idx][513]=(uint8_t)constrain(fMs/10,0,255);
@@ -749,6 +981,7 @@ void capturePreset(int idx, bool ignoreDimmer, uint16_t fMs, uint16_t hMs){
   xSemaphoreGive(dmxMutex);
   markStateChanged();
   persistAll();   // tulis NVS hanya di sini (awet flash)
+  return true;
 }
 
 String presetsJson(){
@@ -870,9 +1103,22 @@ bool importJson(const String& s){
   // Commit hanya setelah parsing selesai. Index file tetap dipertahankan.
   // Parser kompatibel dengan export desktop: 30 slot, field c/f/h/u.
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
-  for(int i=0;i<N_PRESETS;i++)
-    if(parsed[i]) memcpy(presets[i],tmp[i],PRESET_CHUNK);
+  bool shadowFailed=false;
+  for(int i=0;i<N_PRESETS;i++){
+    if(!parsed[i]) continue;
+    // v46 COW: file import menimpa slot yang direferensikan scene -> salin
+    // data lama ke slot bayangan supaya scene tetap memainkan data lamanya.
+    // Syarat used=0 tidak dipakai: slot bayangan dirujuk scene juga wajib
+    // terlindungi. Catatan: file export menyimpan SEMUA slot (incl.
+    // tersembunyi), jadi scene di device tujuan biasanya sudah tercakup;
+    // proteksi ini untuk file yang datanya berbeda dari scene lokal.
+    if(presetSceneRefCount(i)>0){
+      if(cowShadowPreset(i)==COW_FULL) shadowFailed=true;
+    }
+    memcpy(presets[i],tmp[i],PRESET_CHUNK);
+  }
   xSemaphoreGive(dmxMutex);
+  if(shadowFailed) sceneRev++;   // ada perubahan referensi (parsial)
   markStateChanged();
   persistAll();
   return true;
@@ -882,7 +1128,10 @@ bool importJson(const String& s){
 // SCENE handlers
 // ---------------------------------------------------------------
 String scnJson(){
+  // v47: reserve — 20 scene x 50 langkah x maks 2 digit + koma ≈ 1,3 KB.
+  // Tanpa reserve, ~1000 konkatenasi memicu puluhan realloc heap.
   String j="[";
+  j.reserve(1400);
   for(int s=0;s<N_SCENES;s++){
     j+="[";
     for(int k=0;k<SCENE_STEPS;k++){ j+=String(scenes[s][k]); if(k<SCENE_STEPS-1) j+=','; }
@@ -899,7 +1148,7 @@ void sendApiError(int code, const char* reason, const char* message){
   server.send(code,"application/json",j);
 }
 void sendApiOk(){
-  String j="{\"ok\":true,\"revision\":"+String(stateRevision)+"}";
+  String j="{\"ok\":true,\"revision\":"+String(stateRevision.load())+"}";
   server.send(200,"application/json",j);
 }
 
@@ -1003,7 +1252,7 @@ void onHealth(){
   j+="\"ok\":true,\"build\":\""+String(BUILD_TAG)+"\",";
   j+="\"uptime\":"+String(millis())+",";
   j+="\"heartbeat\":"+String(dmxHeartbeat)+",";
-  j+="\"revision\":"+String(stateRevision)+",";
+  j+="\"revision\":"+String(stateRevision.load())+",";
   j+="\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",";
   j+="\"sceneError\":"+String(sceneError)+",";
   j+="\"nvsDirty\":"+(String(nvsDirty?"true":"false"))+",";
@@ -1031,6 +1280,7 @@ void onSPush(){
     return;
   }
   if(slot>=0) scenes[s][slot]=(uint8_t)p;
+  sceneRev++;
   xSemaphoreGive(dmxMutex);
   if(slot<0){ sendApiError(409,"scene_full","Scene sudah penuh"); return; }
   stateRevision++; nvsDirty=true;
@@ -1042,7 +1292,7 @@ void onSPop(){
   int s=server.arg("s").toInt()-1;
   if(s<0||s>=N_SCENES){ sendApiError(400,"scene_invalid","Nomor scene tidak valid"); return; }
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
-  for(int k=SCENE_STEPS-1;k>=0;k--){ if(scenes[s][k]!=0){ scenes[s][k]=0; break; } }
+  for(int k=SCENE_STEPS-1;k>=0;k--){ if(scenes[s][k]!=0){ scenes[s][k]=0; sceneRev++; break; } }
   xSemaphoreGive(dmxMutex);
   stateRevision++; nvsDirty=true; persistAll();
   sendApiOk();
@@ -1053,6 +1303,7 @@ void onSClear(){
   if(s<0||s>=N_SCENES){ sendApiError(400,"scene_invalid","Nomor scene tidak valid"); return; }
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
   memset(scenes[s],0,SCENE_STEPS);
+  sceneRev++;
   xSemaphoreGive(dmxMutex);
   stateRevision++; nvsDirty=true; persistAll();
   sendApiOk();
@@ -1095,15 +1346,16 @@ void onGroup(){
   int i=server.arg("i").toInt();
   int v=server.arg("v").toInt();
   if(i<0||i>=N_GROUPS){ sendApiError(400,"group_invalid","Nomor grup tidak valid"); return; }
-  uint8_t val=cv(v);
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
    uint32_t touched=millis();
-   for(int f=0;f<N_FIX;f++){
-     if(fix[f].type!=grp[i].typeFilter) continue;
-     if(grp[i].offset>=fix[f].foot) continue;
-     uint16_t ch=fix[f].start+grp[i].offset;
-     manualWant[ch]=val; manualTouched[ch]=touched;
-   }
+    for(int f=0;f<N_FIX;f++){
+      if(fix[f].type!=grp[i].typeFilter) continue;
+      if(grp[i].offset>=fix[f].foot) continue;
+      uint16_t ch=fix[f].start+grp[i].offset;
+      // v48: snap binary per-fixture utk channel custom mode-switch
+      manualWant[ch]=snapSwitchMode(fix[f].type,grp[i].offset,v);
+      manualTouched[ch]=touched;
+    }
    recomputeWant();
    for(int f=0;f<N_FIX;f++){
      if(fix[f].type!=grp[i].typeFilter) continue;
@@ -1116,7 +1368,9 @@ void onGroup(){
 }
 
 String grpJson(){
+  // v47: reserve — 8 grup x ±60 byte kecil, tapi bebas realloc
   String j="[";
+  j.reserve(512);
   for(int i=0;i<N_GROUPS;i++){
     j+="{\"name\":\""+String(grp[i].name)+"\",";
     j+="\"type\":"+String(grp[i].typeFilter)+",";
@@ -1131,6 +1385,125 @@ String grpJson(){
 String fixJson();
 
 void onGroupsGet(){ server.send(200,"application/json",grpJson()); }
+
+// ---------------------------------------------------------------
+// v48: CUSTOM TYPE API — GET /ctypes (daftar), POST /ctypes (commit penuh)
+// POST body: {"types":[{"slot":5,"used":1,"name":"RELAY","channels":8,
+//   "mode":[0,1,1,0,0,0,0,0],"labels":["PWR","RST1",...]}]}
+// Slot di luar daftar tetap dipertahankan (patch-by-slot).
+// ---------------------------------------------------------------
+String customTypesJson(){
+  String j="[";
+  j.reserve(64+N_CUSTOM_TYPES*64);
+  bool first=true;
+  for(int s=0;s<N_CUSTOM_TYPES;s++){
+    CustomType &c=customSlots[s];
+    if(!c.used) continue;
+    if(!first) j+=",";
+    first=false;
+    j+="{\"slot\":"+String(CUSTOM_TYPE_MIN+s);
+    j+=",\"name\":\""+String(c.name)+"\"";
+    j+=",\"channels\":"+String(c.channels)+",\"mode\":[";
+    for(int k=0;k<c.channels;k++){ j+=String(c.mode[k]); if(k<c.channels-1) j+=','; }
+    j+="],\"labels\":[";
+    for(int k=0;k<c.channels;k++){ j+="\""+String(c.labels[k])+"\""; if(k<c.channels-1) j+=','; }
+    j+="]}";
+  }
+  j+="]";
+  return j;
+}
+
+void onCtypesGet(){ server.send(200,"application/json",customTypesJson()); }
+
+// Commit custom types dari JSON body. Return true sukses (sudah persist).
+// body = elemen "types":[...] dari POST /ctypes ATAU arg CTSET serial.
+bool commitCustomTypes(const String& body){
+  // Parse manual sederhana: cari tiap {"slot":N,...} lalu field di dalamnya.
+  // Batas: 11 slot; field opsional → slot tak disebut tetap utuh.
+  CustomType tmp[N_CUSTOM_TYPES];
+  memcpy(tmp,customSlots,sizeof(tmp));        // mulai dari state aktif
+  int pos=body.indexOf('[');
+  if(pos<0) return false;
+  int parsed=0;
+  while(true){
+    int objStart=body.indexOf('{',pos);
+    if(objStart<0) break;
+    int objEnd=body.indexOf('}',objStart);
+    if(objEnd<0) break;
+    String obj=body.substring(objStart,objEnd+1);
+    pos=objEnd+1;
+    int slot=obj.indexOf("\"slot\":");
+    if(slot<0) continue;
+    int slotN=obj.substring(slot+7).toInt();
+    if(slotN<CUSTOM_TYPE_MIN||slotN>CUSTOM_TYPE_MAX) continue;
+    CustomType &t=tmp[CUSTOM_IDX((uint8_t)slotN)];
+    memset(&t,0,sizeof(CustomType));
+    t.used=1;
+    // name
+    int nm=obj.indexOf("\"name\":\"");
+    if(nm>=0){ int ns=nm+8, ne=obj.indexOf('"',ns); if(ne>ns){ String s=obj.substring(ns,min(ne,ns+16)); s.toCharArray(t.name,17);} }
+    if(t.name[0]==0) strncpy(t.name,"CUSTOM",16);
+    // channels
+    int chp=obj.indexOf("\"channels\":");
+    int channels=chp>=0?obj.substring(chp+11).toInt():0;
+    if(channels<1||channels>CUSTOM_MAX_CH) channels=CUSTOM_MAX_CH;
+    t.channels=(uint8_t)channels;
+    // mode array
+    int mp=obj.indexOf("\"mode\":[");
+    if(mp>=0){
+      int ep=obj.indexOf(']',mp);
+      String arr=obj.substring(mp+8, ep);
+      int idx=0, from=0;
+      while(idx<CUSTOM_MAX_CH){
+        int comma=arr.indexOf(',',from);
+        String tok=(comma<0)?arr.substring(from):arr.substring(from,comma);
+        tok.trim();
+        t.mode[idx]= (uint8_t)(tok.toInt()?1:0);
+        idx++;
+        if(comma<0) break;
+        from=comma+1;
+      }
+    }
+    // labels array
+    int lp=obj.indexOf("\"labels\":[");
+    if(lp>=0){
+      int ep=obj.indexOf(']',lp);
+      String arr=obj.substring(lp+10, ep);
+      int idx=0, from=0;
+      while(idx<CUSTOM_MAX_CH){
+        int q1=arr.indexOf('"',from);
+        if(q1<0) break;
+        int q2=arr.indexOf('"',q1+1);
+        if(q2<0) break;
+        String s=arr.substring(q1+1,q2);
+        s.toCharArray(t.labels[idx],9);
+        idx++;
+        from=q2+1;
+      }
+      // label kosong -> default CHn
+      for(int k=0;k<idx;k++) if(t.labels[k][0]==0){ String d="CH"+String(k+1); d.toCharArray(t.labels[k],9); }
+      for(int k=idx;k<channels;k++){ String d="CH"+String(k+1); d.toCharArray(t.labels[k],9); }
+    } else {
+      for(int k=0;k<channels;k++){ String d="CH"+String(k+1); d.toCharArray(t.labels[k],9); }
+    }
+    parsed++;
+  }
+  if(parsed==0) return false;
+  xSemaphoreTake(dmxMutex,portMAX_DELAY);
+  memcpy(customSlots,tmp,sizeof(tmp));
+  xSemaphoreGive(dmxMutex);
+  if(!persistCustomTypes()) return false;
+  markStateChanged();
+  return true;
+}
+
+void onCtypesPost(){
+  if(!server.hasArg("plain")){ sendApiError(400,"no_body","Body JSON kosong"); return; }
+  String body=server.arg("plain");
+  if(body.length()>4200){ sendApiError(413,"body_too_large","Body terlalu besar"); return; }
+  if(!commitCustomTypes(body)){ sendApiError(400,"ctypes_invalid","Format custom type tidak valid"); return; }
+  sendApiOk();
+}
 void onFixesGet(){ server.send(200,"application/json",fixJson()); }
 
 // ---------------------------------------------------------------
@@ -1205,9 +1578,23 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   #masterPanel{grid-column:2;grid-row:2}
   #scenePanel{grid-column:1;grid-row:2}
   #presetPanel{grid-column:1;grid-row:3}
-  #faderPanel{grid-column:2;grid-row:3}
   #channelPanel{grid-column:1 / -1;grid-row:4}
-  .fixgrd{display:grid;grid-template-columns:1fr;gap:12px}
+  /* v47: section per tipe fixture — collapsible, group fader embedded */
+  .type-sec{border:1px solid var(--edge);border-radius:8px;margin:10px 0;padding:10px;background:#20242c}
+  .type-sec>summary{cursor:pointer;font-size:13px;font-weight:700;color:#b0bec5;user-select:none;list-style:none}
+  .type-sec>summary::-webkit-details-marker{display:none}
+  .type-sec>summary::before{content:'\25BE ';color:var(--muted)}
+  .type-sec:not([open])>summary::before{content:'\25B8 '}
+  .type-sec .grouphdr{font-size:11px;color:var(--muted);font-weight:700;margin:6px 0 2px;letter-spacing:.4px}
+  .fixgrd{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
+  /* v48: dual pane — kiri fixture individu, kanan fader bank */
+  .dualfx{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;align-items:start}
+  .dualfx>[data-role="bank"]{border-left:1px dashed var(--edge);padding-left:14px}
+  @media(max-width:900px){.dualfx{grid-template-columns:1fr}.dualfx>[data-role="bank"]{border-left:0;padding-left:0;border-top:1px dashed var(--edge);padding-top:10px}}
+  /* v48: channel mode SWITCH — thumb persegi + fill beda, ⚡ di label */
+  input.switchmode{accent-color:#ffd54f}
+  input.switchmode::-webkit-slider-thumb{border-radius:3px;background:#ffd54f}
+  input.switchmode::-moz-range-thumb{border-radius:3px;background:#ffd54f}
   .fix{padding-top:10px;border-top:1px dashed var(--edge)}.fix:first-child{border-top:0;padding-top:0}
   .fix-name{font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.3px;margin-bottom:2px}
   .io{display:flex;gap:8px;flex-wrap:wrap}
@@ -1222,16 +1609,14 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   #patchTable .del{background:#7f1d1d;color:#fff;border:0;border-radius:5px;padding:3px 8px;cursor:pointer;font-size:12px;min-height:28px}
   #patchTable .err{border-color:#e74c3c !important;background:#2a1215}
   #patchPanel{grid-column:1 / -1;grid-row:5}
-  @media(min-width:520px){.fixgrd{grid-template-columns:1fr 1fr}}
   @media(max-width:760px){
     .wrap{display:flex;flex-direction:column;max-width:680px}
     header{order:0}
     #masterPanel{order:1}
     #scenePanel{order:2}
     #presetPanel{order:3}
-    #faderPanel{order:4}
-    #channelPanel{order:5}
-    #patchPanel{order:6}
+    #channelPanel{order:4}
+    #patchPanel{order:5}
     .panel{margin-bottom:14px}
   }
   @media(max-width:380px){.panel{padding:14px}.bank{grid-template-columns:repeat(4,1fr)}label{grid-template-columns:auto 1fr 36px}}
@@ -1258,14 +1643,31 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 
   <section class="panel" id="patchPanel">
     <h3>Patch <span style="color:var(--muted);font-weight:400">alamat DMX &amp; jumlah fixture (maks 512 ch)</span></h3>
-    <p class="sub">Ubah alamat/jumlah fixture lalu Simpan Patch. Alamat akhir tiap fixture tidak boleh melebihi 512 dan tidak boleh tumpang tindih.</p>
+    <p class="sub">Ubah alamat/jumlah fixture lalu Simpan Patch. Alamat akhir tiap fixture tidak boleh melebihi 512 dan tidak boleh tumpang tindih. Tipe custom (slot 5-15) dibuat dulu di &quot;Tipe Custom&quot;.</p>
     <div id="patchTable" style="overflow-x:auto;margin:8px 0"></div>
     <div class="actions">
       <button class="btn-go act" id="btnPatchSave">Simpan Patch</button>
       <button class="btn-off act" id="btnPatchAdd">+ Tambah Fixture</button>
       <button class="btn-reset act" id="btnPatchReset">Reset Default</button>
+      <button class="act" id="btnCType">Tipe Custom</button>
     </div>
     <div class="status" id="patchStatus" style="margin-top:8px"></div>
+    <!-- v48: dialog editor custom fixture type (dibangun JS; hidden default) -->
+    <div id="ctypeEditor" style="display:none;margin-top:12px;border:1px solid var(--edge);border-radius:8px;padding:10px;background:#20242c">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <strong style="color:#b0bec5">Tipe Custom (slot 5-15)</strong>
+        <select id="ctSlot" style="width:auto"></select>
+        <input type="text" id="ctName" placeholder="Nama tipe" maxlength="16" style="width:140px">
+        <input type="number" id="ctChannels" min="1" max="32" value="8" style="width:70px">
+        <span style="color:var(--muted);font-size:12px">channel</span>
+        <button class="act" id="ctLoad" style="margin-left:auto">Muat Slot</button>
+        <button class="btn-go act" id="ctSave">Simpan Tipe</button>
+        <button class="btn-off act" id="ctClose">Tutup</button>
+      </div>
+      <p class="sub" style="margin:6px 0 2px">Mode: <b>FADER</b> = 0-255 kontinu &middot; <b>SWITCH</b> = hanya 0 / 255 (relay &amp; beban on-off). Radio di bawah menentukan mode tiap channel.</p>
+      <div id="ctChannels" style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px"></div>
+      <div class="status" id="ctStatus" style="margin-top:8px"></div>
+    </div>
   </section>
 
   <section class="panel" id="presetPanel">
@@ -1301,15 +1703,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <p class="sub">durasi tiap langkah = Hold preset masing-masing</p>
   </section>
 
-  <section class="panel" id="faderPanel">
-    <h3>Fader Bank <span style="color:var(--muted);font-weight:400">1 fader &middot; banyak lampu</span></h3>
-    <p class="sub">fader menulis channel yang sama di semua fixture grupnya</p>
-    <div id="groups"></div>
-  </section>
-
   <section class="panel" id="channelPanel">
-    <h3>Channel</h3><p class="sub">geser = realtime &middot; dimmer channel pertama mengikuti master</p>
-    <div class="fixgrd" id="fixes"></div>
+    <h3>Mixer <span style="color:var(--muted);font-weight:400">section per tipe &middot; klik judul utk lipat</span></h3>
+    <p class="sub">geser = realtime &middot; dimmer channel pertama mengikuti master</p>
+    <div id="fixes"></div>
     <div class="actions" style="margin-top:12px">
       <button class="btn-off act" id="btnOff">Mati Semua</button>
       <button class="btn-reset act" id="btnWhite">Semua Warna Penuh</button>
@@ -1384,6 +1781,7 @@ function api(url,options){
 const FIX=__FIXDATA__;
 const GRP=__GRPDATA__;
 const SCN=__SCNDATA__;
+const CT=__CTDATA__;   // v48: custom fixture types [{slot,name,channels,mode[],labels[]}]
 const NSCN=SCN.length, NSTEPS=SCN[0].length;
 const N_PRESETS=__NP__;   // jumlah pad preset (diinjeksi server; selaras firmware)
 const N=FIX.length, COLS=['#ffb400','#e0463f','#3fae57','#3f7fd4','#9b59b6','#e67e22','#1abc9c','#95a5a6'];
@@ -1397,51 +1795,176 @@ function labelOf(i){
     const extra=['Strobe','Mode','Auto','Speed','Aux','R2','G2','B2'];
     return base.concat(extra.slice(0,Math.max(0,f-4)));
   }
+  if(t===1){   // v47: chart standar moving head
+    const a=['Pan','PanF','Tilt','TiltF','P/T Spd','Dim','Strobe','ColorSpd',
+             'Gobo','GoboRot','PrismRot','Focus','Zoom','Shutter','Func','Reset','CH19','CH20'];
+    return fitLabels(a,f);
+  }
+  if(t===2){   // v47: chart standar beam
+    const a=['Pan','PanF','Tilt','TiltF','P/T Spd','Dim','Strobe','Color',
+             'Gobo','GoboRot','Prism','Focus','Zoom','Shutter','Func','Reset'];
+    return fitLabels(a,f);
+  }
   if(t===4) return ['Fog','Fan'];
   if(t===3) return ['Mode','Strobe','Dim','Color'];
   const a=[]; for(let k=1;k<=f;k++)a.push('CH'+k); return a;
 }
-function buildFixes(){
-  const box=$('fixes'); box.innerHTML='';
-  for(let i=0;i<N;i++){
-    const f=FIX[i]; const wrap=document.createElement('div'); wrap.className='fix';
-    const nm=document.createElement('div'); nm.className='fix-name';
-    nm.textContent=f.name+'   '+f.start+'-'+(f.start+f.foot-1);
-    wrap.appendChild(nm);
-    const labels=labelOf(i);
-    for(let c=0;c<f.foot;c++){
-      const lbl=document.createElement('label');
-      const lab=document.createElement('span');lab.className='lab';lab.textContent=labels[c]||('CH'+(c+1));
-      const inp=document.createElement('input');inp.type='range';inp.min=0;inp.max=255;inp.value=0;
-      const idi=keyOf(i,c); inp.id=idi; inp.dataset.fi=i; inp.dataset.ch=c;
-      const val=document.createElement('span');val.className='val';val.id=idi+'v';val.textContent='0';
-      inp.addEventListener('input',()=>onInput(inp));
-      inp.addEventListener('change',()=>onRelease(inp));
-      inp.addEventListener('blur',()=>onRelease(inp));
-      sliders[idi]=inp; allKeys.push(idi);
-      lbl.appendChild(lab);lbl.appendChild(inp);lbl.appendChild(val);
-      wrap.appendChild(lbl);
-    }
-    box.appendChild(wrap);
-  }
+function fitLabels(a,f){   // v47: potong bila foot<chart; sisa = CHn
+  const out=a.slice(0,f);
+  for(let k=out.length;k<f;k++) out.push('CH'+(k+1));
+  return out;
 }
-function buildGroups(){
-  const box=$('groups'); box.innerHTML='';
-  GRP.forEach((g,i)=>{
-    let n=0;
-    FIX.forEach(f=>{ if(f.type===g.type && g.offset<f.foot) n++; });
-    const lbl=document.createElement('label');
-    const lab=document.createElement('span');lab.className='lab';lab.textContent=g.name+' \u00d7'+n;
-    const inp=document.createElement('input');inp.type='range';inp.min=0;inp.max=255;inp.value=0;inp.id='g'+i;
-    const val=document.createElement('span');val.className='val';val.id='g'+i+'v';val.textContent='0';
-    inp.addEventListener('input',()=>{
-      document.getElementById('g'+i+'v').textContent=inp.value;paintFill(inp);
-      stopAuto();
-      api('/grp?i='+i+'&v='+inp.value).catch(e=>showError(e.message));
+// ---- v48: custom type helpers --------------------------------------------
+function ctFind(t){ return CT.find(c=>c.slot===t)||null; }
+function isCustom(t){ return t>=5 && t<=15; }
+// label channel fixture i: chart bawaan ATAU custom type definition
+function channelLabelsFor(i){
+  const t=FIX[i].type, f=FIX[i].foot;
+  if(isCustom(t)){
+    const c=ctFind(t);
+    if(c){
+      const out=[];
+      for(let k=0;k<f;k++){
+        if(k<c.labels.length && c.labels[k]) out.push(c.labels[k]);
+        else out.push('CH'+(k+1));
+      }
+      return {labels:out, modes:(k)=> (k<c.mode.length?c.mode[k]:0)};
+    }
+    return {labels:fitLabels([],f), modes:()=>0};
+  }
+  return {labels:labelOf(i), modes:()=>0};
+}
+// v47: bangun section per tipe — tiap section berisi fader GRUP tipe itu
+// + fader per fixture tipenya. Menggantikan buildFixes()+buildGroups() lama
+// (panel Fader Bank terpisah dihapus).
+const TYPE_NAMES={0:'PAR LED',1:'MOVING HEAD',2:'BEAM',3:'STROBE',4:'FOG'};
+function buildSections(){
+  const box=$('fixes'); box.innerHTML='';
+  allKeys=[];   // dibangun ulang (slider per-channel)
+  // kelompokkan fixture per tipe, urutan kemunculan dipertahankan
+  const byType=[];
+  for(let i=0;i<N;i++){
+    const t=FIX[i].type;
+    let g=byType.find(x=>x.t===t);
+    if(!g){ g={t,items:[]}; byType.push(g); }
+    g.items.push(i);
+  }
+  byType.forEach(g=>{
+    const sec=document.createElement('details');
+    sec.className='type-sec';
+    sec.open = g.t===0;   // PAR default terbuka; tipe lain dilipat
+    const sum=document.createElement('summary');
+    const first=FIX[g.items[0]], last=FIX[g.items[g.items.length-1]];
+    sum.textContent=(TYPE_NAMES[g.t]||('TIPE '+g.t))+' \u00b7 '+g.items.length+
+                    ' unit \u00b7 DMX '+first.start+'-'+(last.start+last.foot-1);
+    sec.appendChild(sum);
+    // (1) v48: fader GRUP lama DIHAPUS dari section — fungsinya tergantikan
+    // oleh BANK (pane kanan): bank menulis channel sama ke semua fixture
+    // tipe ini, mencakup semua channel (GRUP hanya subset 8 channel tetap).
+    // Duplikasi kontrol = membingungkan operator (laporan user v48).
+    // Endpoint /grp + syncGroups tetap ada utk kompatibilitas desktop lama.
+    // (2) fader per-fixture tipe ini — DUAL PANE (v48):
+    //     kiri = fixture individu (klik nama utk pilih), kanan = BANK fader
+    //     yang menulis channel sama ke SEMUA fixture tipe itu.
+    const dual=document.createElement('div');
+    dual.className='dualfx';
+    // --- pane kiri: fixture individu
+    const grd=document.createElement('div'); grd.className='fixgrd';
+    grd.dataset.role='individual';
+    // --- pane kanan: fader bank
+    const bankPane=document.createElement('div');
+    bankPane.className='fix';
+    bankPane.dataset.role='bank';
+    bankPane.style.display='none';   // muncul setelah fixture dipilih
+    const bankTitle=document.createElement('div'); bankTitle.className='fix-name';
+    bankPane.appendChild(bankTitle);
+    dual.appendChild(grd);
+    dual.appendChild(bankPane);
+    sec.appendChild(dual);
+    // helper render bank utk tipe ini (dipanggil saat fixture dipilih)
+    const renderBank=(selIdx)=>{
+      const f=FIX[selIdx];
+      const cl=channelLabelsFor(selIdx);
+      const def=ctFind(g.t);
+      const typeName=TYPE_NAMES[g.t]||(def?def.name:('TIPE '+g.t));
+      bankTitle.textContent='BANK: '+typeName+' \u00d7'+g.items.length+' \u00b7 mempegaruhi SEMUA fixture tipe ini';
+      // bersihkan fader bank lama (kecuali judul)
+      while(bankPane.children.length>1) bankPane.removeChild(bankPane.lastChild);
+      for(let c=0;c<f.foot;c++){
+        const lbl=document.createElement('label');
+        const lab=document.createElement('span');lab.className='lab';
+        lab.textContent=(cl.labels[c]||('CH'+(c+1)))+(cl.modes(c)?' \u26a1':'');
+        const inp=document.createElement('input');inp.type='range';inp.min=0;inp.max=255;inp.value=0;
+        inp.dataset.bankTy=g.t; inp.dataset.bankCh=c;
+        if(cl.modes(c)){ inp.classList.add('switchmode'); inp.title='SWITCH: nilai dibatasi 0 / 255'; }
+        const val=document.createElement('span');val.className='val';
+        const vv=document.createElement('span');vv.textContent='0'; vv.id='bk'+g.t+'_'+c+'v';
+        val.appendChild(vv);
+        inp.addEventListener('input',()=>{
+          // v48: snap client-side utk switch mode (firmware snap juga — dua lapis)
+          let v=+inp.value;
+          if(cl.modes(c)) v=(v<128)?0:255;
+          inp.value=v; vv.textContent=v; paintFill(inp);
+          stopAuto();
+          // tandai channel sedang di-drag bank -> slider member dikecualikan
+          // dari sync server (anti echo-bounce)
+          bankDragMark(g.t+'_'+c);
+          // kirim SET ke semua fixture tipe ini (loop kecil, N<=32)
+          g.items.forEach(fi=>{
+            const key=fi+'_'+c;
+            const s=sliders[key];
+            if(s){ s.value=v; document.getElementById(key+'v').textContent=v; paintFill(s); }
+          });
+          bankSend(g.t,c,v);   // v48: satu pesan agregat, bukan N request
+        });
+        inp.addEventListener('change',()=>bankDragUntil=Date.now()+600);
+        lbl.appendChild(lab);lbl.appendChild(inp);lbl.appendChild(val);
+        bankPane.appendChild(lbl);
+      }
+      bankPane.style.display='';
+    };
+    // klik nama fixture = pilih fixture utk tampilan bank
+    g.items.forEach(i=>{
+      const f=FIX[i]; const wrap=document.createElement('div'); wrap.className='fix';
+      const nm=document.createElement('div'); nm.className='fix-name';
+      nm.style.cursor='pointer';
+      nm.textContent=f.name+'   '+f.start+'-'+(f.start+f.foot-1);
+      nm.addEventListener('click',()=>{
+        // highlight pilihan di pane kiri
+        grd.querySelectorAll('.fix-name').forEach(x=>x.style.color='');
+        nm.style.color='#4fc3f7';
+        renderBank(i);
+      });
+      wrap.appendChild(nm);
+      const cl=channelLabelsFor(i);
+      for(let c=0;c<f.foot;c++){
+        const lbl=document.createElement('label');
+        const lab=document.createElement('span');lab.className='lab';
+        lab.textContent=(cl.labels[c]||('CH'+(c+1)))+(cl.modes(c)?' \u26a1':'');
+        const inp=document.createElement('input');inp.type='range';inp.min=0;inp.max=255;inp.value=0;
+        const idi=keyOf(i,c); inp.id=idi; inp.dataset.fi=i; inp.dataset.ch=c;
+        if(cl.modes(c)){ inp.classList.add('switchmode'); inp.title='SWITCH: nilai dibatasi 0 / 255'; }
+        const val=document.createElement('span');val.className='val';val.id=idi+'v';val.textContent='0';
+        inp.addEventListener('input',()=>{
+          // v48: snap client-side switch mode
+          if(cl.modes(c)) inp.value=(+inp.value<128)?0:255;
+          onInput(inp);
+        });
+        inp.addEventListener('change',()=>onRelease(inp));
+        inp.addEventListener('blur',()=>onRelease(inp));
+        sliders[idi]=inp; allKeys.push(idi);
+        lbl.appendChild(lab);lbl.appendChild(inp);lbl.appendChild(val);
+        wrap.appendChild(lbl);
+      }
+      grd.appendChild(wrap);
     });
-    lbl.appendChild(lab);lbl.appendChild(inp);lbl.appendChild(val);
-    box.appendChild(lbl);
+    // pilih fixture pertama tipe ini sebagai default bank saat load
+    if(g.items.length) renderBank(g.items[0]);
+    box.appendChild(sec);
   });
+  // v48: group yatim tidak lagi dirender — fader GRUP dihapus dari UI
+  // (digantikan BANK). Group tanpa member tidak punya padanan bank; tampilan
+  // "GRUP LAIN ×0" hanya membingungkan. Endpoint /grp tetap utuh (kompat).
 }
 // Sinkron fader grup dari state server. Aturan: fader grup hanya di-set bila
 // SEMUA membernya bernilai sama. Kalau member berbeda (mis. satu fixture
@@ -1460,13 +1983,24 @@ function syncGroups(j){
     if(vals.length===0) return;
     const same=vals.every(v=>v===vals[0]);
     if(!same) return;                       // member berbeda -> jangan sentuh fader grup
-    const s=$('g'+i); s.value=vals[0];
+    // v48: fader grup dihapus dari UI (digantikan BANK) — guard null.
+    const s=$('g'+i); if(!s) return;
+    s.value=vals[0];
     document.getElementById('g'+i+'v').textContent=vals[0]; paintFill(s);
   });
 }
 let chaseOn=false;
 let sceneOn=false, selScene=-1, sceneEdit=false;
 let activeKey=null;   // slider yang sedang digeser user (dilewati polling)
+// v48: channel yang sedang dikendalikan BANK (drag). Slider member-nya
+// dikecualikan dari sinkronisasi server SELAMA drag + 600 ms setelahnya —
+// mencegah echo lama (broadcast 10 Hz kalah cepat dari drag) menimpa nilai
+// baru dengan nilai basi -> fader "memantul-mantul" (laporan user v48).
+let bankDragUntil=0;
+function bankDragMark(ch){ bankDragUntil=Date.now()+600; }
+function bankDragActive(){
+  return Date.now()<bankDragUntil;
+}
 // Throttle: maks 1 request /set beredar; nilai terakhir dikirim setelahnya.
 let setInFlight=false,setPending=null;
 // v43: kontrol dikirim via WebSocket bila tersambung (tanpa overhead & antrean
@@ -1493,6 +2027,27 @@ function onInput(inp){
   pushOne(inp.dataset.fi,inp.dataset.ch,inp.value);
 }
 function onRelease(inp){activeKey=null;}
+// ---- v48: BANK fader — satu pesan agregat untuk semua fixture tipe itu
+// {"t":"b","ty":<type>,"c":<ch>,"v":<val>} — firmware menulis channel sama
+// di semua fixture tipe tsb dalam SATU operasi (nol polling, nol N-request).
+// Throttle: maks 1 pesan per 30 ms (paritas frame DMX 25ms) saat drag.
+let bankLastAt=0, bankPending=null, bankTimer=null;
+function bankSend(ty,c,v){
+  const now=Date.now();
+  const fire=()=>{
+    bankLastAt=Date.now(); bankPending=null; bankTimer=null;
+    const msg={t:'b',ty:ty,c:c,v:v};
+    if(!wsCtl(msg)){
+      // fallback HTTP: loop /set — jarang terpakai (WS nyaris selalu up)
+      FIX.forEach((f,fi)=>{
+        if(f.type===ty && c<f.foot) api('/set?'+fi+'_'+c+'='+v).catch(()=>{});
+      });
+    }
+  };
+  if(now-bankLastAt>=30){ fire(); return; }
+  bankPending=[ty,c,v];
+  if(!bankTimer) bankTimer=setTimeout(fire,30-(now-bankLastAt));
+}
 // Umpan balik non-blocking (pengganti alert utk sukses)
 let toastT=null;
 function toast(msg){
@@ -1653,6 +2208,7 @@ function reloadScenes(){
     renderSceneBank(); renderSteps();
   }).catch(e=>showError(e.message));
 }
+let lastSceneRev=null;   // v46: deteksi sceneRev dari server
 let serverScene=-1;
 function onPad(i){
   if(sceneEdit){
@@ -1769,6 +2325,10 @@ function syncFromServer(j, skipActive){
   if(j.strb!==undefined && (!skipActive || activeKey!=='mstrb')){ $('mstrb').value=j.strb; $('mstrbv').textContent=j.strb; paintFill($('mstrb')); }
   allKeys.forEach(k=>{
     if(skipActive && k===activeKey) return;
+    // v48 anti-bounce: channel sedang di-drag BANK -> jangan ditimpa echo
+    // server (broadcast 10 Hz bisa membawa nilai basi yang lebih tua dari
+    // drag; menimpanya = fader memantul, mis. 255 turun ke 226).
+    if(bankDragActive()) return;
     const v=(j.cur&&j.cur[k]!==undefined)?j.cur[k]:0;
     sliders[k].value=v; document.getElementById(k+'v').textContent=v; paintFill(sliders[k]);
   });
@@ -1779,6 +2339,11 @@ function syncFromServer(j, skipActive){
     if(selScene!==j.selectedScene){ selScene=j.selectedScene; renderSceneBank(); renderSteps(); }
   }
   serverScene=(j.scn!==undefined && j.scn>=0)?j.scn:-1;
+  // v46: isi scene berubah di server (COW / edit dari client lain) -> reload
+  if(j.sceneRev!==undefined && j.sceneRev!==lastSceneRev){
+    if(lastSceneRev!==null) reloadScenes();   // skip saat init pertama
+    lastSceneRev=j.sceneRev;
+  }
   if(sceneOn){ renderSceneBank(); }
   // Indikator playback: scene & langkah yang sedang main selalu terlihat
   const si=$('sinfo');
@@ -1789,7 +2354,7 @@ function syncFromServer(j, skipActive){
     }
   }
 }
-buildFixes();buildGroups();buildSceneBank();renderSteps();updatePinfo();refreshPresets();
+buildSections();buildSceneBank();renderSteps();updatePinfo();refreshPresets();
 // Init penuh (tidak melewati apa pun)
 api('/cur').then(j=>{syncFromServer(j,false);syncGroups(j);$('status').classList.add('live');$('statTxt').textContent='tersimpan';}).catch(e=>{$('statTxt').textContent='server tidak menjawab: '+e.message;});
 // WebSocket realtime (port 81): ESP32 push state saat berubah -> tanpa polling.
@@ -1841,21 +2406,45 @@ function renderPatchTable(){
     const end=f.start+f.foot-1;
     const isErr=errSet.has(i);
     h+='<tr>';
+    // v48 BUGFIX: sel turunan diberi id (pstart{i}/pfoot{i}/pend{i}) supaya
+    // ketikan TIDAK memicu rebuild tabel penuh — dulu tiap huruf memanggil
+    // renderPatchTable() -> innerHTML dibangun ulang -> fokus hilang dan
+    // halaman scroll ke atas ("cursor menghilang"). Lihat patchUpdateDerived().
     h+='<td><input type="text" data-i="'+i+'" data-f="name" value="'+f.name.replace(/"/g,'&quot;')+'" maxlength="24"></td>';
     h+='<td><select data-i="'+i+'" data-f="type">';
     FIX_TYPES.forEach(t=>{ h+='<option value="'+t.v+'"'+(f.type===t.v?' selected':'')+'>'+t.l+'</option>'; });
+    // v48: opsi custom type (slot 5-15 yang sudah didefinisikan)
+    CT.forEach(c=>{ h+='<option value="'+c.slot+'"'+(f.type===c.slot?' selected':'')+'>* '+c.name+'</option>'; });
     h+='</select></td>';
-    h+='<td><input type="number" data-i="'+i+'" data-f="start" min="1" max="512" value="'+f.start+'" class="'+(isErr?'err':'')+'"></td>';
-    h+='<td><input type="number" data-i="'+i+'" data-f="foot" min="1" max="512" value="'+f.foot+'" class="'+(isErr?'err':'')+'"></td>';
-    h+='<td style="color:'+(end>512?'var(--bad)':'var(--muted)')+'">'+end+'</td>';
+    h+='<td><input type="number" id="pstart'+i+'" data-i="'+i+'" data-f="start" min="1" max="512" value="'+f.start+'" class="'+(isErr?'err':'')+'"></td>';
+    h+='<td><input type="number" id="pfoot'+i+'" data-i="'+i+'" data-f="foot" min="1" max="512" value="'+f.foot+'" class="'+(isErr?'err':'')+'"></td>';
+    h+='<td id="pend'+i+'" style="color:'+(end>512?'var(--bad)':'var(--muted)')+'">'+end+'</td>';
     h+='<td><input type="checkbox" data-i="'+i+'" data-f="hasMove" '+(f.hasMove?'checked':'')+' style="width:auto"></td>';
     h+='<td><button class="del" data-del="'+i+'">Hapus</button></td>';
     h+='</tr>';
   });
   h+='</tbody></table>';
   box.innerHTML=h;
-  // Status validasi
-  const st=$('patchStatus');
+  patchUpdateStatus(patchValidate());
+}
+// v48: update TANPA rebuild DOM — fokus & posisi scroll input tetap.
+// Hanya sel turunan yang berubah (akhir, kelas err, teks status).
+function patchUpdateDerived(){
+  const errs=patchValidate();
+  const errSet=new Set(errs.map(e=>e.i));
+  patchData.forEach((f,i)=>{
+    const end=f.start+f.foot-1;
+    const ec=document.getElementById('pend'+i);
+    if(ec){ ec.textContent=end; ec.style.color=(end>512)?'var(--bad)':'var(--muted)'; }
+    const se=document.getElementById('pstart'+i);
+    if(se) se.classList.toggle('err',errSet.has(i));
+    const fe=document.getElementById('pfoot'+i);
+    if(fe) fe.classList.toggle('err',errSet.has(i));
+  });
+  patchUpdateStatus(errs);
+}
+function patchUpdateStatus(errs){
+  const st=$('patchStatus'); if(!st) return;
   if(errs.length===0){
     const total=patchData.reduce((s,f)=>Math.max(s,f.start+f.foot-1),0);
     st.textContent='Valid. '+patchData.length+' fixture, channel tertinggi: '+total+'/512.';
@@ -1881,7 +2470,10 @@ function bindPatchEvents(){
     else if(f==='start') patchData[i].start=+el.value||1;
     else if(f==='foot') patchData[i].foot=+el.value||1;
     else if(f==='hasMove') patchData[i].hasMove=el.checked?1:0;
-    renderPatchTable();
+    // v48 BUGFIX: jangan renderPatchTable() saat 'input' — rebuild innerHTML
+    // menghancurkan elemen yang sedang diketik (fokus hilang, scroll lompat).
+    // Cukup perbarui sel turunan. Rebuild penuh hanya utk add/delete row.
+    patchUpdateDerived();
   });
   box.addEventListener('click',e=>{
     const del=e.target.dataset.del;
@@ -1926,6 +2518,93 @@ patchClone();
 renderPatchTable();
 bindPatchEvents();
 
+// =============================================================
+// v48: EDITOR TIPE CUSTOM (slot 5-15)
+// =============================================================
+const CT_MIN=5, CT_MAX=15, CT_CH=32;
+let ctEditing=null;   // {slot,name,channels,mode[],labels[]}
+function ctFillSlotSelect(){
+  const sel=$('ctSlot'); sel.innerHTML='';
+  for(let s=CT_MIN;s<=CT_MAX;s++){
+    const o=document.createElement('option'); o.value=s;
+    const def=ctFind(s);
+    o.textContent='Slot '+s+(def?(' · '+def.name):' (kosong)');
+    sel.appendChild(o);
+  }
+}
+function ctRenderChannels(){
+  const box=$('ctChannels'); box.innerHTML='';
+  if(!ctEditing) return;
+  for(let k=0;k<ctEditing.channels;k++){
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;gap:6px;align-items:center';
+    const num=document.createElement('span'); num.textContent=(k+1)+'.'; num.style.cssText='color:var(--muted);min-width:22px';
+    const name=document.createElement('input'); name.type='text'; name.maxLength=8;
+    name.value=ctEditing.labels[k]||('CH'+(k+1)); name.style.cssText='flex:1;min-width:70px';
+    name.addEventListener('input',()=>{ ctEditing.labels[k]=name.value; });
+    const rf=document.createElement('label'); rf.style.cssText='display:flex;gap:3px;align-items:center;white-space:nowrap';
+    const rF=document.createElement('input'); rF.type='radio'; rF.name='ctm'+k; rF.checked=!ctEditing.mode[k];
+    const rS=document.createElement('input'); rS.type='radio'; rS.name='ctm'+k; rS.checked=!!ctEditing.mode[k];
+    rF.addEventListener('change',()=>{ if(rF.checked) ctEditing.mode[k]=0; });
+    rS.addEventListener('change',()=>{ if(rS.checked) ctEditing.mode[k]=1; });
+    rf.appendChild(rF); rf.appendChild(document.createTextNode('Fader'));
+    const rs=document.createElement('label'); rs.style.cssText='display:flex;gap:3px;align-items:center;white-space:nowrap';
+    rs.appendChild(rS); rs.appendChild(document.createTextNode('Switch'));
+    row.appendChild(num); row.appendChild(name); row.appendChild(rf); row.appendChild(rs);
+    box.appendChild(row);
+  }
+}
+function ctLoadSlot(){
+  const slot=+$('ctSlot').value;
+  const def=ctFind(slot);
+  ctEditing = def ? {slot,name:def.name,channels:def.channels,mode:def.mode.slice(),labels:def.labels.slice()}
+                  : {slot,name:'CUSTOM'+slot,channels:+$('ctChannels').value||8,mode:new Array(CT_CH).fill(0),labels:[]};
+  for(let k=0;k<CT_CH;k++){ if(ctEditing.mode[k]===undefined) ctEditing.mode[k]=0; }
+  for(let k=0;k<ctEditing.channels;k++) if(!ctEditing.labels[k]) ctEditing.labels[k]='CH'+(k+1);
+  $('ctName').value=ctEditing.name;
+  $('ctChannels').value=ctEditing.channels;
+  ctRenderChannels();
+  $('ctStatus').textContent='Slot '+slot+' dimuat.';
+  $('ctStatus').style.color='var(--muted)';
+}
+$('btnCType').addEventListener('click',()=>{
+  const ed=$('ctypeEditor');
+  ed.style.display=ed.style.display==='none'?'':'none';
+  if(ed.style.display!=='none'){ ctFillSlotSelect(); ctLoadSlot(); }
+});
+$('ctSlot').addEventListener('change',ctLoadSlot);
+$('ctLoad').addEventListener('click',ctLoadSlot);
+$('ctClose').addEventListener('click',()=>{ $('ctypeEditor').style.display='none'; });
+$('ctName').addEventListener('input',()=>{ if(ctEditing) ctEditing.name=$('ctName').value; });
+$('ctChannels').addEventListener('change',()=>{
+  if(!ctEditing) return;
+  let n=+$('ctChannels').value||8;
+  if(n<1)n=1; if(n>CT_CH)n=CT_CH;
+  ctEditing.channels=n; $('ctChannels').value=n;
+  ctRenderChannels();
+});
+$('ctSave').addEventListener('click',()=>{
+  if(!ctEditing) return;
+  ctEditing.name=($('ctName').value||('CUSTOM'+ctEditing.slot)).trim();
+  if(!ctEditing.name){ $('ctStatus').textContent='Nama tipe wajib'; $('ctStatus').style.color='var(--bad)'; return; }
+  const payload={types:[{slot:ctEditing.slot,used:1,name:ctEditing.name,
+    channels:ctEditing.channels,
+    mode:ctEditing.mode.slice(0,ctEditing.channels),
+    labels:(ctEditing.labels.length?ctEditing.labels:[]).slice(0,ctEditing.channels)}]};
+  const st=$('ctStatus'); st.textContent='Menyimpan tipe...'; st.style.color='var(--muted)';
+  api('/ctypes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+    .then(()=>{ st.textContent='Tipe custom tersimpan ke NVS.'; st.style.color='#7bd88f';
+      // update cache lokal CT supaya label/mode langsung dipakai mixer
+      const i=CT.findIndex(c=>c.slot===ctEditing.slot);
+      const rec={slot:ctEditing.slot,name:ctEditing.name,channels:ctEditing.channels,
+        mode:ctEditing.mode.slice(0,ctEditing.channels),labels:ctEditing.labels.slice(0,ctEditing.channels)};
+      if(i>=0) CT[i]=rec; else CT.push(rec);
+      toast('Tipe custom tersimpan');
+      ctFillSlotSelect();
+    })
+    .catch(e=>{ st.textContent='Gagal: '+e.message; st.style.color='var(--bad)'; showError(e.message); });
+});
+
 // v43: panel WiFi kustom — status live + simpan kredensial baru.
 function wifiRefresh(){
   api('/wifistat').then(j=>{
@@ -1954,7 +2633,9 @@ wifiRefresh();
 
 // JSON fixture (v45: tambah field hasMove utk paritas desktop)
 String fixJson(){
+  // v47: reserve — 32 fixture x ±70 byte ≈ 2,2 KB
   String j="[";
+  j.reserve(2300);
   for(int i=0;i<N_FIX;i++){
     j+="{\"name\":\""+String(fix[i].name)+"\",";
     j+="\"type\":"+String(fix[i].type)+",";
@@ -2031,23 +2712,54 @@ void onFixesPost(){
   sendApiOk();
 }
 
+// v48 fix: STREAMING UI. Versi v46 masih menyusun String halaman utuh
+// (~54 KB utk HTML v48 + injeksi) — alokasi kontigu sebesar itu gagal saat
+// heap terfragmentasi (WS aktif), sehingga guard 500 "gagal alokasi heap"
+// muncul. Solusi definitive: kirim chunked langsung dari PROGMEM (flash
+// ESP32 memory-mapped) — puncak heap hanya JSON kecil (≤2,3 KB/JSON),
+// nol alokasi halaman. Token diganti on-the-fly; SEMUA kemunculan
+// (per iterasi strstr) diganti, paritas perilaku String::replace() lama.
 void sendUi(){
-  String page = FPSTR(INDEX_HTML);
-  // Satu alokasi besar di awal: tanpa reserve, tiap replace() merealokasi
-  // buffer yang terus membesar. Substitusi terbesar (__SCNDATA__ ~4 KB)
-  // paling rawan gagal alokasi saat heap terfragmentasi -> token tersisa
-  // di HTML dan memicu "Uncaught ReferenceError: __SCNDATA__ is not defined".
-  page.reserve(48000);
-  page.replace("__IP__", activeIP().toString());
-  page.replace("__BUILD__", BUILD_TAG);
-  page.replace("__FIXDATA__", fixJson());
-  page.replace("__GRPDATA__", grpJson());
-  page.replace("__SCNDATA__", scnJson());
-  page.replace("__NP__", String(N_PRESETS));
+  String fx=fixJson(), gr=grpJson(), sc=scnJson(), ct=customTypesJson();
+  String ip=activeIP().toString(), np=String(N_PRESETS);
+  struct TokRep { const char* tok; const String* val; };
+  TokRep toks[] = {
+    {"__IP__",     &ip},
+    {"__BUILD__",  nullptr},   // diisi bawah (BUILD_TAG literal)
+    {"__FIXDATA__",&fx},
+    {"__GRPDATA__",&gr},
+    {"__SCNDATA__",&sc},
+    {"__CTDATA__", &ct},
+    {"__NP__",     &np},
+  };
+  String build=String(BUILD_TAG);
+  toks[1].val=&build;
+  const int NTOK=(int)(sizeof(toks)/sizeof(toks[0]));
+  const char* html=INDEX_HTML;          // ESP32: flash memory-mapped, bisa dibaca
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   // Cegah cache browser: setelah firmware di-update, UI lama bisa bertahan
   // dan bentrok dengan endpoint baru (sumber bug "fitur hilang" yang aneh).
   server.sendHeader("Cache-Control","no-store, must-revalidate");
-  server.send(200,"text/html",page);
+  server.send(200,"text/html","");
+  const char* p=html;
+  while(*p){
+    // cari token paling awal dari posisi sekarang
+    const char* best=nullptr; const String* bestVal=nullptr; int bestLen=0;
+    for(int i=0;i<NTOK;i++){
+      const char* f=strstr(p,toks[i].tok);
+      if(f && (!best || f<best)){
+        best=f; bestVal=toks[i].val; bestLen=(int)strlen(toks[i].tok);
+      }
+    }
+    if(!best){
+      server.sendContent_P(p);          // sisa HTML tanpa token
+      break;
+    }
+    if(best>p) server.sendContent_P(p,(size_t)(best-p));  // potongan sebelum token
+    server.sendContent(*bestVal);       // nilai pengganti (JSON kecil)
+    p=best+bestLen;
+  }
+  server.sendContent("");               // akhir chunked
 }
 
 // ---------------------------------------------------------------
@@ -2064,7 +2776,9 @@ void onSet(){
       int fi=key.substring(0,us).toInt(); int c=key.substring(us+1).toInt();
       if(fi>=0&&fi<N_FIX&&c>=0&&c<fix[fi].foot){
         uint16_t ch=fix[fi].start+c;
-        manualWant[ch]=cv(v); manualTouched[ch]=millis();
+        // v48: snap binary utk channel custom mode-switch (relay)
+        manualWant[ch]=snapSwitchMode(fix[fi].type,(uint16_t)c,v);
+        manualTouched[ch]=millis();
         recomputeWant();
         out[ch]=want[ch];
       }
@@ -2114,6 +2828,9 @@ String buildStateJson(){
   // Snapshot cepat di bawah mutex, bangun JSON DI LUAR mutex ->
   // task DMX (Core0) tidak pernah menunggu lama gara-gara pembentukan String.
   // Dipakai oleh HTTP /cur (fallback) DAN WebSocket push (jalur utama).
+  // v47: reserve — builder ini dipanggil wsBroadcastTick tiap detik (dan tiap
+  // revision change); tanpa reserve, ±150 konkatenasi x frekuensi tinggi =
+  // ratusan realloc heap/detik -> fragmentasi (akar masalah __SCNDATA__).
   static uint8_t snapOut[513];
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
   memcpy(snapOut,out,sizeof(snapOut));
@@ -2122,8 +2839,10 @@ String buildStateJson(){
   bool so=sceneOn;
   xSemaphoreGive(dmxMutex);
   String j="{";
-  j+="\"build\":\""+String(BUILD_TAG)+"\",";   // v44: UI/desktop bisa verifikasi versi firmware aktif
-  j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision)+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
+  j.reserve(2048);
+  j+="\"build\":\""+String(BUILD_TAG)+"\",";
+  j+="\"sceneRev\":"+String(sceneRev.load())+",";   // v46: client reload /scenes saat berubah
+  j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
     if(!first) j+=","; first=false;
@@ -2147,7 +2866,11 @@ void onPresetSave(){
   bool idim=server.hasArg("idim")&&server.arg("idim")=="1";
   long f=server.arg("f").toInt(); if(f<0) f=0; if(f>2550) f=2550;
   long h=server.arg("h").toInt(); if(h<100) h=100; if(h>5000) h=5000;
-  capturePreset(n,idim,(uint16_t)f,(uint16_t)h);
+  if(!capturePreset(n,idim,(uint16_t)f,(uint16_t)h)){
+    // Slot bayangan penuh: scene lama masih memegang data ini, tolak rekaman
+    // agar scene tidak rusak. Operator boleh hapus scene tak terpakai dulu.
+    sendApiError(507,"shadow_full","Slot preset habis untuk melindungi scene; kosongkan scene/preset lain"); return;
+  }
   selectedPreset=n;
   sendApiOk();
 }
@@ -2158,6 +2881,14 @@ void onPresetFade(){
   long f=server.arg("f").toInt(); if(f<0) f=0; if(f>2550) f=2550;
   long h=server.arg("h").toInt(); if(h<100) h=100; if(h>5000) h=5000;
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
+  // COW: ubah fade/hold preset yang dirujuk scene (visible ATAU bayangan) ->
+  // scene harus tetap pegang timing lama. Salin chunk lama ke slot bayangan
+  // + alihkan referensi scene.
+  if(presetSceneRefCount(n)>0 && cowShadowPreset(n)==COW_FULL){
+    xSemaphoreGive(dmxMutex);
+    sendApiError(507,"shadow_full","Slot preset habis untuk melindungi scene; kosongkan scene/preset lain");
+    return;
+  }
   presets[n][513]=(uint8_t)(f/10);
   presets[n][514]=(uint8_t)(h/20);
   xSemaphoreGive(dmxMutex);
@@ -2299,7 +3030,9 @@ void handleSerialCmd(String cmd){
         if(fi>=0&&fi<N_FIX&&c>=0&&c<fix[fi].foot){
           xSemaphoreTake(dmxMutex,portMAX_DELAY);
           uint16_t ch=fix[fi].start+c;
-          manualWant[ch]=cv(v); manualTouched[ch]=millis();
+          // v48: snap binary utk channel custom mode-switch (relay)
+          manualWant[ch]=snapSwitchMode(fix[fi].type,(uint16_t)c,v);
+          manualTouched[ch]=millis();
           recomputeWant();
           out[ch]=want[ch];                    // snap: fader manual terasa langsung
           xSemaphoreGive(dmxMutex);
@@ -2349,14 +3082,15 @@ void handleSerialCmd(String cmd){
    // GRP <i> <v> -> fader grup
    if(op=="GRP"){
      int i=serArgInt(args,0); int v=serArgInt(args,1);
-     if(i>=0&&i<N_GROUPS&&v>=0&&v<=255){
-       xSemaphoreTake(dmxMutex,portMAX_DELAY);
-       uint8_t val=cv(v);
-       for(int f=0;f<N_FIX;f++){
-         if(fix[f].type!=grp[i].typeFilter || grp[i].offset>=fix[f].foot) continue;
-         uint16_t ch=fix[f].start+grp[i].offset;
-         manualWant[ch]=val; manualTouched[ch]=millis();
-       }
+      if(i>=0&&i<N_GROUPS&&v>=0&&v<=255){
+        xSemaphoreTake(dmxMutex,portMAX_DELAY);
+        for(int f=0;f<N_FIX;f++){
+          if(fix[f].type!=grp[i].typeFilter || grp[i].offset>=fix[f].foot) continue;
+          uint16_t ch=fix[f].start+grp[i].offset;
+          // v48: snap binary per-fixture utk channel custom mode-switch
+          manualWant[ch]=snapSwitchMode(fix[f].type,grp[i].offset,v);
+          manualTouched[ch]=millis();
+        }
        recomputeWant();
        for(int f=0;f<N_FIX;f++){              // snap agar grup terasa langsung
          if(fix[f].type!=grp[i].typeFilter || grp[i].offset>=fix[f].foot) continue;
@@ -2375,11 +3109,14 @@ void handleSerialCmd(String cmd){
      int n=serArgInt(args,0)-1; bool idim=serArgInt(args,1)==1;
      long f=serArgInt(args,2); if(f<0)f=0; if(f>2550)f=2550;
      long h=serArgInt(args,3); if(h<100)h=100; if(h>5000)h=5000;
-     if(n>=0&&n<N_PRESETS){
-       capturePreset(n,idim,(uint16_t)f,(uint16_t)h);
-       selectedPreset=n;
-       Serial.println("{\"ok\":true}");
-     } else Serial.println("{\"ok\":false,\"err\":\"REC <n>\"}");
+      if(n>=0&&n<N_PRESETS){
+        if(!capturePreset(n,idim,(uint16_t)f,(uint16_t)h)){
+          Serial.println("{\"ok\":false,\"err\":\"shadow_full\"}");
+        } else {
+          selectedPreset=n;
+          Serial.println("{\"ok\":true}");
+        }
+      } else Serial.println("{\"ok\":false,\"err\":\"REC <n>\"}");
      return;
    }
 
@@ -2388,13 +3125,20 @@ void handleSerialCmd(String cmd){
      int n=serArgInt(args,0)-1;
      long f=serArgInt(args,1); if(f<0)f=0; if(f>2550)f=2550;
      long h=serArgInt(args,2); if(h<100)h=100; if(h>5000)h=5000;
-     if(n>=0&&n<N_PRESETS&&presets[n][0]){
-       xSemaphoreTake(dmxMutex,portMAX_DELAY);
-       presets[n][513]=(uint8_t)constrain(f/10,0,255); presets[n][514]=(uint8_t)constrain(h/20,5,250);
-       xSemaphoreGive(dmxMutex);
-       persistAll(); stateRevision++;
-       Serial.println("{\"ok\":true}");
-     } else Serial.println("{\"ok\":false,\"err\":\"PFH <n> <f_ms> <h_ms>\"}");
+      if(n>=0&&n<N_PRESETS&&presets[n][0]){
+         xSemaphoreTake(dmxMutex,portMAX_DELAY);
+         // COW: proteksi timing lama milik scene (sama seperti /psetfade);
+         // berlaku juga untuk slot bayangan yang dirujuk scene.
+         if(presetSceneRefCount(n)>0 && cowShadowPreset(n)==COW_FULL){
+          xSemaphoreGive(dmxMutex);
+          Serial.println("{\"ok\":false,\"err\":\"shadow_full\"}");
+          return;
+        }
+        presets[n][513]=(uint8_t)constrain(f/10,0,255); presets[n][514]=(uint8_t)constrain(h/20,5,250);
+        xSemaphoreGive(dmxMutex);
+        persistAll(); stateRevision++;
+        Serial.println("{\"ok\":true}");
+      } else Serial.println("{\"ok\":false,\"err\":\"PFH <n> <f_ms> <h_ms>\"}");
      return;
    }
 
@@ -2427,9 +3171,9 @@ void handleSerialCmd(String cmd){
          Serial.println("{\"ok\":false,\"err\":\"scene_duplicate\"}");
          return;
        }
-       if(slot>=0) scenes[s][slot]=(uint8_t)p;
-       xSemaphoreGive(dmxMutex);
-       if(slot<0){ Serial.println("{\"ok\":false,\"err\":\"scene_full\"}"); return; }
+        if(slot>=0){ scenes[s][slot]=(uint8_t)p; sceneRev++; }
+        xSemaphoreGive(dmxMutex);
+        if(slot<0){ Serial.println("{\"ok\":false,\"err\":\"scene_full\"}"); return; }
        persistAll(); stateRevision++;
        Serial.println("{\"ok\":true}");
      } else Serial.println("{\"ok\":false,\"err\":\"SPUSH <s> <p>\"}");
@@ -2441,11 +3185,11 @@ void handleSerialCmd(String cmd){
      int s=serArgInt(args,0)-1;
      if(s>=0&&s<N_SCENES){
        xSemaphoreTake(dmxMutex,portMAX_DELAY);
-       for(int k=SCENE_STEPS-1;k>=0;k--){ if(scenes[s][k]!=0){ scenes[s][k]=0; break; } }
-       xSemaphoreGive(dmxMutex);
-       persistAll(); stateRevision++;
-       Serial.println("{\"ok\":true}");
-     } else Serial.println("{\"ok\":false,\"err\":\"SPOP <s>\"}");
+        for(int k=SCENE_STEPS-1;k>=0;k--){ if(scenes[s][k]!=0){ scenes[s][k]=0; sceneRev++; break; } }
+        xSemaphoreGive(dmxMutex);
+        persistAll(); stateRevision++;
+        Serial.println("{\"ok\":true}");
+      } else Serial.println("{\"ok\":false,\"err\":\"SPOP <s>\"}");
      return;
    }
 
@@ -2453,12 +3197,13 @@ void handleSerialCmd(String cmd){
    if(op=="SCLR"){
      int s=serArgInt(args,0)-1;
      if(s>=0&&s<N_SCENES){
-       xSemaphoreTake(dmxMutex,portMAX_DELAY);
-       memset(scenes[s],0,sizeof(scenes[s]));
-       xSemaphoreGive(dmxMutex);
-       persistAll(); stateRevision++;
-       Serial.println("{\"ok\":true}");
-     } else Serial.println("{\"ok\":false,\"err\":\"SCLR <s>\"}");
+        xSemaphoreTake(dmxMutex,portMAX_DELAY);
+        memset(scenes[s],0,sizeof(scenes[s]));
+        sceneRev++;
+        xSemaphoreGive(dmxMutex);
+        persistAll(); stateRevision++;
+        Serial.println("{\"ok\":true}");
+      } else Serial.println("{\"ok\":false,\"err\":\"SCLR <s>\"}");
      return;
    }
 
@@ -2523,6 +3268,22 @@ void handleSerialCmd(String cmd){
     if(op=="LISTF"){ Serial.println(fixJson()); return; }
     // LISTG -> daftar grup fader JSON
     if(op=="LISTG"){ Serial.println(grpJson()); return; }
+    if(op=="LISTCT"){ Serial.println(customTypesJson()); return; }   // v48
+
+    // v48: CTSET <json> -> commit custom type (paritas POST /ctypes)
+    // Format body sama: {"types":[{"slot":5,...}]} — JSON asli (case-sens).
+    if(op=="CTSET"){
+      String body=cmd;
+      int b0=body.indexOf(' ');
+      body=(b0<0)?String(""):body.substring(b0+1);
+      body.trim();
+      if(body.length()==0 || !commitCustomTypes(body)){
+        Serial.println("{\"ok\":false,\"err\":\"CTSET <json>\"}");
+      } else {
+        Serial.println("{\"ok\":true}");
+      }
+      return;
+    }
 
     // v45: FIXSET <json> -> terapkan konfigurasi fixture baru (paritas POST /fixes)
     // Format JSON sama dengan body POST /fixes: {"count":N,"fixtures":[...]}
@@ -2692,6 +3453,7 @@ void processSerialIn(){
 // ---------------------------------------------------------------
 void setup(){
   Serial.begin(115200); delay(300);
+  bootAtMs = millis();
   Serial.println(); Serial.println("=== DMX Web Console " BUILD_TAG " ===");
 
   dmxMutex = xSemaphoreCreateMutex();
@@ -2707,6 +3469,9 @@ void setup(){
   memset(want,0,sizeof(want)); memset(out,0,sizeof(out));
   masterWant=255; masterOut=255;
   // v45: muat konfigurasi fixture dari NVS; fallback ke default bila belum ada
+  if(!loadCustomTypes()){
+    memset(customSlots,0,sizeof(customSlots));   // v48: custom type kosong = normal
+  }
   if(!loadFixtures()){
     loadDefaultFixtures();
     Serial.println("Fixture: pakai patch default (18 fixture)");
@@ -2715,8 +3480,46 @@ void setup(){
   }
   loadAll();
 
-  // WiFi STA: pakai kredensial kustom bila sudah pernah diatur dari UI
-  // (tersimpan di NVS), otherwise bawaan; gagal -> fallback AP darurat.
+  // v47: URUTAN KONEKSI DIBALIK per permintaan operator:
+  //   1. Ethernet W5500 (prioritas utama — kabel, latensi rendah)
+  //   2. WiFi STA (cadangan)
+  //   3. AP darurat (hanya bila keduanya gagal)
+  // STAGED BOOT DELAY: jeda bertahap sebelum tiap tahap berat (SPI/radio)
+  // agar PSU marginal tidak kena lonjakan arus sekaligus (pelajaran brownout:
+  // boot + radio TX + NVS bersamaan = drop tegangan). Tiap tahap dipisah
+  // 1 dtk; total boot bertambah ~2 dtk — murah untuk stabilitas daya.
+
+  // ---- TAHAP 1: Ethernet W5500 ----
+  delay(1000);   // v47: rail 3V3 stabil dulu setelah loadAll() baca NVS
+  SPI.begin(18,19,23);                    // VSPI: SCLK=18, MISO=19, MOSI=23
+  // API core esp32 3.x untuk SPI PHY: begin(tipe, phy_addr, cs, irq, rst, SPI)
+  // ETH_PHY_ADDR_AUTO = deteksi alamat PHY W5500 otomatis. IRQ/RST = -1 sah
+  // di core ini (ETH_SPI_SUPPORTS_NO_IRQ), jadi tidak perlu kabel INT.
+  ETH.begin(ETH_PHY_W5500, ETH_PHY_ADDR_AUTO, ETH_CS, ETH_IRQ, ETH_RST, SPI);
+  Serial.println("Ethernet W5500: inisialisasi... (prioritas 1)");
+
+  // Tunggu Ethernet dapat link (maks 5 detik)
+  uint32_t ethStart=millis();
+  while(!ETH.linkUp() && millis()-ethStart<5000){ delay(100); }
+  bool ethHasIP=false;
+  if(ETH.linkUp()){
+    // link aktif; tunggu DHCP/IP sampai 3 detik lagi
+    uint32_t ipStart=millis();
+    while(ETH.localIP()==IPAddress(0,0,0,0) && millis()-ipStart<3000){ delay(100); }
+    if(ETH.localIP()!=IPAddress(0,0,0,0)){
+      ethHasIP=true;
+      Serial.print("Ethernet tersambung. IP: http://");
+      Serial.println(ETH.localIP());
+    } else {
+      Serial.println("Ethernet link aktif tapi belum dapat IP (DHCP).");
+    }
+  } else {
+    Serial.println("Ethernet: tidak terdeteksi link (kabel tidak dicolok?).");
+  }
+
+  // ---- TAHAP 2: WiFi STA ----
+  delay(1000);   // v47: jeda sebelum radio WiFi on — hindari spike arus TX
+                 // bertepatan dengan init SPI yang barusan selesai
   loadWifiCreds();
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);            // respons web lebih responsif
@@ -2729,46 +3532,19 @@ void setup(){
   }
   Serial.println();
 
-  // Ethernet W5500 (via SPI). Mulai non-blocking; cek link setelah WiFi.
-  // Kalau Ethernet dapat IP, dia jadi jalur utama (latensi lebih rendah daripada WiFi).
-  SPI.begin(18,19,23);                    // VSPI: SCLK=18, MISO=19, MOSI=23
-  // API core esp32 3.x untuk SPI PHY: begin(tipe, phy_addr, cs, irq, rst, SPI)
-  // ETH_PHY_ADDR_AUTO = deteksi alamat PHY W5500 otomatis. IRQ/RST = -1 sah
-  // di core ini (ETH_SPI_SUPPORTS_NO_IRQ), jadi tidak perlu kabel INT.
-  ETH.begin(ETH_PHY_W5500, ETH_PHY_ADDR_AUTO, ETH_CS, ETH_IRQ, ETH_RST, SPI);
-  Serial.println("Ethernet W5500: inisialisasi...");
-
-  // Tunggu Ethernet dapat IP (non-blocking sampai 5 detik tambahan)
-  uint32_t ethStart=millis();
-  while(!ETH.linkUp() && millis()-ethStart<5000){ delay(100); }
-  if(ETH.linkUp()){
-    // link aktif; tunggu DHCP/IP sampai 3 detik lagi
-    uint32_t ipStart=millis();
-    while(ETH.localIP()==IPAddress(0,0,0,0) && millis()-ipStart<3000){ delay(100); }
-    if(ETH.localIP()!=IPAddress(0,0,0,0)){
-      Serial.print("Ethernet tersambung. IP: http://");
-      Serial.println(ETH.localIP());
-    } else {
-      Serial.println("Ethernet link aktif tapi belum dapat IP (DHCP).");
-    }
-  } else {
-    Serial.println("Ethernet: tidak terdeteksi link (kabel tidak dicolok?).");
-  }
-
   if(WiFi.status()==WL_CONNECTED){
     Serial.print("WiFi tersambung. IP: http://");
     Serial.println(WiFi.localIP());
+  } else if(ethHasIP){
+    // Ethernet sudah jadi jalur utama; WiFi gagal bukan masalah.
+    Serial.println("WiFi gagal, tapi Ethernet aktif -- pakai Ethernet saja.");
   } else {
-    // Fallback AP darurat hanya kalau TIDAK ada Ethernet sama sekali
-    if(!ETH.linkUp()){
-      Serial.println("WiFi gagal & Ethernet tidak ada. Fallback ke AP darurat.");
-      WiFi.mode(WIFI_AP);
-      WiFi.softAP(AP_SSID, AP_PASS);
-      Serial.print("AP: "); Serial.print(AP_SSID);
-      Serial.print(" | Buka browser: http://"); Serial.println(WiFi.softAPIP());
-    } else {
-      Serial.println("WiFi gagal, tapi Ethernet aktif — pakai Ethernet saja.");
-    }
+    // ---- TAHAP 3: AP darurat (hanya bila Ethernet & WiFi keduanya gagal) ----
+    Serial.println("WiFi gagal & Ethernet tidak ada. Fallback ke AP darurat.");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    Serial.print("AP: "); Serial.print(AP_SSID);
+    Serial.print(" | Buka browser: http://"); Serial.println(WiFi.softAPIP());
   }
 
   server.on("/",      HTTP_GET, sendUi);
@@ -2778,6 +3554,8 @@ void setup(){
    server.on("/fixes", HTTP_GET, onFixesGet);    // v40: metadata fixture (paritas LISTF serial)
    server.on("/fixes", HTTP_POST, onFixesPost);  // v45: update konfigurasi fixture
    server.on("/groups",HTTP_GET, onGroupsGet);   // v40: metadata grup fader (paritas LISTG serial)
+  server.on("/ctypes", HTTP_GET,  onCtypesGet); // v48: daftar custom type
+  server.on("/ctypes", HTTP_POST, onCtypesPost);// v48: commit custom type
   server.on("/wifistat",HTTP_GET, onWifiStat);   // v43: status koneksi WiFi
   server.on("/wifiset", HTTP_POST, onWifiSet);   // v43: simpan kredensial + reconnect
   server.on("/wifiset", HTTP_GET, onWifiSet);    // kompatibilitas desktop v44
@@ -2817,12 +3595,18 @@ void setup(){
 }
 // Broadcast state via WebSocket: segera saat stateRevision berubah,
 // heartbeat 1 dtk saat diam (paritas dgn polling lama utk scn/stp playback).
+// v47: THROTTLE 100 ms — slider drag memicu puluhan revision++/dtk; tanpa
+// throttle itu = puluhan broadcast JSON ~2 KB/dtk ke semua client (heap
+// churn + bandwidth). 10 Hz lebih dari cukup utk fader terasa realtime.
 void wsBroadcastTick(){
   static uint32_t lastAt=0, lastRev=0;
   uint32_t now=millis();
-  if(stateRevision==lastRev && now-lastAt<1000) return;
+  uint32_t rev=stateRevision.load();          // v47: atomic -> snapshot sekali
+  bool changed = rev!=lastRev;
+  if(!changed && now-lastAt<1000) return;          // diam: heartbeat 1 dtk
+  if(changed && now-lastAt<100) return;            // perubahan cepat: max 10 Hz
   if(ws.count()==0){ lastAt=now; return; }   // tanpa klien -> hemat CPU; lastRev sengaja tidak diupdate
-  lastRev=stateRevision; lastAt=now;
+  lastRev=rev; lastAt=now;
   ws.textAll(buildStateJson());
 }
 void loop(){
@@ -2831,6 +3615,15 @@ void loop(){
   wsBroadcastTick();
   wifiReconnectTick();      // v43: reconnect WiFi kustom (non-blocking)
   processSerialIn();        // v33: kendali via serial (non-blocking, Core 1)
+  // v46: migrasi gen v45->v46 dijalankan SETELAH 10 dtk stabil (radio WiFi
+  // penuh daya, boot selesai) — bukan saat boot, untuk menghindari brownout.
+  if(pendingGenMigration && millis()-bootAtMs > 10000){
+    pendingGenMigration = false;
+    Serial.println("NVS: migrasi gen (commit marker)...");
+    if(persistAll()) Serial.println("NVS: migrasi selesai");
+    else Serial.println("NVS: migrasi GAGAL (persistAll) — coba lagi nanti");
+    if(!lastSaveOk) pendingGenMigration = true;   // retry siklus berikutnya
+  }
   // AUTO-SAVE NVS (sisi server, safety-net): 60 detik setelah simpan terakhir,
   // bila masih ada perubahan (nvsDirty) -> persistAll(). Menutup kasus browser
   // ditutup sebelum timer client 60 s sempat mengirim /save.
