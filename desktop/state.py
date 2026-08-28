@@ -8,11 +8,29 @@ def channel_labels(ftype, foot):
         base = ["Dim", "R", "G", "B"]
         extra = ["Strobe", "Mode", "Auto", "Speed", "Aux", "R2", "G2", "B2"]
         return base + extra[: max(0, foot - 4)]
+    if ftype == 1:  # MOVING HEAD (chart standar 18 label + sisa CHn)
+        labels = ["Pan", "PanF", "Tilt", "TiltF", "P/T Spd", "Dim", "Strobe",
+                  "ColorSpd", "Gobo", "GoboRot", "PrismRot", "Focus", "Zoom",
+                  "Shutter", "Func", "Reset", "CH19", "CH20"]
+        return _fit_labels(labels, foot)
+    if ftype == 2:  # BEAM
+        labels = ["Pan", "PanF", "Tilt", "TiltF", "P/T Spd", "Dim", "Strobe",
+                  "Color", "Gobo", "GoboRot", "Prism", "Focus", "Zoom",
+                  "Shutter", "Func", "Reset"]
+        return _fit_labels(labels, foot)
     if ftype == 4:  # FOG
         return ["Fog", "Fan"][:foot]
     if ftype == 3:  # STROBE
         return ["Mode", "Strobe", "Dim", "Color"][:foot]
     return [f"CH{i+1}" for i in range(foot)]
+
+
+def _fit_labels(labels, foot):
+    """Potong bila foot < jumlah label; sisa (foot > label) = CHn."""
+    out = labels[:foot]
+    for i in range(len(out), foot):
+        out.append(f"CH{i+1}")
+    return out
 
 
 class DeviceState:
@@ -24,6 +42,7 @@ class DeviceState:
         self.presets = []    # LISTP: [{n,used,r,g,b,f,h}]
         self.scenes = []     # LISTS: 20 x 50 int (0=kosong, 1..30=preset)
         self.live = {}       # GET  : state realtime
+        self.custom_types = []   # v48 LISTCT: [{slot,name,channels,mode[],labels[]}]
 
     # ---- akses nyaman ----------------------------------------------------
     def preset(self, idx0):

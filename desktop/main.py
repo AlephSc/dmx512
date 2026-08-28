@@ -198,8 +198,8 @@ class MainWindow(QMainWindow):
             self.transport.error_occurred.connect(self._on_serial_error)
             self._worker.start()
             self._thread.start()
-            # ambil metadata dari ESP32
-            for kind in ("LISTF", "LISTG", "LISTP", "LISTS"):
+            # ambil metadata dari ESP32 (v48: + LISTCT custom type)
+            for kind in ("LISTF", "LISTG", "LISTP", "LISTS", "LISTCT"):
                 self._worker.cmd_queue.put((kind, kind))
             self.btn_conn.setText("PUTUS")
             self.btn_conn.setObjectName("dangerBtn")
@@ -395,6 +395,10 @@ class MainWindow(QMainWindow):
             if isinstance(payload, list) and all(isinstance(x, dict) for x in payload):
                 self.state.groups = payload
                 self.tab_mixer.build_groups(payload)
+        elif kind == "LISTCT":   # v48: definisi custom fixture type
+            if isinstance(payload, list) and all(isinstance(x, dict) for x in payload):
+                self.state.custom_types = payload
+                self.tab_mixer.set_custom_types(payload)
         elif kind == "LISTP":
             if isinstance(payload, list):
                 self.state.presets = payload
@@ -408,9 +412,19 @@ class MainWindow(QMainWindow):
             if isinstance(payload, dict):
                 self.tab_system.set_wifi(payload)
 
+    # Pesan error firmware yang perlu penjelasan ramah operator (v46).
+    _ERR_HINTS = {
+        "shadow_full": "Slot preset habis: data lama dipertahankan untuk scene. "
+                       "Kosongkan scene/preset yang tak terpakai, lalu ulangi.",
+    }
+
     def _on_cmd_done(self, cmd, resp):
         if isinstance(resp, dict) and resp.get("ok") is False:
-            msg = f"GAGAL [{cmd}]: {resp.get('err', resp.get('message', '?'))}"
+            err = resp.get("err") or resp.get("code") or "?"
+            hint = self._ERR_HINTS.get(err)
+            msg = f"GAGAL [{cmd}]: {err}"
+            if hint:
+                msg += f" — {hint}"
             self._set_status(msg)
             self.tab_system.log(msg)
         elif isinstance(resp, dict) and resp.get("ok") is True:

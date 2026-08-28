@@ -16,9 +16,13 @@ class VFader(QWidget):
     pressed = Signal()
     released = Signal()
 
-    def __init__(self, label="", color="#f5a623", small=False):
+    def __init__(self, label="", color="#f5a623", small=False, switch_mode=False):
         super().__init__()
         self._key = None
+        # v48: switch_mode = fader binary (0/255). Slider tetap terlihat, tapi
+        # nilai di-snap — mencegah beban on-off (relay 12V) menerima tegangan
+        # antara. Firmware juga snap (dua lapis).
+        self.switch_mode = switch_mode
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
@@ -29,7 +33,7 @@ class VFader(QWidget):
         w = 28 if small else 32
         self.slider.setFixedHeight(h)
         self.slider.setFixedWidth(w)
-        self.slider.setStyleSheet(SLIDER_QSS.replace("%COLOR%", color))
+        self.slider.setStyleSheet(SLIDER_QSS.replace("%COLOR%", "#ffd54f" if switch_mode else color))
         self.slider.valueChanged.connect(self._on_change)
         self.slider.sliderPressed.connect(self.pressed)
         self.slider.sliderReleased.connect(self.released)
@@ -46,6 +50,13 @@ class VFader(QWidget):
         layout.addWidget(self.name_lbl)
 
     def _on_change(self, v):
+        # v48: snap binary utk switch mode — client-side, sebelum emit
+        if self.switch_mode:
+            v = 0 if v < 128 else 255
+            self.slider.blockSignals(True)
+            if self.slider.value() != v:
+                self.slider.setValue(v)
+            self.slider.blockSignals(False)
         self.val_lbl.setText(str(v))
         self.valueChanged.emit(v)
 
