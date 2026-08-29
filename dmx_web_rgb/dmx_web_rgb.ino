@@ -491,9 +491,16 @@ void hwPlayScene(int s){
   }
   xSemaphoreGive(dmxMutex);
   if(!playable){ sceneError=1; return; }
+  // v49.2 RACE FIX: sceneTick berjalan di Core 0 (dmxTask). Penulisan lama
+  // (sceneOn=true DULU baru sceneIdx) membuat Core 0 bisa membaca sceneOn
+  // aktif dengan sceneIdx LAMA -> memutar scene lain sesaat ("pindah scene
+  // acak"). Urutan benar: semua state baru ditulis DULU, sceneOn (switch
+  // aktif) PALING AKHIR.
+  Serial.printf("[scene] play hw #%d\n", s+1);
   chaseOn=false; chaseIdx=-1;
-  sceneOn=true; sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
+  sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
   selectedScene=s;
+  sceneOn=true;
   stateRevision++;
 }
 
@@ -562,6 +569,7 @@ void hwInputTask(){
   if(digitalRead(HW_ENC_SW) == LOW){
     if(ms - hwBtnLastAt[4] > 400){
       hwBtnLastAt[4] = ms;
+      Serial.println("[scene] stop hw (SW encoder)");
       sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0;
       chaseOn=false; chaseIdx=-1;
       stateRevision++;
@@ -1162,6 +1170,12 @@ void sceneTick(uint32_t now){
   }
   xSemaphoreGive(dmxMutex);
   if(chosen<0){ sceneOn=false; sceneError=1; return; }
+  // v49.2: log wrap — membedakan "scene kembali ke awal" karena SIKLUS
+  // normal (50 langkah habis, wrap ke langkah 1) vs restart oleh sumber lain.
+  if(sceneStep>=0 && chosen<=sceneStep){
+    Serial.printf("[scene] wrap #%d (siklus normal, langkah %d->%d)\n",
+                  sceneIdx+1, sceneStep+1, chosen+1);
+  }
   sceneStep=chosen;
   applyPresetToWant(pnum-1);               // mutex diambil di dalamnya
   sceneNextAt=now+sceneMs;
@@ -1602,9 +1616,12 @@ void onSPlay(){
     sendApiError(409,"scene_no_valid_presets","Scene tidak memiliki preset yang tersedia");
     return;
   }
+  // v49.2 race fix: state dulu, sceneOn terakhir (lihat hwPlayScene)
+  Serial.printf("[scene] play http #%d\n", s+1);
   chaseOn=false; chaseIdx=-1;              // hanya satu sistem auto aktif
-  sceneOn=true; sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
+  sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
   selectedScene=s;
+  sceneOn=true;
   sendApiOk();
 }
 
@@ -3376,8 +3393,11 @@ void handleSerialCmd(String cmd){
   if(op=="SPLAY"){                    // mulai scene
     int s=args.toInt()-1;
     if(s>=0&&s<N_SCENES){
-      sceneOn=true; sceneIdx=s; sceneStep=-1; sceneError=0;
+      // v49.2 race fix: state dulu, sceneOn terakhir (lihat hwPlayScene)
+      Serial.printf("[scene] play ser #%d\n", s+1);
+      sceneIdx=s; sceneStep=-1; sceneError=0;
       sceneNextAt=millis();
+      sceneOn=true;
       stateRevision++;
       Serial.println("{\"ok\":true}");
     } else Serial.println("{\"ok\":false,\"err\":\"scene invalid\"}");
