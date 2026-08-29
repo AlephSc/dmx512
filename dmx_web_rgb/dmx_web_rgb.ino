@@ -273,9 +273,48 @@ static uint8_t presets[N_PRESETS][PRESET_CHUNK];   // chunk: [0]=used, [1..512]=
 // pan/tilt bergerak jauh (LTP). Diisi saat apply preset.
 // v45: ukuran MAX_FIX agar aman saat N_FIX berubah runtime.
 static volatile uint32_t blackoutEnd[MAX_FIX] = {0};
+// ---------------------------------------------------------------
+// SCENE: rangkaian hingga 50 langkah preset (referensi nomor, bukan salinan)
+// 0 = langkah kosong; 1..N_PRESETS = nomor preset. Disimpan terpisah di NVS.
+// ---------------------------------------------------------------
+#define N_SCENES 20
+#define SCENE_STEPS 50
+static uint8_t scenes[N_SCENES][SCENE_STEPS];
+static volatile bool sceneOn = false;
+static volatile int sceneIdx = -1;     // scene yang sedang diputar
+static volatile int sceneStep = -1;    // posisi langkah terakhir
+static volatile uint32_t sceneMs = 1500;
+
+// State UI yang authoritative di ESP32, bukan hanya di browser.
+// v47: stateRevision & sceneRev kini std::atomic — dua-satunya counter yang
+// di-increment dari Core 0 (dmxTask: applyPresetToWant) DAN dibaca Core 1
+// (web/ws/serial). `volatile` tidak menjamin atomicity ++ di Xtensa.
+static volatile int selectedPreset = -1;
+static volatile int selectedScene = -1;
+static std::atomic<uint32_t> stateRevision{1};
+static volatile bool nvsDirty = false;
+static volatile bool lastSaveOk = true;
+static volatile uint32_t lastSaveAt = 0;
+static volatile uint32_t dmxHeartbeat = 0;
+
+// v46: sceneRev ikut naik saat isi scenes[] berubah (termasuk alih referensi
+// COW dari client lain) -> client tahu kapan harus reload /scenes.
+static std::atomic<uint32_t> sceneRev{1};
+// Deadline playback di-reset ketika PLAY/CHASE dimulai. Ini mencegah timer
+// static lama membuat langkah pertama kadang terlambat atau tidak konsisten.
+static volatile uint32_t chaseNextAt = 0;
+static volatile uint32_t sceneNextAt = 0;
 
 // ---------------------------------------------------------------
-// v49: ART-NET INPUT (node) — sumber kontrol dari QLC+/xLights/Resolume.
+
+static volatile uint8_t sceneError = 0;
+
+// Sinkronisasi antar-core (Core0 DMX <-> Core1 WiFi).
+SemaphoreHandle_t dmxMutex = NULL;
+
+
+// v49: ART-NET INPUT (node)
+ — sumber kontrol dari QLC+/xLights/Resolume.
 // Layer ketiga "netWant" di mixer LTP-timestamp (paritas manual/pbWant).
 // Standar yang diikuti (Art-Net 4, spec 1.4):
 //   - Header "Art-Net\0" + OpCode 0x5000 OpDmx (LSB-first)
@@ -388,41 +427,118 @@ void artnetTask(){
 
 // ---------------------------------------------------------------
 
+// v49: INPUT FISIK — rotary encoder + 4 tombol scene (hardware button deck)
+// Wiring (semua INPUT_PULLUP, aktif LOW, tombol/encoder ke GND):
+//   Encoder EC11: CLK GPIO25, DT GPIO26, (SW GPIO13 opsional = STOP)
+//   Tombol scene: B1 GPIO32, B2 GPIO33, B3 GPIO27, B4 GPIO14
+// Pin dipilih yang aman (bukan boot-strapping 0/2/12/15, bukan flash 6-11,
+// bukan DMX 16/17/4, bukan SPI 18/19/23/5) dan SEMUA mendukung pull-up
+// internal -> nol resistor eksternal.
+// Perilaku (paritas /splay + SPUSH):
+//   B1-B4   = play scene (bank aktif + 0..3), debounce 30 ms
+//   Encoder = geser "bank scene" kelipatan 4 (0,4,8,16) — B1 = scene bank+1
+//   SW      = stop playback (scene & chase off)
+// Nilai terekspos di state JSON (hwB1..B4, hwBank, hwEnc) -> website bisa
+// menampilkan deck fisik; tombol web vs fisik = sumber state yang sama.
+// Polling (bukan ISR): debounce sederhana, tak menyentuh mutex dari
+// interrupt context. Encoder quadrature via tabel 16-state standar.
 // ---------------------------------------------------------------
-// SCENE: rangkaian hingga 50 langkah preset (referensi nomor, bukan salinan)
-// 0 = langkah kosong; 1..N_PRESETS = nomor preset. Disimpan terpisah di NVS.
+#define HW_ENC_CLK 25
+#define HW_ENC_DT  26
+#define HW_ENC_SW  13
+#define HW_BTN1    32
+#define HW_BTN2    33
+#define HW_BTN3    27
+#define HW_BTN4    14
+static uint8_t  hwBank = 0;             // bank scene aktif (kelipatan 4)
+static int8_t   hwEncDelta = 0;         // akumulasi state encoder
+static uint8_t  hwEncLast = 0;          // state quadrature terakhir
+static uint32_t hwBtnLastAt[6] = {0};   // debounce per tombol (+SW)
+static volatile uint8_t hwBtnState[4] = {0};   // 1=ditekan (state JSON)
+static volatile int16_t hwEncCount = 0;        // total detent (state JSON)
+
+// tabel transisi quadrature: index = (last<<2)|now -> delta
+static const int8_t HW_ENC_TAB[16] = {
+  0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0
+};
+
+void hwBankAdjust(int dir){
+  // bank scene 0..N_SCENES-4 step 4; wrap-around (fraksional bila <4 scene)
+  int nb = (int)hwBank + dir*4;
+  int maxBank = ((int)N_SCENES/4 - 1)*4;
+  if(maxBank < 0) maxBank = 0;
+  if(nb < 0) nb = maxBank;
+  if(nb > maxBank) nb = 0;
+  hwBank = (uint8_t)nb;
+  stateRevision++;
+}
+
+// Play scene fisik: paritas logika onSPlay (tanpa HTTP — langsung state).
+void hwPlayScene(int s){
+  if(s<0||s>=N_SCENES) return;
+  bool playable=false;
+  xSemaphoreTake(dmxMutex,portMAX_DELAY);
+  for(int k=0;k<SCENE_STEPS;k++){
+    uint8_t p=scenes[s][k];
+    if(p>=1 && p<=N_PRESETS){ playable=true; break; }
+  }
+  xSemaphoreGive(dmxMutex);
+  if(!playable){ sceneError=1; return; }
+  chaseOn=false; chaseIdx=-1;
+  sceneOn=true; sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
+  selectedScene=s;
+  stateRevision++;
+}
+
+void hwInputBegin(){
+  pinMode(HW_ENC_CLK, INPUT_PULLUP);
+  pinMode(HW_ENC_DT,  INPUT_PULLUP);
+  pinMode(HW_ENC_SW,  INPUT_PULLUP);
+  pinMode(HW_BTN1, INPUT_PULLUP);
+  pinMode(HW_BTN2, INPUT_PULLUP);
+  pinMode(HW_BTN3, INPUT_PULLUP);
+  pinMode(HW_BTN4, INPUT_PULLUP);
+  hwEncLast = (uint8_t)((digitalRead(HW_ENC_CLK)<<1) | digitalRead(HW_ENC_DT));
+}
+
+void hwInputTask(){
+  // --- encoder quadrature (EC11: 4 state per detent, /4 = 1 detent)
+  uint8_t now = (uint8_t)((digitalRead(HW_ENC_CLK)<<1) | digitalRead(HW_ENC_DT));
+  if(now != hwEncLast){
+    int8_t d = HW_ENC_TAB[(hwEncLast<<2)|now];
+    hwEncDelta += d;
+    hwEncLast = now;
+    if(hwEncDelta >= 4){ hwEncDelta -= 4; hwEncCount++; hwBankAdjust(1); }
+    else if(hwEncDelta <= -4){ hwEncDelta += 4; hwEncCount--; hwBankAdjust(-1); }
+  }
+  // --- 4 tombol scene (debounce 30 ms, trigger saat baru ditekan)
+  const uint8_t pins[4] = {HW_BTN1, HW_BTN2, HW_BTN3, HW_BTN4};
+  uint32_t ms = millis();
+  for(int i=0;i<4;i++){
+    bool pressed = (digitalRead(pins[i]) == LOW);
+    if(pressed){
+      if(!hwBtnState[i] && ms - hwBtnLastAt[i] > 30){
+        hwBtnState[i] = 1;
+        hwPlayScene(hwBank + i);
+      }
+      hwBtnLastAt[i] = ms;               // refresh window selama ditahan
+    } else {
+      hwBtnState[i] = 0;
+    }
+  }
+  // --- encoder switch = STOP playback (hold-guard 400 ms)
+  if(digitalRead(HW_ENC_SW) == LOW){
+    if(ms - hwBtnLastAt[4] > 400){
+      hwBtnLastAt[4] = ms;
+      sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0;
+      chaseOn=false; chaseIdx=-1;
+      stateRevision++;
+    }
+  }
+}
+
 // ---------------------------------------------------------------
-#define N_SCENES 20
-#define SCENE_STEPS 50
-static uint8_t scenes[N_SCENES][SCENE_STEPS];
-static volatile bool sceneOn = false;
-static volatile int sceneIdx = -1;     // scene yang sedang diputar
-static volatile int sceneStep = -1;    // posisi langkah terakhir
-static volatile uint32_t sceneMs = 1500;
 
-// State UI yang authoritative di ESP32, bukan hanya di browser.
-// v47: stateRevision & sceneRev kini std::atomic — dua-satunya counter yang
-// di-increment dari Core 0 (dmxTask: applyPresetToWant) DAN dibaca Core 1
-// (web/ws/serial). `volatile` tidak menjamin atomicity ++ di Xtensa.
-static volatile int selectedPreset = -1;
-static volatile int selectedScene = -1;
-static std::atomic<uint32_t> stateRevision{1};
-static volatile bool nvsDirty = false;
-static volatile bool lastSaveOk = true;
-static volatile uint32_t lastSaveAt = 0;
-static volatile uint32_t dmxHeartbeat = 0;
-
-// v46: sceneRev ikut naik saat isi scenes[] berubah (termasuk alih referensi
-// COW dari client lain) -> client tahu kapan harus reload /scenes.
-static std::atomic<uint32_t> sceneRev{1};
-// Deadline playback di-reset ketika PLAY/CHASE dimulai. Ini mencegah timer
-// static lama membuat langkah pertama kadang terlambat atau tidak konsisten.
-static volatile uint32_t chaseNextAt = 0;
-static volatile uint32_t sceneNextAt = 0;
-static volatile uint8_t sceneError = 0;
-
-// Sinkronisasi antar-core (Core0 DMX <-> Core1 WiFi).
-SemaphoreHandle_t dmxMutex = NULL;
 
 WebServer server(80);
 
@@ -1821,6 +1937,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button class="btn-go" id="btnSPlay" title="Cek scene terpilih">&#9654; Cek</button>
     </div></div>
     <p class="state-line" id="sinfo">pilih scene (S1-S20), lalu EDIT utk merangkai preset</p>
+    <p class="state-line" id="hwDeck" style="color:#b0bec5">DECK FISIK: pasang 4 tombol (GPIO 32/33/27/14) + encoder (25/26, SW 13) — status muncul di sini</p>
     <div class="bank" id="sbank"></div>
     <div class="steps" id="steps"></div>
     <p class="sub">durasi tiap langkah = Hold preset masing-masing</p>
@@ -2464,6 +2581,14 @@ function syncFromServer(j, skipActive){
   });
   if(j.chaseOn!==undefined && j.chaseOn!==chaseOn){ chaseOn=j.chaseOn; applyChaseBtn(); }
   if(j.artnet!==undefined){ const an=(j.artnet==='network'); if(an!==artnetMode){ artnetMode=an; applyArtnetBtn(); } }   // v49
+  // v49: deck fisik — indikator bank + tombol di panel scene
+  if(j.hwBank!==undefined){
+    const el=$('hwDeck'); if(el){
+      el.textContent='DECK FISIK \u00b7 Bank '+(j.hwBank+1)+'-'+(Math.min(j.hwBank+4,NSCN))+
+        ' \u00b7 encoder '+(j.hwEnc||0)+' detent \u00b7 '+
+        ((j.hwB||[]).map(b=>b?'#':'-').join(''));
+    }
+  }
   if(j.sceneOn!==undefined && j.sceneOn!==sceneOn){ sceneOn=j.sceneOn; applySceneBtn(); if(!sceneOn) renderSteps(); }
   syncSelectedState(j);
   if(j.selectedScene!==undefined && j.selectedScene>=0 && j.selectedScene<NSCN){
@@ -2974,6 +3099,10 @@ String buildStateJson(){
   j+="\"build\":\""+String(BUILD_TAG)+"\",";
   j+="\"sceneRev\":"+String(sceneRev.load())+",";   // v46: client reload /scenes saat berubah
   j+="\"artnet\":\""+String(artnetMode?"network":"local")+"\",";   // v49: indikator mode
+  // v49: deck fisik — nilai button/encoder terekspos utk website
+  j+="\"hwBank\":"+String(hwBank)+",\"hwEnc\":"+String(hwEncCount)+",\"hwB\":["
+    +String(hwBtnState[0])+","+String(hwBtnState[1])+","
+    +String(hwBtnState[2])+","+String(hwBtnState[3])+"],";
   j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
@@ -3639,6 +3768,7 @@ void setup(){
   DMX.configure();
   DMX.setBreakLength(100);
 
+  hwInputBegin();          // v49: tombol scene fisik + rotary encoder
   memset(want,0,sizeof(want)); memset(out,0,sizeof(out));
   masterWant=255; masterOut=255;
   // v45: muat konfigurasi fixture dari NVS; fallback ke default bila belum ada
@@ -3789,6 +3919,7 @@ void loop(){
   wsBroadcastTick();
   wifiReconnectTick();      // v43: reconnect WiFi kustom (non-blocking)
   artnetTask();             // v49: Art-Net input (mode NETWORK saja)
+  hwInputTask();            // v49: tombol fisik + encoder (polling 2ms efek)
   processSerialIn();        // v33: kendali via serial (non-blocking, Core 1)
   // v46: migrasi gen v45->v46 dijalankan SETELAH 10 dtk stabil (radio WiFi
   // penuh daya, boot selesai) — bukan saat boot, untuk menghindari brownout.
