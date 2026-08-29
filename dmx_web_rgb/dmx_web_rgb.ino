@@ -460,7 +460,7 @@ void artnetTask(){
 static uint8_t  hwBank = 0;             // bank scene aktif (kelipatan 4)
 static int8_t   hwEncDelta = 0;         // akumulasi state encoder
 static uint8_t  hwEncLast = 0;          // state quadrature terakhir
-static uint32_t hwBtnLastAt[6] = {0};   // debounce per tombol (+SW)
+static uint32_t hwBtnLastAt[6] = {0};   // debounce SW encoder (index 4)
 static volatile uint8_t hwBtnState[4] = {0};   // 1=ditekan (state JSON)
 static volatile int16_t hwEncCount = 0;        // total detent (state JSON)
 
@@ -518,43 +518,44 @@ void hwInputTask(){
     if(hwEncDelta >= 4){ hwEncDelta -= 4; hwEncCount++; hwBankAdjust(1); }
     else if(hwEncDelta <= -4){ hwEncDelta += 4; hwEncCount--; hwBankAdjust(-1); }
   }
-  // --- 4 tombol scene (debounce 30 ms, trigger saat baru ditekan)
-  // v49.1 PERUBAHAN: pemindahan GRUP tanpa encoder — HOLD tombol:
-  //   hold B4 >= 600 ms = grup BERIKUTNYA (1-4 -> 5-8 -> 9-12 -> ... wrap)
-  //   hold B1 >= 600 ms = grup SEBELUMNYA
-  //   tap pendek B1..B4 = play scene bank+i (B4 tetap play scene ke-4 grup)
-  // Tekan-dan-tahan dibedakan dari tap lewat timer: scene baru di-play saat
-  // tombol DILEPAS < 600 ms; hold melewati 600 ms memicu pindah grup SEKALI
-  // (flag hwHoldDone mencegah repeat selama ditahan terus).
+  // --- 4 tombol scene — DEBOUNCE DUA-ARAH (v49.2 fix "scene restart sendiri")
+  // Akar bug: v49.1 memindah play ke trigger-on-RELEASE tanpa debounce di
+  // sisi release. Kontak switch memantul saat DILEPAS (LOW-HIGH-LOW-HIGH
+  // beberapa ms) -> tiap pantulan = tekan+lepas baru -> scene di-play
+  // ulang ("kembali ke awal seperti ditekan lagi") / pindah acak bila
+  // bounce di tombol lain. Fix: state stabil-baru diterima hanya bila
+  // pembacaan pin KONSISTEN 30 ms (lastChangeAt), arah manapun.
   const uint8_t pins[4] = {HW_BTN1, HW_BTN2, HW_BTN3, HW_BTN4};
   uint32_t ms = millis();
-  static uint32_t hwPressAt[4] = {0};     // mulai tekan per tombol
+  static uint32_t hwPressAt[4] = {0};     // mulai tekan (stabil) per tombol
+  static uint32_t hwLastChange[4] = {0};  // pembacaan pin terakhir BERUBAH
+  static uint8_t  hwRawPrev[4] = {1,1,1,1}; // pembacaan mentah sebelumnya
   static bool     hwHoldDone[4] = {false};
   for(int i=0;i<4;i++){
-    bool pressed = (digitalRead(pins[i]) == LOW);
-    if(pressed){
-      if(!hwBtnState[i]){                 // edge: baru ditekan
-        if(ms - hwBtnLastAt[i] > 30){
-          hwBtnState[i] = 1;
-          hwPressAt[i] = ms;
-          hwHoldDone[i] = false;
-        }
-      } else {
-        // sedang ditahan — cek hold utk tombol ujung (B1=mundur, B4=maju)
-        if(!hwHoldDone[i] && ms - hwPressAt[i] >= 600){
-          hwHoldDone[i] = true;
-          if(i==3)      hwBankAdjust(1);  // B4 hold = grup berikutnya
-          else if(i==0) hwBankAdjust(-1); // B1 hold = grup sebelumnya
-        }
-      }
-      hwBtnLastAt[i] = ms;                // refresh window debounce
-    } else {
-      if(hwBtnState[i]){                  // edge: baru dilepas
+    uint8_t raw = (digitalRead(pins[i]) == LOW) ? 1 : 0;
+    if(raw != hwRawPrev[i]){
+      hwRawPrev[i] = raw;
+      hwLastChange[i] = ms;               // pin berubah -> mulai ulang window
+    }
+    bool stable = (ms - hwLastChange[i]) >= 30;   // stabil 30 ms berturut-turut
+    if(stable){
+      bool nowPressed = (hwRawPrev[i] == 1);
+      if(nowPressed && !hwBtnState[i]){   // edge tekan (stabil)
+        hwBtnState[i] = 1;
+        hwPressAt[i] = ms;
+        hwHoldDone[i] = false;
+      } else if(!nowPressed && hwBtnState[i]){   // edge lepas (stabil)
+        hwBtnState[i] = 0;
         if(!hwHoldDone[i]){
           hwPlayScene(hwBank + i);        // tap pendek -> play scene
         }
       }
-      hwBtnState[i] = 0;
+      // sedang ditahan stabil — cek hold utk tombol ujung
+      if(hwBtnState[i] && !hwHoldDone[i] && ms - hwPressAt[i] >= 600){
+        hwHoldDone[i] = true;
+        if(i==3)      hwBankAdjust(1);    // B4 hold = grup berikutnya
+        else if(i==0) hwBankAdjust(-1);   // B1 hold = grup sebelumnya
+      }
     }
   }
   // --- encoder switch = STOP playback (hold-guard 400 ms)
