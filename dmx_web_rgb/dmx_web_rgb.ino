@@ -463,6 +463,19 @@ static uint8_t  hwEncLast = 0;          // state quadrature terakhir
 static uint32_t hwBtnLastAt[6] = {0};   // debounce SW encoder (index 4)
 static volatile uint8_t hwBtnState[4] = {0};   // 1=ditekan (state JSON)
 static volatile int16_t hwEncCount = 0;        // total detent (state JSON)
+// v49.3 NOISE GUARD (kasus user: hwInputTask memicu play palsu dari EMI
+// kabel tombol — pull-up internal ~45k lemah; dimmer/lampu menginduksi LOW
+// >30ms sehingga lolos debounce). Dua lapis:
+//   1) RATE LIMIT: hwPlayScene dari tombol maks 1x per 300 ms.
+//   2) NOISE LOCKOUT: >3 trigger dalam 10 dtk dari pin sama = pin di-lock
+//      30 dtk + log Serial — operator melihat pin mana yang bermasalah.
+//   3) KILL SWITCH: serial "HWOFF"/"HWON" + tombol WebUI (hwEnable=false
+//      = deck fisik nonaktif total; rig aman sebelum perbaikan wiring).
+static volatile bool hwEnabled = true;
+static uint32_t hwLastPlayAt = 0;
+static uint32_t hwTrigAt[4] = {0};      // timestamp trigger terakhir per pin
+static uint8_t  hwTrigCnt[4] = {0};     // jumlah trigger dalam window 10 dtk
+static uint32_t hwLockUntil[4] = {0};   // pin ter-lock noise sampai ms ini
 
 // tabel transisi quadrature: index = (last<<2)|now -> delta
 static const int8_t HW_ENC_TAB[16] = {
@@ -481,7 +494,9 @@ void hwBankAdjust(int dir){
 }
 
 // Play scene fisik: paritas logika onSPlay (tanpa HTTP — langsung state).
-void hwPlayScene(int s){
+// v49.3: dipanggil hwInputTask dgn index pin utk noise guard (rate limit +
+// lockout per pin). pinIdx<0 = jalur tanpa pin (tanpa guard).
+void hwPlayScene(int s, int pinIdx){
   if(s<0||s>=N_SCENES) return;
   bool playable=false;
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
@@ -504,6 +519,26 @@ void hwPlayScene(int s){
   stateRevision++;
 }
 
+// v49.3: gate noise utk trigger tombol. Return false = trigger diabaikan.
+// Rate limit 300 ms antar play + lockout pin setelah >3 trigger/10 dtk.
+bool hwNoiseGate(int pinIdx, uint32_t ms){
+  if(pinIdx<0 || pinIdx>=4) return true;          // jalur non-pin: lewati
+  if(ms < hwLockUntil[pinIdx]) return false;       // pin sedang di-lock
+  if(ms - hwLastPlayAt < 300) return false;        // rate limit global
+  // window 10 dtk per pin
+  if(ms - hwTrigAt[pinIdx] > 10000){ hwTrigAt[pinIdx]=ms; hwTrigCnt[pinIdx]=0; }
+  hwTrigCnt[pinIdx]++;
+  if(hwTrigCnt[pinIdx] > 3){
+    hwLockUntil[pinIdx] = ms + 30000;
+    Serial.printf("[hw] NOISE LOCK pin B%d — 30 dtk. Periksa kabel/pull-up pin GPIO%d.\n",
+                  pinIdx+1, pinIdx==0?HW_BTN1:pinIdx==1?HW_BTN2:pinIdx==2?HW_BTN3:HW_BTN4);
+    hwTrigCnt[pinIdx]=0;
+    return false;
+  }
+  hwLastPlayAt = ms;
+  return true;
+}
+
 void hwInputBegin(){
   pinMode(HW_ENC_CLK, INPUT_PULLUP);
   pinMode(HW_ENC_DT,  INPUT_PULLUP);
@@ -516,6 +551,7 @@ void hwInputBegin(){
 }
 
 void hwInputTask(){
+  if(!hwEnabled) return;                  // v49.3: kill switch (HWOFF/tombol UI)
   // --- encoder quadrature (EC11: 4 state per detent, /4 = 1 detent)
   uint8_t now = (uint8_t)((digitalRead(HW_ENC_CLK)<<1) | digitalRead(HW_ENC_DT));
   if(now != hwEncLast){
@@ -553,8 +589,8 @@ void hwInputTask(){
         hwHoldDone[i] = false;
       } else if(!nowPressed && hwBtnState[i]){   // edge lepas (stabil)
         hwBtnState[i] = 0;
-        if(!hwHoldDone[i]){
-          hwPlayScene(hwBank + i);        // tap pendek -> play scene
+        if(!hwHoldDone[i] && hwNoiseGate(i, ms)){
+          hwPlayScene(hwBank + i, i);    // tap pendek -> play scene (guarded)
         }
       }
       // sedang ditahan stabil — cek hold utk tombol ujung
@@ -3146,6 +3182,7 @@ String buildStateJson(){
   j+="\"build\":\""+String(BUILD_TAG)+"\",";
   j+="\"sceneRev\":"+String(sceneRev.load())+",";   // v46: client reload /scenes saat berubah
   j+="\"artnet\":\""+String(artnetMode?"network":"local")+"\",";   // v49: indikator mode
+  j+="\"hw\":"+(hwEnabled?"true":"false")+",";   // v49.3: deck fisik aktif?
   // v49: deck fisik — nilai button/encoder terekspos utk website
   j+="\"hwBank\":"+String(hwBank)+",\"hwEnc\":"+String(hwEncCount)+",\"hwB\":["
     +String(hwBtnState[0])+","+String(hwBtnState[1])+","
@@ -3581,6 +3618,18 @@ void handleSerialCmd(String cmd){
      Serial.println("{\"ok\":true}");
      return;
    }
+
+    // v49.3: HWOFF/HWON -> kill switch deck fisik (saat wiring/EMI bermasalah)
+    if(op=="HWOFF" || op=="HWON"){
+      hwEnabled = (op=="HWON");
+      if(!hwEnabled){
+        sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0;
+        chaseOn=false; chaseIdx=-1;
+      }
+      stateRevision++;
+      Serial.println(String("{\"ok\":true,\"hw\":")+(hwEnabled?"true":"false")+"}");
+      return;
+    }
 
     // v49: ARTNET local|network -> mode input Art-Net
     if(op=="ARTNET"){
