@@ -313,8 +313,7 @@ static volatile uint8_t sceneError = 0;
 SemaphoreHandle_t dmxMutex = NULL;
 
 
-// v49: ART-NET INPUT (node)
- — sumber kontrol dari QLC+/xLights/Resolume.
+// v49: ART-NET INPUT (node) — sumber kontrol dari QLC+/xLights/Resolume.
 // Layer ketiga "netWant" di mixer LTP-timestamp (paritas manual/pbWant).
 // Standar yang diikuti (Art-Net 4, spec 1.4):
 //   - Header "Art-Net\0" + OpCode 0x5000 OpDmx (LSB-first)
