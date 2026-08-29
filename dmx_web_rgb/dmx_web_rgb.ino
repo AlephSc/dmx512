@@ -227,6 +227,11 @@ static uint8_t out[513];          // nilai tampilan (hasil fade)
 // =============================================================
 static uint8_t manualWant[513];
 static uint8_t pbWant[513];
+// v49: layer network (Art-Net). Deklarasi DI ATAS recomputeWant() —
+// variabel statis tidak di-auto-prototype oleh builder .ino; definisi
+// lengkap blok Art-Net ada setelah deklarasi dmxMutex.
+static uint8_t  netWant[513];
+static volatile uint32_t netTouched[513];
 static volatile uint32_t manualTouched[513];   // millis tulis manual terakhir
 static volatile uint32_t pbTouched[513];       // millis tulis playback terakhir
 
@@ -328,8 +333,8 @@ SemaphoreHandle_t dmxMutex = NULL;
 #include <WiFiUdp.h>
 static WiFiUDP artnetUdp;
 static bool     artnetMode = false;         // false=LOCAL, true=NETWORK
-static uint8_t  netWant[513];
-static volatile uint32_t netTouched[513];
+// netWant/netTouched dideklarasikan di atas (dekat manualWant/pbWant) —
+// recomputeWant() memakainya sebelum blok ini.
 static volatile uint32_t artnetLastAt = 0;   // ms paket terakhir (indikator)
 static volatile uint32_t artnetPktCount = 0; // total paket diterima
 static uint8_t  artnetLastSeq = 0;           // sequence tracking
