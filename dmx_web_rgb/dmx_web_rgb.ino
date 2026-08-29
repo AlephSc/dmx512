@@ -428,20 +428,23 @@ void artnetTask(){
 // ---------------------------------------------------------------
 
 // v49: INPUT FISIK — rotary encoder + 4 tombol scene (hardware button deck)
-// Wiring (semua INPUT_PULLUP, aktif LOW, tombol/encoder ke GND):
+// Wiring (semua INPUT_PULLUP internal — NOL komponen eksternal, aktif LOW,
+// tombol/encoder ke GND; verifikasi: pinMode INPUT_PULLUP di hwInputBegin):
 //   Encoder EC11: CLK GPIO25, DT GPIO26, (SW GPIO13 opsional = STOP)
 //   Tombol scene: B1 GPIO32, B2 GPIO33, B3 GPIO27, B4 GPIO14
 // Pin dipilih yang aman (bukan boot-strapping 0/2/12/15, bukan flash 6-11,
 // bukan DMX 16/17/4, bukan SPI 18/19/23/5) dan SEMUA mendukung pull-up
-// internal -> nol resistor eksternal.
-// Perilaku (paritas /splay + SPUSH):
-//   B1-B4   = play scene (bank aktif + 0..3), debounce 30 ms
-//   Encoder = geser "bank scene" kelipatan 4 (0,4,8,16) — B1 = scene bank+1
-//   SW      = stop playback (scene & chase off)
-// Nilai terekspos di state JSON (hwB1..B4, hwBank, hwEnc) -> website bisa
-// menampilkan deck fisik; tombol web vs fisik = sumber state yang sama.
-// Polling (bukan ISR): debounce sederhana, tak menyentuh mutex dari
-// interrupt context. Encoder quadrature via tabel 16-state standar.
+// internal.
+// PERILAKU v49.1 (permintaan user: pindah grup TANPA encoder):
+//   tap B1..B4      = play scene grup aktif (1-4 / 5-8 / 9-12 / 13-16 / 17-20)
+//   HOLD B4 >=600ms = pindah ke grup BERIKUTNYA (wrap ke grup 1 setelah habis)
+//   HOLD B1 >=600ms = pindah ke grup SEBELUMNYA
+//   Encoder putar   = pindah grup juga (opsional, tetap didukung)
+//   Encoder SW      = stop playback
+// Yang di-PLAY adalah SCENE (bukan preset) — paritas /splay: validasi
+// playable, matikan chase, set selectedScene (terlihat di kedua client web).
+// Nilai terekspos di state JSON (hwB[4], hwBank, hwEnc) -> website
+// menampilkan deck fisik. Polling di loop (bukan ISR) — anti race mutex.
 // ---------------------------------------------------------------
 #define HW_ENC_CLK 25
 #define HW_ENC_DT  26
@@ -512,17 +515,41 @@ void hwInputTask(){
     else if(hwEncDelta <= -4){ hwEncDelta += 4; hwEncCount--; hwBankAdjust(-1); }
   }
   // --- 4 tombol scene (debounce 30 ms, trigger saat baru ditekan)
+  // v49.1 PERUBAHAN: pemindahan GRUP tanpa encoder — HOLD tombol:
+  //   hold B4 >= 600 ms = grup BERIKUTNYA (1-4 -> 5-8 -> 9-12 -> ... wrap)
+  //   hold B1 >= 600 ms = grup SEBELUMNYA
+  //   tap pendek B1..B4 = play scene bank+i (B4 tetap play scene ke-4 grup)
+  // Tekan-dan-tahan dibedakan dari tap lewat timer: scene baru di-play saat
+  // tombol DILEPAS < 600 ms; hold melewati 600 ms memicu pindah grup SEKALI
+  // (flag hwHoldDone mencegah repeat selama ditahan terus).
   const uint8_t pins[4] = {HW_BTN1, HW_BTN2, HW_BTN3, HW_BTN4};
   uint32_t ms = millis();
+  static uint32_t hwPressAt[4] = {0};     // mulai tekan per tombol
+  static bool     hwHoldDone[4] = {false};
   for(int i=0;i<4;i++){
     bool pressed = (digitalRead(pins[i]) == LOW);
     if(pressed){
-      if(!hwBtnState[i] && ms - hwBtnLastAt[i] > 30){
-        hwBtnState[i] = 1;
-        hwPlayScene(hwBank + i);
+      if(!hwBtnState[i]){                 // edge: baru ditekan
+        if(ms - hwBtnLastAt[i] > 30){
+          hwBtnState[i] = 1;
+          hwPressAt[i] = ms;
+          hwHoldDone[i] = false;
+        }
+      } else {
+        // sedang ditahan — cek hold utk tombol ujung (B1=mundur, B4=maju)
+        if(!hwHoldDone[i] && ms - hwPressAt[i] >= 600){
+          hwHoldDone[i] = true;
+          if(i==3)      hwBankAdjust(1);  // B4 hold = grup berikutnya
+          else if(i==0) hwBankAdjust(-1); // B1 hold = grup sebelumnya
+        }
       }
-      hwBtnLastAt[i] = ms;               // refresh window selama ditahan
+      hwBtnLastAt[i] = ms;                // refresh window debounce
     } else {
+      if(hwBtnState[i]){                  // edge: baru dilepas
+        if(!hwHoldDone[i]){
+          hwPlayScene(hwBank + i);        // tap pendek -> play scene
+        }
+      }
       hwBtnState[i] = 0;
     }
   }
@@ -2581,11 +2608,12 @@ function syncFromServer(j, skipActive){
   });
   if(j.chaseOn!==undefined && j.chaseOn!==chaseOn){ chaseOn=j.chaseOn; applyChaseBtn(); }
   if(j.artnet!==undefined){ const an=(j.artnet==='network'); if(an!==artnetMode){ artnetMode=an; applyArtnetBtn(); } }   // v49
-  // v49: deck fisik — indikator bank + tombol di panel scene
+  // v49: deck fisik — indikator grup + tombol di panel scene
   if(j.hwBank!==undefined){
     const el=$('hwDeck'); if(el){
-      el.textContent='DECK FISIK \u00b7 Bank '+(j.hwBank+1)+'-'+(Math.min(j.hwBank+4,NSCN))+
-        ' \u00b7 encoder '+(j.hwEnc||0)+' detent \u00b7 '+
+      const g=Math.floor(j.hwBank/4)+1;
+      el.textContent='DECK FISIK \u00b7 GRUP '+g+': scene '+(j.hwBank+1)+'-'+Math.min(j.hwBank+4,NSCN)+
+        ' \u00b7 [tap=play \u00b7 hold B4=grup berikut \u00b7 hold B1=grup sebelum] \u00b7 '+
         ((j.hwB||[]).map(b=>b?'#':'-').join(''));
     }
   }
