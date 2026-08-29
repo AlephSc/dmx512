@@ -1170,12 +1170,9 @@ void sceneTick(uint32_t now){
   }
   xSemaphoreGive(dmxMutex);
   if(chosen<0){ sceneOn=false; sceneError=1; return; }
-  // v49.2: log wrap — membedakan "scene kembali ke awal" karena SIKLUS
-  // normal (50 langkah habis, wrap ke langkah 1) vs restart oleh sumber lain.
-  if(sceneStep>=0 && chosen<=sceneStep){
-    Serial.printf("[scene] wrap #%d (siklus normal, langkah %d->%d)\n",
-                  sceneIdx+1, sceneStep+1, chosen+1);
-  }
+  // v49.2: log wrap DIHAPUS — instrumen diagnosis sudah cukup (misi
+  // selesai: wrap terkonfirmasi). Pada scene cepat (hold 100ms) log ini
+  // menulis 5x/dtk dari dmxTask Core 0 — spam Serial + jitter timing frame.
   sceneStep=chosen;
   applyPresetToWant(pnum-1);               // mutex diambil di dalamnya
   sceneNextAt=now+sceneMs;
