@@ -3274,8 +3274,16 @@ void onImportUpload(){
 // ---------------------------------------------------------------
 // DMX TASK (Core 0) - timing realtime, terpisah dari WiFi/Web (Core 1)
 // ---------------------------------------------------------------
+// snapshot instrumen frame (diisi dmxTask, dibaca DMXSTAT — uint32 tugas
+// 32-bit atomik di ESP32, cukup tanpa mutex utk keperluan diagnosis)
+static volatile uint32_t dmxFrameMin = 0, dmxFrameMax = 0, dmxFrameAvg = 0, dmxFrameCnt = 0;
+
 void dmxTask(void* arg){
   TickType_t lastWake = xTaskGetTickCount();
+  // v49.2: instrumen interval frame (dibaca via serial DMXSTAT).
+  // min/max/avg sejak DMXSTAT terakhir — bukti angka kelaparan task.
+  uint32_t prevNow = millis();
+  uint32_t fMin = 0xFFFFFFFF, fMax = 0, fSum = 0, fCnt = 0;
   for(;;){
     uint32_t now = millis();
     chaseTick(now);
@@ -3283,10 +3291,26 @@ void dmxTask(void* arg){
     fadeTick(0.025f);
     buildFrame();
     dmxHeartbeat++;
+    uint32_t iv = now - prevNow; prevNow = now;
+    if(iv < fMin) fMin = iv;
+    if(iv > fMax) fMax = iv;
+    fSum += iv; fCnt++;
     vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(25));   // ~40fps presisi
+    // ekspose utk DMXSTAT (dibaca handler serial — nilai snapshot kasar cukup)
+    dmxFrameMin = fMin; dmxFrameMax = fMax;
+    dmxFrameAvg = fCnt ? (fSum / fCnt) : 0; dmxFrameCnt = fCnt;
   }
 }
 TaskHandle_t dmxTaskHandle = NULL;
+
+// v49.2 FRAME STARVATION FIX: dmxTask semula priority 5 di Core 0 — di bawah
+// WiFi system task (23) dan lwIP/AsyncTCP. Setiap WS broadcast state (~2 KB
+// × client × 10 Hz saat slider/scene aktif) membuat task jaringan menyita
+// Core 0 ratusan ms -> frame DMX telat 0,3-1,5 dtk (gejala: lampu delay,
+// strobe 255 tampak ~1 Hz padahal harus 12,5 Hz, blink scene tidak realtime).
+// Priority dinaikkan ke 18: di atas pemrosesan TCP, tetap di bawah WiFi
+// radio (23) supaya paket tetap dikirim — DMX frame 25 ms tak boleh menunggu.
+#define DMX_TASK_PRIO 18
 
 // ---------------------------------------------------------------
 // SERIAL CONTROL (v33) — jalur kendali kedua selain Web UI
@@ -3572,6 +3596,18 @@ void handleSerialCmd(String cmd){
       Serial.println(String("{\"mode\":\"")+(artnetMode?"network":"local")
         +"\",\"lastAt\":"+String(artnetLastAt)
         +",\"pkt\":"+String(artnetPktCount)+"}");
+      return;
+    }
+    // v49.2: DMXSTAT -> interval frame ms (min/avg/max) sejak panggilan
+    // terakhir. Normal: min 24-26, avg ~25, max <50. Kelaparan task
+    // (gejala lampu delay): max ratusan-ribuan ms.
+    if(op=="DMXSTAT"){
+      Serial.println(String("{\"frames\":"+String(dmxFrameCnt)
+        +",\"min\":"+String(dmxFrameMin)
+        +",\"avg\":"+String(dmxFrameAvg)
+        +",\"max\":"+String(dmxFrameMax)+"}"));
+      // reset window dgn mengganti sinyal: cukup laporkan kumulatif;
+      // user bisa reboot utk reset. (Sederhana — alat diagnosis, bukan produk.)
       return;
     }
 
@@ -3944,7 +3980,7 @@ void setup(){
   buildFrame();
 
   // DMX timing di Core 0 (PRO_CPU), WebServer tetap di Core 1 berkat loop().
-  xTaskCreatePinnedToCore(dmxTask, "dmx", 8192, NULL, 5, &dmxTaskHandle, 0);
+  xTaskCreatePinnedToCore(dmxTask, "dmx", 8192, NULL, DMX_TASK_PRIO, &dmxTaskHandle, 0);
   Serial.println("DMX task -> Core 0 | WebServer -> Core 1");
 }
 // Broadcast state via WebSocket: segera saat stateRevision berubah,
