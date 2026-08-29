@@ -3598,16 +3598,23 @@ void handleSerialCmd(String cmd){
         +",\"pkt\":"+String(artnetPktCount)+"}");
       return;
     }
-    // v49.2: DMXSTAT -> interval frame ms (min/avg/max) sejak panggilan
-    // terakhir. Normal: min 24-26, avg ~25, max <50. Kelaparan task
-    // (gejala lampu delay): max ratusan-ribuan ms.
+    // v49.2: DMXSTAT -> interval frame ms (min/avg/max) + snapshot runtime.
+    // Normal: min 24-26, avg ~25, max <50. strb=255 + half harusnya 40ms
+    // (12,5 Hz). Dipakai mendiagnosis "strobe master lambat": bandingkan
+    // nilai strb aktual vs fader UI.
     if(op=="DMXSTAT"){
+      uint8_t sv=strobeWant;
+      uint32_t half = 40 + (uint32_t)(255 - sv) * 1960 / 255;
       Serial.println(String("{\"frames\":"+String(dmxFrameCnt)
         +",\"min\":"+String(dmxFrameMin)
         +",\"avg\":"+String(dmxFrameAvg)
-        +",\"max\":"+String(dmxFrameMax)+"}"));
-      // reset window dgn mengganti sinyal: cukup laporkan kumulatif;
-      // user bisa reboot utk reset. (Sederhana — alat diagnosis, bukan produk.)
+        +",\"max\":"+String(dmxFrameMax)
+        +",\"strb\":"+String(sv)
+        +",\"halfMs\":"+String(half)
+        +",\"mast\":"+String(masterOut)
+        +",\"chase\":"+(chaseOn?"true":"false")
+        +",\"sceneOn\":"+(sceneOn?"true":"false")
+        +",\"artnet\":\""+String(artnetMode?"network":"local")+"\"}"));
       return;
     }
 
