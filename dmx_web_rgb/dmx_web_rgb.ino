@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v48"
+#define BUILD_TAG "v49"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -241,10 +241,19 @@ static inline bool timestampNewer(uint32_t a, uint32_t b){
   return (int32_t)(a-b)>0;
 }
 void recomputeWant(){
+  // v49: mix TIGA layer LTP timestamp: manual (fader) > playback (preset/
+  // scene/chase) > network (Art-Net). Semua timestamp millis — paket ArtDmx
+  // menang bila datang SETELAH sentuhan lokal terakhir. Tie memihak
+  // playback (state boot deterministik).
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
     uint16_t ch=fix[f].start+c;
-    // Tie memihak playback agar state boot deterministik.
-    want[ch] = timestampNewer(manualTouched[ch],pbTouched[ch]) ? manualWant[ch] : pbWant[ch];
+    uint32_t mT=manualTouched[ch], pT=pbTouched[ch], nT=netTouched[ch];
+    uint8_t  mV=manualWant[ch], pV=pbWant[ch], nV=netWant[ch];
+    // pilih sumber dengan timestamp terbaru (tie: playback > manual > net)
+    uint32_t bestT=pT; uint8_t bestV=pV;
+    if(timestampNewer(mT,bestT)){ bestT=mT; bestV=mV; }
+    if(timestampNewer(nT,bestT)){ bestT=nT; bestV=nV; }
+    want[ch]=bestV;
   }
 }
 static volatile uint8_t masterOut = 255; static volatile uint8_t masterWant = 255;
@@ -264,6 +273,120 @@ static uint8_t presets[N_PRESETS][PRESET_CHUNK];   // chunk: [0]=used, [1..512]=
 // pan/tilt bergerak jauh (LTP). Diisi saat apply preset.
 // v45: ukuran MAX_FIX agar aman saat N_FIX berubah runtime.
 static volatile uint32_t blackoutEnd[MAX_FIX] = {0};
+
+// ---------------------------------------------------------------
+// v49: ART-NET INPUT (node) — sumber kontrol dari QLC+/xLights/Resolume.
+// Layer ketiga "netWant" di mixer LTP-timestamp (paritas manual/pbWant).
+// Standar yang diikuti (Art-Net 4, spec 1.4):
+//   - Header "Art-Net\0" + OpCode 0x5000 OpDmx (LSB-first)
+//   - ProtVer Lo=14
+//   - Sequence 0 = non-sequenced; selisih 1..20 = out-of-order window
+//     (spec 1.4) — duplikat(0) / selisih>20 di-drop
+//   - SubUni/SubNet: hanya universe 0:0 diterima (1 universe fisik,
+//     padanan node Art-Net 1-port standar QLC+)
+// Mode operasi (UI): LOCAL (default) / NETWORK (aktif).
+// Merge: LTP timestamp — paritas perilaku fader manual kita.
+// ---------------------------------------------------------------
+#include <WiFiUdp.h>
+static WiFiUDP artnetUdp;
+static bool     artnetMode = false;         // false=LOCAL, true=NETWORK
+static uint8_t  netWant[513];
+static volatile uint32_t netTouched[513];
+static volatile uint32_t artnetLastAt = 0;   // ms paket terakhir (indikator)
+static volatile uint32_t artnetPktCount = 0; // total paket diterima
+static uint8_t  artnetLastSeq = 0;           // sequence tracking
+static uint32_t artnetBindMs = 0;            // mulai listen
+
+void artnetBegin(){
+  artnetUdp.stop();
+  if(artnetUdp.begin(6454)==0){
+    Serial.println("Art-Net: GAGAL bind UDP 6454 (socket penuh?)");
+    return;
+  }
+  artnetBindMs = millis();
+  Serial.println("Art-Net: listening UDP 6454 (mode NETWORK)");
+}
+
+// v49: ArtPollReply — identitas node utk discovery QLC+/xLights.
+// Layout 208 byte (spec 1.4). Field penting:
+//   NodeReport status 0x0 = ready; PortTypes bit7=output DMX; GoodOutput
+//   bit7=data receiving; SwIn/SwOut = universe port (0). NetSwitch/SubSwitch
+//   = 0. Panjang IP = 4 byte. Versi firmware di NodeReport teks.
+// Ini yang membuat node muncul di input map QLC+ secara OTOMATIS.
+void artnetSendPollReply(IPAddress to){
+  uint8_t r[208];
+  memset(r,0,sizeof(r));
+  memcpy(r,"Art-Net\0",8);
+  r[8]=0x00; r[9]=0x21;                    // OpCode 0x2100 ArtPollReply (LSB)
+  r[10]=0; r[11]=14;                       // ProtVer
+  IPAddress ip = activeIP();
+  memcpy(r+12, &ip[0], 4);                 // IP
+  r[16]=0x36; r[17]=0x19;                  // Port 0x1936 (6454, hi-lo)
+  r[18]=0;                                // NetSwitch = 0 (default Art-Net 4 port-address rendah)
+  r[19]=0;                                 // SubSwitch
+  r[20]=0x05;                              // OEM hi (placeholder; OEM code 0x05FF-class custom)
+  r[21]=0xFF;
+  r[22]=0xA1;                              // Ubea + status1 ready
+  memcpy(r+26,"DMX Web Console",15);       // ShortName (18 b)
+  String rep=String("DMX Web Console ")+String(BUILD_TAG)+" #"+String(artnetPktCount);
+  rep.toCharArray((char*)r+44,60);         // LongName (64 b)
+  strncpy((char*)r+108,"OK",32);           // NodeReport (64 b)
+  r[172]=3;                                // NumPortsLo = 1 port input (kita node INPUT utk software)
+  r[173]=0;                                // NumPortsHi
+  r[174]=0xC0;                             // PortTypes b0: bit7=DMX + bit6=input
+  r[175]=0x80;                             // GoodInput b0: bit7=data receiving (mode network)
+  r[176]=0x80;                             // GoodOutput b0: bit7=transmitting (utk software ini = output kita)
+  r[177]=0; r[178]=0;                      // SwIn b0 / SwOut b0 = universe 0
+  r[179]=0; r[180]=0;
+  r[181]=0; r[182]=0; r[183]=0; r[184]=0;  // SwIn/Out 1..3 kosong
+  r[185]=0; r[186]=0; r[187]=0; r[188]=0;
+  r[190]=0; r[191]=3;                      // Status2: bit0=webbrowser config, bit1=artnet
+  artnetUdp.beginPacket(to, 6454);
+  artnetUdp.write(r, sizeof(r));
+  artnetUdp.endPacket();
+}
+
+// Parse & apply satu datagram ArtDmx. Dipanggil dari loop() (Core 1).
+// Buffer stack 530 byte — nol alokasi heap (pelajaran fragmentasi).
+void artnetTask(){
+  if(!artnetMode) return;
+  int n = artnetUdp.parsePacket();
+  if(n < 18) return;                       // header ArtDmx min 18 byte
+  uint8_t p[530];
+  int len = artnetUdp.read(p, sizeof(p));
+  if(len < 18) return;
+  if(memcmp(p, "Art-Net\0", 8) != 0) return;
+  uint16_t op = (uint16_t)p[9] << 8 | p[8];           // OpCode LSB-first
+  if(op == 0x2000){                                    // ArtPoll -> balas ArtPollReply
+    artnetSendPollReply(artnetUdp.remoteIP());
+    artnetLastAt = millis();
+    return;
+  }
+  if(op != 0x5000) return;                             // hanya OpDmx
+  if(p[10] != 0 || p[11] < 14) return;                 // ProtVer 14
+  uint8_t seq = p[12];
+  uint8_t subUni = p[14];
+  uint8_t subNet = p[15];
+  if(seq != 0 && artnetPktCount > 0){
+    uint16_t diff = (uint16_t)(seq - artnetLastSeq);
+    if(diff == 0 || diff > 20){ artnetLastSeq = seq; return; }    // drop
+  }
+  artnetLastSeq = seq;
+  if(subUni != 0 || subNet != 0) return;                // universe 0 saja
+  uint16_t dlen = ((uint16_t)p[16] << 8) | p[17];
+  if(dlen < 2) dlen = 2;
+  if(dlen > 512) dlen = 512;
+  if((int)(18 + dlen) > len) dlen = (uint16_t)(len - 18);
+  xSemaphoreTake(dmxMutex, portMAX_DELAY);
+  uint32_t now = millis();
+  memcpy(netWant, p + 18, dlen);
+  for(int i = 0; i < dlen; i++) netTouched[i+1] = now;  // DMX ch1 = data[0]
+  xSemaphoreGive(dmxMutex);
+  artnetLastAt = now;
+  artnetPktCount++;
+}
+
+// ---------------------------------------------------------------
 
 // ---------------------------------------------------------------
 // SCENE: rangkaian hingga 50 langkah preset (referensi nomor, bukan salinan)
@@ -1628,7 +1751,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <h3>Master <span style="color:var(--muted);font-weight:400">global</span></h3>
     <label><span class="lab">Master</span><input type="range" id="master" min="0" max="255" value="255"><span class="val" id="masterv">255</span></label>
     <label><span class="lab">Strobe</span><input type="range" id="mstrb" min="0" max="255" value="0"><span class="val" id="mstrbv">0</span></label>
-    <div class="actions"><button class="btn-off act" id="btnBlack">Blackout</button><button class="btn-go act" id="btnChase">Chase OFF</button><button class="btn-reset act" id="btnSaveData">Save Data</button><button class="btn-off act" id="btnLoadData">Load Data</button></div>
+    <div class="actions"><button class="btn-off act" id="btnBlack">Blackout</button><button class="act" id="btnArtnet">Art-Net: LOCAL</button><button class="btn-go act" id="btnChase">Chase OFF</button><button class="btn-reset act" id="btnSaveData">Save Data</button><button class="btn-off act" id="btnLoadData">Load Data</button></div>
     <div class="status" id="saveStatus">Data tersimpan</div>
   </section>
 
@@ -2130,6 +2253,13 @@ $('pfade').addEventListener('change',persistTiming);
 $('phold').addEventListener('input',()=>{phold=+$('phold').value;setPHoldLabel(phold);paintFill($('phold'));});
 $('phold').addEventListener('change',persistTiming);
 $('btnBlack').addEventListener('click',()=>{$('master').value=0;$('masterv').textContent=0;pushLive({t:'all',v:0},'all=off');});
+// v49: Art-Net mode toggle — LOCAL (default) / NETWORK (dengar UDP 6454)
+let artnetMode=false;
+function applyArtnetBtn(){const b=$('btnArtnet');b.textContent='Art-Net: '+(artnetMode?'NETWORK':'LOCAL');b.classList.toggle('on',artnetMode);}
+$('btnArtnet').addEventListener('click',()=>{
+  artnetMode=!artnetMode; applyArtnetBtn();
+  api('/artnet?mode='+(artnetMode?'network':'local')).catch(e=>showError(e.message));
+});
 // Aman perangkat: "Penuh" hanya untuk PAR (dimmer+RGB); moving/fog/strobe tetap 0.
 $('btnWhite').addEventListener('click',()=>{allKeys.forEach(k=>{const fi=+k.split('_')[0];sliders[k].value=(FIX[fi].type===0)?255:0;});paintAll();pushLive({t:'all',v:1},'all=on');});
 $('btnOff').addEventListener('click',()=>{allKeys.forEach(k=>sliders[k].value=0);paintAll();pushLive({t:'all',v:0},'all=off');});
@@ -2333,6 +2463,7 @@ function syncFromServer(j, skipActive){
     sliders[k].value=v; document.getElementById(k+'v').textContent=v; paintFill(sliders[k]);
   });
   if(j.chaseOn!==undefined && j.chaseOn!==chaseOn){ chaseOn=j.chaseOn; applyChaseBtn(); }
+  if(j.artnet!==undefined){ const an=(j.artnet==='network'); if(an!==artnetMode){ artnetMode=an; applyArtnetBtn(); } }   // v49
   if(j.sceneOn!==undefined && j.sceneOn!==sceneOn){ sceneOn=j.sceneOn; applySceneBtn(); if(!sceneOn) renderSteps(); }
   syncSelectedState(j);
   if(j.selectedScene!==undefined && j.selectedScene>=0 && j.selectedScene<NSCN){
@@ -2842,6 +2973,7 @@ String buildStateJson(){
   j.reserve(2048);
   j+="\"build\":\""+String(BUILD_TAG)+"\",";
   j+="\"sceneRev\":"+String(sceneRev.load())+",";   // v46: client reload /scenes saat berubah
+  j+="\"artnet\":\""+String(artnetMode?"network":"local")+"\",";   // v49: indikator mode
   j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
@@ -2873,6 +3005,30 @@ void onPresetSave(){
   }
   selectedPreset=n;
   sendApiOk();
+}
+// ---------------------------------------------------------------
+// v49: Art-Net mode — GET /artnet?mode=local|network (toggle operator)
+// Ephemeral (bukan NVS): mode jaringan = keputusan sesi operator, bukan
+// konfigurasi persisten (flash awet; konsisten strobe ephemeral).
+// GET /artnet (tanpa arg) = status.
+// ---------------------------------------------------------------
+void onArtnet(){
+  if(server.hasArg("mode")){
+    bool wantNet = server.arg("mode")=="network";
+    if(wantNet && !artnetMode) artnetBegin();
+    if(!wantNet && artnetMode){
+      artnetUdp.stop();
+      Serial.println("Art-Net: stop (mode LOCAL)");
+    }
+    artnetMode = wantNet;
+    stateRevision++;
+    sendApiOk();
+    return;
+  }
+  String j="{\"ok\":true,\"mode\":\""+String(artnetMode?"network":"local")+"\"";
+  j+=",\"lastAt\":"+String(artnetLastAt);
+  j+=",\"pkt\":"+String(artnetPktCount)+"}";
+  server.send(200,"application/json",j);
 }
 // GET /psetfade?n=X&f=&h= -> ubah fade/hold preset X tanpa merekam ulang
 void onPresetFade(){
@@ -3223,8 +3379,25 @@ void handleSerialCmd(String cmd){
      return;
    }
 
-   // CHASE on/off -> toggle chase
-   if(op=="CHASE"){
+    // v49: ARTNET local|network -> mode input Art-Net
+    if(op=="ARTNET"){
+      bool net = args.indexOf("network",0)>=0 || args.indexOf("on",0)>=0;
+      if(net && !artnetMode) artnetBegin();
+      if(!net && artnetMode){ artnetUdp.stop(); Serial.println("Art-Net: stop (mode LOCAL)"); }
+      artnetMode = net;
+      stateRevision++;
+      Serial.println(String("{\"ok\":true,\"mode\":\"")+(net?"network":"local")+"\"}");
+      return;
+    }
+    if(op=="ARTSTAT"){
+      Serial.println(String("{\"mode\":\"")+(artnetMode?"network":"local")
+        +"\",\"lastAt\":"+String(artnetLastAt)
+        +",\"pkt\":"+String(artnetPktCount)+"}");
+      return;
+    }
+
+    // CHASE on/off -> toggle chase
+    if(op=="CHASE"){
      chaseOn = args.indexOf("on",0)>=0;
      if(chaseOn){ sceneOn=false; sceneIdx=-1; sceneStep=-1; chaseNextAt=millis(); }
      else { chaseOn=false; chaseIdx=-1; }
@@ -3556,6 +3729,7 @@ void setup(){
    server.on("/groups",HTTP_GET, onGroupsGet);   // v40: metadata grup fader (paritas LISTG serial)
   server.on("/ctypes", HTTP_GET,  onCtypesGet); // v48: daftar custom type
   server.on("/ctypes", HTTP_POST, onCtypesPost);// v48: commit custom type
+  server.on("/artnet", HTTP_GET,  onArtnet);   // v49: mode Art-Net input
   server.on("/wifistat",HTTP_GET, onWifiStat);   // v43: status koneksi WiFi
   server.on("/wifiset", HTTP_POST, onWifiSet);   // v43: simpan kredensial + reconnect
   server.on("/wifiset", HTTP_GET, onWifiSet);    // kompatibilitas desktop v44
@@ -3614,6 +3788,7 @@ void loop(){
   ws.cleanupClients();      // housekeeping AsyncWebSocket
   wsBroadcastTick();
   wifiReconnectTick();      // v43: reconnect WiFi kustom (non-blocking)
+  artnetTask();             // v49: Art-Net input (mode NETWORK saja)
   processSerialIn();        // v33: kendali via serial (non-blocking, Core 1)
   // v46: migrasi gen v45->v46 dijalankan SETELAH 10 dtk stabil (radio WiFi
   // penuh daya, boot selesai) — bukan saat boot, untuk menghindari brownout.
