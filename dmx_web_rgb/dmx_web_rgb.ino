@@ -561,26 +561,51 @@ void hwInputTask(){
     if(hwEncDelta >= 4){ hwEncDelta -= 4; hwEncCount++; hwBankAdjust(1); }
     else if(hwEncDelta <= -4){ hwEncDelta += 4; hwEncCount--; hwBankAdjust(-1); }
   }
-  // --- 4 tombol scene — DEBOUNCE DUA-ARAH (v49.2 fix "scene restart sendiri")
-  // Akar bug: v49.1 memindah play ke trigger-on-RELEASE tanpa debounce di
-  // sisi release. Kontak switch memantul saat DILEPAS (LOW-HIGH-LOW-HIGH
-  // beberapa ms) -> tiap pantulan = tekan+lepas baru -> scene di-play
-  // ulang ("kembali ke awal seperti ditekan lagi") / pindah acak bila
-  // bounce di tombol lain. Fix: state stabil-baru diterima hanya bila
-  // pembacaan pin KONSISTEN 30 ms (lastChangeAt), arah manapun.
+  // --- 4 tombol scene — DEBOUNCE DUA-ARAH (v49.2) + COMMON-MODE DETECTOR
+  // (v49.3 fix "scene restart sendiri" / "strobe tampak lambat")
+  // Akar bug: EMI dimmer menginduksi pin tombol (pull-up internal ~45k
+  // lemah) → LOW >30ms → lolos debounce → hwPlayScene palsu berulang.
+  // DISKRIMINATOR COMMON-MODE (lapis baru): EMI menginduksi SEMUA kabel
+  // panel bersamaan (satu jalur kabel); manusia menekan SATU tombol.
+  // ≥2 pin LOW bersamaan yang belum dikenali = burst noise → blok 500 ms
+  // semua tombol + log. Detektor dibaca SEBELUM edge individual diproses.
+  // Lapis lain: debounce 30→60 ms (tak terasa bagi tangan, menyaring
+  // burst panjang) + rate/lockout v49.3 tetap.
   const uint8_t pins[4] = {HW_BTN1, HW_BTN2, HW_BTN3, HW_BTN4};
   uint32_t ms = millis();
   static uint32_t hwPressAt[4] = {0};     // mulai tekan (stabil) per tombol
   static uint32_t hwLastChange[4] = {0};  // pembacaan pin terakhir BERUBAH
   static uint8_t  hwRawPrev[4] = {1,1,1,1}; // pembacaan mentah sebelumnya
   static bool     hwHoldDone[4] = {false};
+  // --- common-mode: hitung pin yang baru BERUBAH ke LOW pada iterasi ini
+  int cmChanges = 0;
+  uint8_t raws[4];
   for(int i=0;i<4;i++){
-    uint8_t raw = (digitalRead(pins[i]) == LOW) ? 1 : 0;
+    raws[i] = (digitalRead(pins[i]) == LOW) ? 1 : 0;
+    if(raws[i] != hwRawPrev[i] && raws[i] == 1) cmChanges++;
+  }
+  static uint32_t hwCMBlockUntil = 0;     // blok common-mode berakhir ms ini
+  if(cmChanges >= 2){
+    hwCMBlockUntil = ms + 500;            // burst multipin = noise
+    Serial.printf("[hw] common-mode noise (%d pin) — tombol diblok 500ms\n", cmChanges);
+    for(int i=0;i<4;i++){                 // buang state edge setengah jalan
+      hwRawPrev[i] = raws[i];
+      hwLastChange[i] = ms;
+    }
+  }
+  bool cmBlocked = (ms < hwCMBlockUntil);
+  for(int i=0;i<4;i++){
+    uint8_t raw = raws[i];
+    if(cmBlocked){
+      // selama blok common-mode: hanya refresh pembacaan, tanpa edge
+      if(raw != hwRawPrev[i]){ hwRawPrev[i] = raw; hwLastChange[i] = ms; }
+      continue;
+    }
     if(raw != hwRawPrev[i]){
       hwRawPrev[i] = raw;
       hwLastChange[i] = ms;               // pin berubah -> mulai ulang window
     }
-    bool stable = (ms - hwLastChange[i]) >= 30;   // stabil 30 ms berturut-turut
+    bool stable = (ms - hwLastChange[i]) >= 60;   // stabil 60 ms (v49.3: 30→60)
     if(stable){
       bool nowPressed = (hwRawPrev[i] == 1);
       if(nowPressed && !hwBtnState[i]){   // edge tekan (stabil)
