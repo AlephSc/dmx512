@@ -3207,7 +3207,7 @@ String buildStateJson(){
   j+="\"build\":\""+String(BUILD_TAG)+"\",";
   j+="\"sceneRev\":"+String(sceneRev.load())+",";   // v46: client reload /scenes saat berubah
   j+="\"artnet\":\""+String(artnetMode?"network":"local")+"\",";   // v49: indikator mode
-  j+="\"hw\":"+(hwEnabled?"true":"false")+",";   // v49.3: deck fisik aktif?
+  j+="\"hw\":"; j+=(hwEnabled?"true":"false"); j+=",";   // v49.3: deck fisik aktif?
   // v49: deck fisik — nilai button/encoder terekspos utk website
   j+="\"hwBank\":"+String(hwBank)+",\"hwEnc\":"+String(hwEncCount)+",\"hwB\":["
     +String(hwBtnState[0])+","+String(hwBtnState[1])+","
