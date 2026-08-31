@@ -1952,6 +1952,24 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   .type-sec>summary::before{content:'\25BE ';color:var(--muted)}
   .type-sec:not([open])>summary::before{content:'\25B8 '}
   .type-sec .grouphdr{font-size:11px;color:var(--muted);font-weight:700;margin:6px 0 2px;letter-spacing:.4px}
+  /* v49.4: editor tipe custom — grid rapi, tanpa fixed-width inline */
+  .ct-toolbar{display:grid;grid-template-columns:auto 1fr 1fr auto auto;gap:8px;align-items:end}
+  .ct-toolbar .ct-actions{display:flex;gap:6px}
+  .ct-field{display:flex;flex-direction:column;gap:3px;min-width:0}
+  .ct-field .ct-lab{font-size:11px;color:var(--muted);font-weight:700}
+  .ct-field select,.ct-field input{width:100%;min-width:0;background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;font-size:13px}
+  .ct-chan{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:6px 8px;border:1px solid var(--edge);border-radius:6px}
+  .ct-chan input[type=text]{flex:1;min-width:60px;background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:5px 6px;font-size:13px}
+  .ct-chan label{display:flex;gap:3px;align-items:center;color:var(--muted);font-size:12px;min-height:28px}
+  #ctChannels{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px}
+  @media(max-width:640px){
+    .ct-toolbar{grid-template-columns:1fr 1fr;align-items:stretch}
+    .ct-toolbar strong{grid-column:1/-1}
+    .ct-toolbar .ct-actions{grid-column:1/-1}
+    .ct-toolbar .ct-actions button{flex:1;min-height:44px}
+    .ct-toolbar span[style]{grid-column:1/-1}
+    #ctChannels{grid-template-columns:1fr}
+  }
   .fixgrd{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
   /* v48: dual pane — kiri fixture individu, kanan fader bank */
   .dualfx{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;align-items:start}
@@ -1975,6 +1993,21 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   #patchTable th{text-align:left;color:var(--muted);font-weight:600;padding:4px 6px;border-bottom:1px solid var(--edge);font-size:12px}
   #patchTable td{padding:4px 6px;border-bottom:1px solid #232733}
   #patchTable input[type=number]{width:70px;background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:4px 6px;font-size:13px}
+  /* v49.4: mobile — tabel patch jadi kartu per fixture (R-03: tanpa
+     overflow horizontal). td label dari data-label; th disembunyikan. */
+  @media(max-width:640px){
+    #patchTable{overflow-x:visible!important}
+    #patchTable table{min-width:0}
+    #patchTable thead{display:none}
+    #patchTable tr{display:block;border:1px solid var(--edge);border-radius:6px;margin-bottom:8px;padding:6px}
+    #patchTable td{display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:1px dashed #232733;min-height:44px;padding:4px 2px}
+    #patchTable td:last-child{border-bottom:0;justify-content:flex-end}
+    #patchTable td::before{content:attr(data-label);color:var(--muted);font-size:12px;font-weight:600;flex-shrink:0}
+    #patchTable input[type=number]{width:90px;min-height:44px}
+    #patchTable select{min-height:44px;max-width:170px}
+    #patchTable button.del{min-height:44px;min-width:88px}
+    #patchTable input[type=text]{min-width:0;width:60%;min-height:44px}
+  }
   #patchTable input[type=text]{width:110px;background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:4px 6px;font-size:13px}
   #patchTable select{background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:4px 6px;font-size:13px}
   #patchTable .del{background:#7f1d1d;color:#fff;border:0;border-radius:5px;padding:3px 8px;cursor:pointer;font-size:12px;min-height:28px}
@@ -2024,19 +2057,26 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
     <div class="status" id="patchStatus" style="margin-top:8px"></div>
     <!-- v48: dialog editor custom fixture type (dibangun JS; hidden default) -->
+    <!-- v49.4: layout grid label:kontrol (bukan flex fixed-width) supaya di HP
+         tidak meluber; semua lebar dikelola CSS class, bukan inline style -->
     <div id="ctypeEditor" style="display:none;margin-top:12px;border:1px solid var(--edge);border-radius:8px;padding:10px;background:#20242c">
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div class="ct-toolbar">
         <strong style="color:#b0bec5">Tipe Custom (slot 5-15)</strong>
-        <select id="ctSlot" style="width:auto"></select>
-        <input type="text" id="ctName" placeholder="Nama tipe" maxlength="16" style="width:140px">
-        <input type="number" id="ctChannels" min="1" max="32" value="8" style="width:70px">
+        <label class="ct-field"><span class="ct-lab">Slot</span>
+          <select id="ctSlot"></select></label>
+        <label class="ct-field"><span class="ct-lab">Nama</span>
+          <input type="text" id="ctName" placeholder="Nama tipe" maxlength="16"></label>
+        <label class="ct-field"><span class="ct-lab">Channel</span>
+          <input type="number" id="ctChannels" min="1" max="32" value="8"></label>
         <span style="color:var(--muted);font-size:12px">channel</span>
-        <button class="act" id="ctLoad" style="margin-left:auto">Muat Slot</button>
-        <button class="btn-go act" id="ctSave">Simpan Tipe</button>
-        <button class="btn-off act" id="ctClose">Tutup</button>
+        <div class="ct-actions">
+          <button class="act" id="ctLoad">Muat Slot</button>
+          <button class="btn-go act" id="ctSave">Simpan Tipe</button>
+          <button class="btn-off act" id="ctClose">Tutup</button>
+        </div>
       </div>
       <p class="sub" style="margin:6px 0 2px">Mode: <b>FADER</b> = 0-255 kontinu &middot; <b>SWITCH</b> = hanya 0 / 255 (relay &amp; beban on-off). Radio di bawah menentukan mode tiap channel.</p>
-      <div id="ctChannels" style="margin-top:6px;display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:6px"></div>
+      <div id="ctChannels" style="margin-top:6px"></div>
       <div class="status" id="ctStatus" style="margin-top:8px"></div>
     </div>
   </section>
@@ -2069,7 +2109,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button class="btn-go" id="btnSPlay" title="Cek scene terpilih">&#9654; Cek</button>
     </div></div>
     <p class="state-line" id="sinfo">pilih scene (S1-S20), lalu EDIT utk merangkai preset</p>
-    <p class="state-line" id="hwDeck" style="color:#b0bec5">DECK FISIK: pasang 4 tombol (GPIO 32/33/27/14) + encoder (25/26, SW 13) — status muncul di sini</p>
+    <p class="state-line" id="hwDeck" style="color:#b0bec5">DECK FISIK: pasang 4 tombol (GPIO 32/33/27/14) + encoder (25/26, SW 13). Status muncul di sini</p>
     <div class="bank" id="sbank"></div>
     <div class="steps" id="steps"></div>
     <p class="sub">durasi tiap langkah = Hold preset masing-masing</p>
@@ -2795,20 +2835,20 @@ function renderPatchTable(){
     const end=f.start+f.foot-1;
     const isErr=errSet.has(i);
     h+='<tr>';
-    // v48 BUGFIX: sel turunan diberi id (pstart{i}/pfoot{i}/pend{i}) supaya
-    // ketikan TIDAK memicu rebuild tabel penuh — dulu tiap huruf memanggil
+    // v49.4 BUGFIX: sel diberi id (pend{i}/pstart{i}/pfoot{i}) supaya ketikan
+    // di input TIDAK memicu rebuild tabel penuh — dulu tiap huruf memanggil
     // renderPatchTable() -> innerHTML dibangun ulang -> fokus hilang dan
     // halaman scroll ke atas ("cursor menghilang"). Lihat patchUpdateDerived().
-    h+='<td><input type="text" data-i="'+i+'" data-f="name" value="'+f.name.replace(/"/g,'&quot;')+'" maxlength="24"></td>';
-    h+='<td><select data-i="'+i+'" data-f="type">';
+    // v49.4 mobile: data-label di setiap td -> card-mode CSS (R-03).
+    h+='<td data-label="Nama"><input type="text" data-i="'+i+'" data-f="name" value="'+f.name.replace(/"/g,'&quot;')+'" maxlength="24"></td>';
+    h+='<td data-label="Tipe"><select data-i="'+i+'" data-f="type">';
     FIX_TYPES.forEach(t=>{ h+='<option value="'+t.v+'"'+(f.type===t.v?' selected':'')+'>'+t.l+'</option>'; });
-    // v48: opsi custom type (slot 5-15 yang sudah didefinisikan)
     CT.forEach(c=>{ h+='<option value="'+c.slot+'"'+(f.type===c.slot?' selected':'')+'>* '+c.name+'</option>'; });
     h+='</select></td>';
-    h+='<td><input type="number" id="pstart'+i+'" data-i="'+i+'" data-f="start" min="1" max="512" value="'+f.start+'" class="'+(isErr?'err':'')+'"></td>';
-    h+='<td><input type="number" id="pfoot'+i+'" data-i="'+i+'" data-f="foot" min="1" max="512" value="'+f.foot+'" class="'+(isErr?'err':'')+'"></td>';
-    h+='<td id="pend'+i+'" style="color:'+(end>512?'var(--bad)':'var(--muted)')+'">'+end+'</td>';
-    h+='<td><input type="checkbox" data-i="'+i+'" data-f="hasMove" '+(f.hasMove?'checked':'')+' style="width:auto"></td>';
+    h+='<td data-label="Awal"><input type="number" id="pstart'+i+'" data-i="'+i+'" data-f="start" min="1" max="512" value="'+f.start+'" class="'+(isErr?'err':'')+'"></td>';
+    h+='<td data-label="Jml Ch"><input type="number" id="pfoot'+i+'" data-i="'+i+'" data-f="foot" min="1" max="512" value="'+f.foot+'" class="'+(isErr?'err':'')+'"></td>';
+    h+='<td data-label="Akhir" id="pend'+i+'" style="color:'+(end>512?'var(--bad)':'var(--muted)')+'">'+end+'</td>';
+    h+='<td data-label="Pan/Tilt"><input type="checkbox" data-i="'+i+'" data-f="hasMove" '+(f.hasMove?'checked':'')+' style="width:auto"></td>';
     h+='<td><button class="del" data-del="'+i+'">Hapus</button></td>';
     h+='</tr>';
   });
@@ -2926,18 +2966,18 @@ function ctRenderChannels(){
   if(!ctEditing) return;
   for(let k=0;k<ctEditing.channels;k++){
     const row=document.createElement('div');
-    row.style.cssText='display:flex;gap:6px;align-items:center';
+    row.className='ct-chan';               // v49.4: class, bukan inline style
     const num=document.createElement('span'); num.textContent=(k+1)+'.'; num.style.cssText='color:var(--muted);min-width:22px';
     const name=document.createElement('input'); name.type='text'; name.maxLength=8;
-    name.value=ctEditing.labels[k]||('CH'+(k+1)); name.style.cssText='flex:1;min-width:70px';
+    name.value=ctEditing.labels[k]||('CH'+(k+1));
     name.addEventListener('input',()=>{ ctEditing.labels[k]=name.value; });
-    const rf=document.createElement('label'); rf.style.cssText='display:flex;gap:3px;align-items:center;white-space:nowrap';
+    const rf=document.createElement('label');
     const rF=document.createElement('input'); rF.type='radio'; rF.name='ctm'+k; rF.checked=!ctEditing.mode[k];
     const rS=document.createElement('input'); rS.type='radio'; rS.name='ctm'+k; rS.checked=!!ctEditing.mode[k];
     rF.addEventListener('change',()=>{ if(rF.checked) ctEditing.mode[k]=0; });
     rS.addEventListener('change',()=>{ if(rS.checked) ctEditing.mode[k]=1; });
     rf.appendChild(rF); rf.appendChild(document.createTextNode('Fader'));
-    const rs=document.createElement('label'); rs.style.cssText='display:flex;gap:3px;align-items:center;white-space:nowrap';
+    const rs=document.createElement('label');
     rs.appendChild(rS); rs.appendChild(document.createTextNode('Switch'));
     row.appendChild(num); row.appendChild(name); row.appendChild(rf); row.appendChild(rs);
     box.appendChild(row);
