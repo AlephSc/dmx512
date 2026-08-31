@@ -556,6 +556,7 @@ void hwInputBegin(){
 void hwInputTask(){
   if(!hwEnabled) return;                  // v49.3: kill switch (HWOFF/tombol UI)
   // --- encoder quadrature (EC11: 4 state per detent, /4 = 1 detent)
+  // --- encoder quadrature (EC11: 4 state per detent, /4 = 1 detent)
   uint8_t now = (uint8_t)((digitalRead(HW_ENC_CLK)<<1) | digitalRead(HW_ENC_DT));
   if(now != hwEncLast){
     int8_t d = HW_ENC_TAB[(hwEncLast<<2)|now];
@@ -574,6 +575,10 @@ void hwInputTask(){
   // semua tombol + log. Detektor dibaca SEBELUM edge individual diproses.
   // Lapis lain: debounce 30→60 ms (tak terasa bagi tangan, menyaring
   // burst panjang) + rate/lockout v49.3 tetap.
+  // v49.4 TRIGGER SPLIT (latensi operator):
+  //   B2/B3 (tombol tengah, tanpa fungsi hold) = play saat TEKAN (go-button:
+  //   lampu merespons saat jari mendarat, tanpa menunggu lepas).
+  //   B1/B4 (dual-fungsi tap/hold utk pindah grup) = tetap saat LEPAS.
   const uint8_t pins[4] = {HW_BTN1, HW_BTN2, HW_BTN3, HW_BTN4};
   uint32_t ms = millis();
   static uint32_t hwPressAt[4] = {0};     // mulai tekan (stabil) per tombol
@@ -615,10 +620,13 @@ void hwInputTask(){
         hwBtnState[i] = 1;
         hwPressAt[i] = ms;
         hwHoldDone[i] = false;
+        if(i==1 || i==2){                 // B2/B3: go-button — play sekarang
+          if(hwNoiseGate(i, ms)) hwPlayScene(hwBank + i, i);
+        }
       } else if(!nowPressed && hwBtnState[i]){   // edge lepas (stabil)
         hwBtnState[i] = 0;
         if(!hwHoldDone[i] && hwNoiseGate(i, ms)){
-          hwPlayScene(hwBank + i, i);    // tap pendek -> play scene (guarded)
+          hwPlayScene(hwBank + i, i);    // B1/B4: play saat lepas (dual-fungsi)
         }
       }
       // sedang ditahan stabil — cek hold utk tombol ujung
@@ -638,6 +646,19 @@ void hwInputTask(){
       chaseOn=false; chaseIdx=-1;
       stateRevision++;
     }
+  }
+}
+
+// v49.4: TASK DEDIKASI input fisik. Dulu hwInputTask menumpang di loop()
+// (loopTask prio 1, Core 1) — saat AsyncTCP/WebServer/WiFi sibuk, deteksi
+// tombol telat ratusan ms (gejala "delay tombol saat web aktif"). Task ini
+// prio 12 Core 1: di atas loop(1)/AsyncTCP(3), di bawah WiFi radio.
+// Polling 5 ms (200 Hz) — overhead mikro, latensi deteksi maks 5 ms.
+TaskHandle_t hwTaskHandle = NULL;
+void hwLoop(void* arg){
+  for(;;){
+    hwInputTask();
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
@@ -4127,7 +4148,9 @@ void setup(){
 
   // DMX timing di Core 0 (PRO_CPU), WebServer tetap di Core 1 berkat loop().
   xTaskCreatePinnedToCore(dmxTask, "dmx", 8192, NULL, DMX_TASK_PRIO, &dmxTaskHandle, 0);
-  Serial.println("DMX task -> Core 0 | WebServer -> Core 1");
+  // v49.4: input fisik di task dedikasi — deteksi tombol bebas kelaparan
+  xTaskCreatePinnedToCore(hwLoop, "hwIn", 4096, NULL, 12, &hwTaskHandle, 1);
+  Serial.println("DMX task -> Core 0 | WebServer -> Core 1 | HW buttons task -> Core 1 (prio 12)");
 }
 // Broadcast state via WebSocket: segera saat stateRevision berubah,
 // heartbeat 1 dtk saat diam (paritas dgn polling lama utk scn/stp playback).
@@ -4151,7 +4174,9 @@ void loop(){
   wsBroadcastTick();
   wifiReconnectTick();      // v43: reconnect WiFi kustom (non-blocking)
   artnetTask();             // v49: Art-Net input (mode NETWORK saja)
-  hwInputTask();            // v49: tombol fisik + encoder (polling 2ms efek)
+  // v49.4: hwInputTask pindah ke task dedikasi "hwIn" (prio 12, Core 1) —
+  // loop() prio 1 bisa kelaparan saat AsyncTCP/WebServer sibuk -> deteksi
+  // tombol telat (gejala "delay saat web aktif").
   processSerialIn();        // v33: kendali via serial (non-blocking, Core 1)
   // v46: migrasi gen v45->v46 dijalankan SETELAH 10 dtk stabil (radio WiFi
   // penuh daya, boot selesai) — bukan saat boot, untuk menghindari brownout.
