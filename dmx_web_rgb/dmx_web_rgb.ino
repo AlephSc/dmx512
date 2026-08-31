@@ -716,10 +716,15 @@ void wsHandleCtl(const uint8_t* data, size_t len){
     xSemaphoreGive(dmxMutex);
     stateRevision++;
   } else if(strstr(buf, "\"t\":\"mast\"")){
+    // v49.4: mutex + tanpa nvsDirty (master ephemeral — flash-wear percuma)
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
     masterWant=cv(wsInt(buf,"v",0)); masterOut=masterWant;
-    stateRevision++; nvsDirty=true;
+    xSemaphoreGive(dmxMutex);
+    stateRevision++;
   } else if(strstr(buf, "\"t\":\"strb\"")){
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
     strobeWant=cv(wsInt(buf,"v",0));
+    xSemaphoreGive(dmxMutex);
     stateRevision++;
   } else if(strstr(buf, "\"t\":\"all\"")){
     bool on = wsInt(buf,"v",0)==1;
@@ -3240,8 +3245,22 @@ void onSet(){
 }
 void onCtrl(){
   // fade/hold kini milik preset (di-set saat preset dimuat); /ctrl hanya master, strobe & all.
-  if(server.hasArg("mast")){ masterWant=cv(server.arg("mast").toInt()); masterOut=masterWant; }
-  if(server.hasArg("strb")){ strobeWant=cv(server.arg("strb").toInt()); }   // ephemeral: tidak persisten NVS
+  // v49.4: master/strobe = state OPERATOR (ephemeral) — TIDAK memicu nvsDirty.
+  // Dulu /ctrl?mast & /ctrl?all set nvsDirty=true -> auto-save menulis 5 KB
+  // flash 60 dtk kemudian TANPA alasan (master tidak dipersistenkan di
+  // loadAll — serial MAST pun tak pernah set nvsDirty). Flash-wear percuma.
+  // Semua penulisan master/strobe/all kini di bawah dmxMutex (fadeTick Core 0
+  // membaca variabel yang sama).
+  if(server.hasArg("mast")){
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    masterWant=cv(server.arg("mast").toInt()); masterOut=masterWant;
+    xSemaphoreGive(dmxMutex);
+  }
+  if(server.hasArg("strb")){
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    strobeWant=cv(server.arg("strb").toInt());
+    xSemaphoreGive(dmxMutex);
+  }   // ephemeral: tidak persisten NVS
    if(server.hasArg("all")){
      bool on = server.arg("all")=="on";
      xSemaphoreTake(dmxMutex,portMAX_DELAY);
@@ -3265,13 +3284,19 @@ void onCtrl(){
      xSemaphoreGive(dmxMutex);
    }
   stateRevision++;
-  if(server.hasArg("mast")||server.hasArg("all")) nvsDirty=true;
   sendApiOk();
 }
 void onChase(){
-  chaseOn = server.hasArg("on");
-  if(chaseOn) sceneOn=false;              // hanya satu sistem auto aktif
-  if(!chaseOn) chaseIdx=-1; else chaseNextAt=millis();
+  // v49.4 race fix: chaseIdx/scene state DULU, chaseOn (switch) terakhir —
+  // chaseTick Core 0 tak boleh membaca switch aktif dgn index lama/-1.
+  bool on = server.hasArg("on");
+  if(on){
+    sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0;  // satu auto-run aktif
+    chaseNextAt=millis();
+  } else {
+    chaseIdx=-1;
+  }
+  chaseOn = on;
   sendApiOk();
 }
 String buildStateJson(){
@@ -3513,13 +3538,18 @@ void handleSerialCmd(String cmd){
   String args=(sp<0)?"":C.substring(sp+1);
 
   if(op=="MAST"){
-    int v=args.toInt(); masterWant=cv(v); masterOut=masterWant;
+    // v49.4: mutex (fadeTick Core 0 membaca masterOut)
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    masterWant=cv(args.toInt()); masterOut=masterWant;
+    xSemaphoreGive(dmxMutex);
     stateRevision++;
     Serial.println("{\"ok\":true}");
     return;
   }
   if(op=="STRB"){
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
     strobeWant=cv(args.toInt());
+    xSemaphoreGive(dmxMutex);
     stateRevision++;
     Serial.println("{\"ok\":true}");
     return;
@@ -3780,9 +3810,11 @@ void handleSerialCmd(String cmd){
 
     // CHASE on/off -> toggle chase
     if(op=="CHASE"){
-     chaseOn = args.indexOf("on",0)>=0;
-     if(chaseOn){ sceneOn=false; sceneIdx=-1; sceneStep=-1; chaseNextAt=millis(); }
-     else { chaseOn=false; chaseIdx=-1; }
+     // v49.4 race fix: state dulu, chaseOn terakhir (paritas onChase)
+     bool on = args.indexOf("on",0)>=0;
+     if(on){ sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0; chaseNextAt=millis(); }
+     else chaseIdx=-1;
+     chaseOn = on;
      stateRevision++;
      Serial.println("{\"ok\":true}");
      return;
