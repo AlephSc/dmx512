@@ -213,6 +213,9 @@ void loadDefaultFixtures(){
 
 static uint8_t want[513];         // target hasil mix (diproses fadeTick -> out)
 static uint8_t out[513];          // nilai tampilan (hasil fade)
+// v49.4: sisa fraksi fade per channel (simpan pembulatan fadeTick agar
+// lintasan linear PERSIS sampai want[] — fix "fade mentok 230-an")
+static int16_t netFrac[513];
 
 // =============================================================
 // HTP/LTP MIXER (sejak v32)
@@ -1179,6 +1182,13 @@ void buildFrame(){
 void fadeTick(float dtSec){
   bool snap = fadeMs<=20;
   float step = snap?1.0f:min(1.0f,(dtSec*1000.0f)/(float)fadeMs);
+  // v49.4 FADE TRUNCATION FIX (laporan user: fade 0->255 mentok 230-an):
+  // lama: out += (int)(diff*step) — cast int memotong fraksi SETIAP frame.
+  // Contoh fade 600ms: diff=255, step=0.0416 -> 10.6 -> 10 per frame; sisa
+  // 0.6 dibuang terus-menerus -> konvergensi lambat & tak merata, nilai
+  // tersangkut di ~230-an sampai snap akhir. FIX: akumulasi fraksi dalam
+  // netFrac[ch] (int16, ±255) dan tambahkan ke pembulatan frame berikutnya —
+  // total nilai akhir PERSIS want[ch], lintasan linear mulus.
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
   {
     int dm = (int)masterWant - (int)masterOut;
@@ -1188,8 +1198,17 @@ void fadeTick(float dtSec){
       for(uint16_t c=0;c<fix[f].foot;c++){
         uint16_t ch=fix[f].start+c;
         int diff=(int)want[ch]-(int)out[ch];
-        if(abs(diff)<2) out[ch]=want[ch];
-        else out[ch]=(uint8_t)((int)out[ch]+(int)((float)diff*(snap?1.0f:step)));
+        if(abs(diff)<2){ out[ch]=want[ch]; netFrac[ch]=0; }
+        else if(snap){ out[ch]=want[ch]; netFrac[ch]=0; }
+        else {
+          // nilai fraksional penuh frame ini: diff*step + fraksi tersisa
+          float exact = (float)diff*step + (float)netFrac[ch];
+          int move = (int)exact;                        // bagian utuh
+          int frac = (int)((exact - (float)move) * 255.0f); // sisa simpan
+          if(move==0 && frac==0) frac = (diff>0)?1:-1;  // jangan diam total
+          out[ch] = (uint8_t)constrain((int)out[ch]+move,0,255);
+          netFrac[ch] = (int16_t)constrain(frac,-255,255);
+        }
       }
   }
   xSemaphoreGive(dmxMutex);
@@ -1260,6 +1279,7 @@ void applyPresetToWant(int idx){
       uint16_t ch=fix[f].start+c;
       pbWant[ch]=presets[idx][ch];
       pbTouched[ch]=now;
+      netFrac[ch]=0;                 // v49.4: langkah baru = fraksi fade lama tak relevan
     }
   }
   recomputeWant();
@@ -1936,7 +1956,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   /* v48: dual pane — kiri fixture individu, kanan fader bank */
   .dualfx{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:14px;align-items:start}
   .dualfx>[data-role="bank"]{border-left:1px dashed var(--edge);padding-left:14px}
-  @media(max-width:900px){.dualfx{grid-template-columns:1fr}.dualfx>[data-role="bank"]{border-left:0;padding-left:0;border-top:1px dashed var(--edge);padding-top:10px}}
+  /* v49.4 mobile: BANK fader di ATAS fader individual (permintaan user) */
+  @media(max-width:900px){
+    .dualfx{grid-template-columns:1fr}
+    .dualfx>[data-role="bank"]{order:-1;border-left:0;padding-left:0;border-bottom:1px dashed var(--edge);border-top:0;padding-top:0;padding-bottom:10px;margin-bottom:10px}
+    .dualfx>[data-role="individual"]{order:1}
+  }
   /* v48: channel mode SWITCH — thumb persegi + fill beda, ⚡ di label */
   input.switchmode{accent-color:#ffd54f}
   input.switchmode::-webkit-slider-thumb{border-radius:3px;background:#ffd54f}
