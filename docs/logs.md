@@ -1,5 +1,43 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 65 - 2026-09-01 - v50: deck fisik dimatikan (HW_DECK_ENABLE 0)
+
+### Konteks (lanjutan dari sesi terputus)
+Bisect user (2 build, satu variabel): **noHW = NORMAL, noArtNet = LAGGING**
+→ pelaku eksklusi: `hwInputTask`/task `hwIn`, BUKAN Art-Net, BUKAN strobe
+gate, BUKAN wiring/EMI (pin tetap terpasang saat uji noHW dan tetap normal).
+v49.3-v49.5 (noise guard, restart guard, lockout global) TIDAK menuntaskan.
+User meminta revert: "kembalikan dulu tanpa fitur button fisik".
+
+### Keputusan desain: switch compile-time, bukan penghapusan
+`HW_DECK_ENABLE 0` di `dmx_web_rgb.ino` — seluruh blok deck (deklarasi pin,
+hwBankAdjust, hwPlayScene, hwNoiseGate, hwInputBegin, hwInputTask, hwLoop)
+dibungkus `#if HW_DECK_ENABLE`. Kondisi eksekusi identik BISECT-A_noHW yang
+terbukti normal: pin tak dikonfigurasi, task `hwIn` tak dibuat, polling tak
+jalan. Set 1 untuk mengaktifkan lagi (kode v49.x utuh, tak perlu diketik ulang).
+
+### Titik yang dibungkus switch
+- Blok kode deck (± line 449-714) + `hwInputBegin()` di setup().
+- `xTaskCreatePinnedToCore(hwLoop...)` di setup() + log boot alternatif.
+- Serial `HWOFF/HWON`: cabang `#else` menjawab `{"ok":false,"err":"hw_disabled"}`.
+- State JSON: `#else` mengirim `"hw":false` saja (tanpa hwBank/hwEnc/hwB).
+- Web UI: banner `hwDeck` jadi "DECK FISIK: NONAKTIF di build ini".
+- `sceneStartedAt` (v49.5) TETAP di luar switch — dipakai jalur play
+  HTTP/serial (restart guard); `j.hwBank!==undefined` guard JS WebUI aman.
+
+### Dokumentasi
+README: status v50, section deck jadi "NONAKTIF default" + spesifikasi
+bersyarat, wiring + catatan aktivasi, tabel API, roadmap Selesai.
+
+### Validasi
+Grep pasangan `#if/#endif` = 6 blok berpasangan; semua simbol hw hanya di
+dalam blok atau komentar/guard JS. Compile Arduino IDE: user (aturan proyek).
+
+### Harapan & uji
+Upload v50 → strobe master 255 harus cepat seperti v48/noHW (commit 14c64f3
+v49.5 ikut ter-push bersama commit ini — push lama gagal DNS).
+Jika masih lambat: bukan deck, kembali ke dmxTask/frame path.
+
 ## Session 64 - 2026-08-28 - v48 fix: fader bank "bouncing" (echo server)
 
 ### Gejala (user report)

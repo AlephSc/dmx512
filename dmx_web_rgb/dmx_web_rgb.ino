@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v49"
+#define BUILD_TAG "v50"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -433,6 +433,20 @@ void artnetTask(){
 }
 
 // ---------------------------------------------------------------
+// v50: INPUT FISIK (deck tombol/encoder) — DIMATIKAN via switch
+// compile-time. HW_DECK_ENABLE 0 = seluruh kode deck (pin, task "hwIn",
+// noise guard) dikompilasi KELUAR: pin tak dikonfigurasi, tak ada task
+// tambahan — kondisi eksekusi identik build BISECT-A_noHW yang teruji
+// NORMAL di rig user (bisect 2026-08-31: noHW = aman, noArtNet = lagging).
+// Seluruh kode v49.x tetap utuh di bawah; set 1 utk mengaktifkan lagi.
+// ---------------------------------------------------------------
+#define HW_DECK_ENABLE 0
+
+// v49.5: kapan scene mulai (restart guard tombol hw). DIPAKAI JUGA jalur
+// play HTTP/serial — deklarasinya harus di luar switch HW_DECK_ENABLE.
+static volatile uint32_t sceneStartedAt = 0;
+
+#if HW_DECK_ENABLE
 
 // v49: INPUT FISIK — rotary encoder + 4 tombol scene (hardware button deck)
 // Wiring (semua INPUT_PULLUP internal — NOL komponen eksternal, aktif LOW,
@@ -696,6 +710,8 @@ void hwLoop(void* arg){
     vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
+
+#endif // HW_DECK_ENABLE
 
 // ---------------------------------------------------------------
 
@@ -2171,7 +2187,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button class="btn-go" id="btnSPlay" title="Cek scene terpilih">&#9654; Cek</button>
     </div></div>
     <p class="state-line" id="sinfo">pilih scene (S1-S20), lalu EDIT utk merangkai preset</p>
-    <p class="state-line" id="hwDeck" style="color:#b0bec5">DECK FISIK: pasang 4 tombol (GPIO 32/33/27/14) + encoder (25/26, SW 13). Status muncul di sini</p>
+    <p class="state-line" id="hwDeck" style="color:#546e7a">DECK FISIK: NONAKTIF di build ini (HW_DECK_ENABLE=0 — penyebab lagging; lihat docs/logs.md)</p>
     <div class="bank" id="sbank"></div>
     <div class="steps" id="steps"></div>
     <p class="sub">durasi tiap langkah = Hold preset masing-masing</p>
@@ -3354,11 +3370,15 @@ String buildStateJson(){
   j+="\"build\":\""+String(BUILD_TAG)+"\",";
   j+="\"sceneRev\":"+String(sceneRev.load())+",";   // v46: client reload /scenes saat berubah
   j+="\"artnet\":\""+String(artnetMode?"network":"local")+"\",";   // v49: indikator mode
+#if HW_DECK_ENABLE
   j+="\"hw\":"; j+=(hwEnabled?"true":"false"); j+=",";   // v49.3: deck fisik aktif?
   // v49: deck fisik — nilai button/encoder terekspos utk website
   j+="\"hwBank\":"+String(hwBank)+",\"hwEnc\":"+String(hwEncCount)+",\"hwB\":["
     +String(hwBtnState[0])+","+String(hwBtnState[1])+","
     +String(hwBtnState[2])+","+String(hwBtnState[3])+"],";
+#else
+  j+="\"hw\":false,";   // v50: deck fisik dikompilasi keluar
+#endif
   j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
@@ -3798,6 +3818,9 @@ void handleSerialCmd(String cmd){
    }
 
     // v49.3: HWOFF/HWON -> kill switch deck fisik (saat wiring/EMI bermasalah)
+    // v50: deck dikompilasi keluar (HW_DECK_ENABLE 0) -> perintah dijawab
+    // eksplisit "disabled" supaya operator tahu ini bukan bug.
+#if HW_DECK_ENABLE
     if(op=="HWOFF" || op=="HWON"){
       hwEnabled = (op=="HWON");
       if(!hwEnabled){
@@ -3808,6 +3831,12 @@ void handleSerialCmd(String cmd){
       Serial.println(String("{\"ok\":true,\"hw\":")+(hwEnabled?"true":"false")+"}");
       return;
     }
+#else
+    if(op=="HWOFF" || op=="HWON"){
+      Serial.println("{\"ok\":false,\"err\":\"hw_disabled\",\"msg\":\"HW_DECK_ENABLE=0 (v50) — set 1 dan compile ulang\"}");
+      return;
+    }
+#endif
 
     // v49: ARTNET local|network -> mode input Art-Net
     if(op=="ARTNET"){
@@ -4090,7 +4119,9 @@ void setup(){
   DMX.configure();
   DMX.setBreakLength(100);
 
+#if HW_DECK_ENABLE
   hwInputBegin();          // v49: tombol scene fisik + rotary encoder
+#endif
   memset(want,0,sizeof(want)); memset(out,0,sizeof(out));
   masterWant=255; masterOut=255;
   // v45: muat konfigurasi fixture dari NVS; fallback ke default bila belum ada
@@ -4217,9 +4248,15 @@ void setup(){
 
   // DMX timing di Core 0 (PRO_CPU), WebServer tetap di Core 1 berkat loop().
   xTaskCreatePinnedToCore(dmxTask, "dmx", 8192, NULL, DMX_TASK_PRIO, &dmxTaskHandle, 0);
+#if HW_DECK_ENABLE
   // v49.4: input fisik di task dedikasi — deteksi tombol bebas kelaparan
   xTaskCreatePinnedToCore(hwLoop, "hwIn", 4096, NULL, 12, &hwTaskHandle, 1);
   Serial.println("DMX task -> Core 0 | WebServer -> Core 1 | HW buttons task -> Core 1 (prio 12)");
+#else
+  // v50: deck fisik dimatikan (HW_DECK_ENABLE 0) — tak ada task hwIn;
+  // pin tombol dibiarkan mengambang tanpa pull-up, tidak dibaca siapa pun.
+  Serial.println("DMX task -> Core 0 | WebServer -> Core 1 | HW deck OFF (v50)");
+#endif
 }
 // Broadcast state via WebSocket: segera saat stateRevision berubah,
 // heartbeat 1 dtk saat diam (paritas dgn polling lama utk scn/stp playback).
