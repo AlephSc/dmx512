@@ -479,6 +479,12 @@ static uint32_t hwLastPlayAt = 0;
 static uint32_t hwTrigAt[4] = {0};      // timestamp trigger terakhir per pin
 static uint8_t  hwTrigCnt[4] = {0};     // jumlah trigger dalam window 10 dtk
 static uint32_t hwLockUntil[4] = {0};   // pin ter-lock noise sampai ms ini
+// v49.5: hitungan GLOBAL (semua pin) — menutup celah: noise berputar antar
+// pin menghindari lockout per-pin (tiap pin selalu <3 dalam window-nya).
+static uint32_t hwGTrigAt = 0;          // trigger global terakhir
+static uint8_t  hwGTrigCnt = 0;         // trigger global dalam window 10 dtk
+static uint32_t hwGLockUntil = 0;       // global lock sampai ms ini
+static volatile uint32_t sceneStartedAt = 0;  // v49.5: kapan scene mulai (restart guard)
 
 // tabel transisi quadrature: index = (last<<2)|now -> delta
 static const int8_t HW_ENC_TAB[16] = {
@@ -518,17 +524,46 @@ void hwPlayScene(int s, int pinIdx){
   chaseOn=false; chaseIdx=-1;
   sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
   selectedScene=s;
+  sceneStartedAt = millis();     // v49.5 restart guard
   sceneOn=true;
   stateRevision++;
 }
 
 // v49.3: gate noise utk trigger tombol. Return false = trigger diabaikan.
-// Rate limit 300 ms antar play + lockout pin setelah >3 trigger/10 dtk.
+// v49.5 REVISI (masih lagging setelah v49.3): lubang-lubang guard lama —
+//   (a) rate limit 300 ms hanya MENAHAN play palsu ke maks 1/300ms = scene
+//       restart ±3x/dtk = persis "lagging berdetak" yang masih terlihat;
+//   (b) lockout per-pin dihindari noise yang BERPUTAR antar pin;
+//   (c) trigger-on-PRESS (B2/B3 v49.4) cukup SATU pulsa 60 ms untuk play.
+// Guard baru:
+//   1) RESTART GUARD: scene yang sama tak bisa di-play ulang dalam 2 dtk.
+//      (play palsu hampir selalu mengarah ke scene yang sedang jalan.)
+//   2) Rate limit global 500 ms (semua pin).
+//   3) LOCKOUT GLOBAL: >4 trigger/10 dtk gabungan semua pin -> semua tombol
+//      terkunci 60 dtk + log (pin per-pin tetap ada utk identifikasi).
 bool hwNoiseGate(int pinIdx, uint32_t ms){
   if(pinIdx<0 || pinIdx>=4) return true;          // jalur non-pin: lewati
-  if(ms < hwLockUntil[pinIdx]) return false;       // pin sedang di-lock
-  if(ms - hwLastPlayAt < 300) return false;        // rate limit global
-  // window 10 dtk per pin
+  // --- RESTART GUARD: scene sedang jalan = pinIdx ini = jangan play ulang
+  if(sceneOn && sceneIdx == hwBank + pinIdx && ms - sceneStartedAt < 2000){
+    Serial.printf("[hw] restart-guard: scene #%d baru saja mulai (%lu ms)\n",
+                  hwBank+pinIdx+1, (unsigned long)(ms-sceneStartedAt));
+    return false;
+  }
+  // --- LOCKOUT GLOBAL
+  if(ms < hwGLockUntil) return false;
+  // --- rate limit global 500 ms
+  if(ms - hwLastPlayAt < 500) return false;
+  // --- window global 10 dtk (semua pin digabung)
+  if(ms - hwGTrigAt > 10000){ hwGTrigAt = ms; hwGTrigCnt = 0; }
+  hwGTrigCnt++;
+  if(hwGTrigCnt > 4){
+    hwGLockUntil = ms + 60000;
+    Serial.println("[hw] NOISE LOCK GLOBAL 60 dtk (>4 trigger/10 dtk). "
+                   "Periksa kabel tombol / pull-up eksternal.");
+    hwGTrigCnt = 0;
+    return false;
+  }
+  // --- window per-pin (identifikasi pin bermasalah, tetap dipertahankan)
   if(ms - hwTrigAt[pinIdx] > 10000){ hwTrigAt[pinIdx]=ms; hwTrigCnt[pinIdx]=0; }
   hwTrigCnt[pinIdx]++;
   if(hwTrigCnt[pinIdx] > 3){
@@ -1725,6 +1760,7 @@ void onSPlay(){
   chaseOn=false; chaseIdx=-1;              // hanya satu sistem auto aktif
   sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
   selectedScene=s;
+  sceneStartedAt = millis();     // v49.5 restart guard
   sceneOn=true;
   sendApiOk();
 }
@@ -3596,6 +3632,7 @@ void handleSerialCmd(String cmd){
       Serial.printf("[scene] play ser #%d\n", s+1);
       sceneIdx=s; sceneStep=-1; sceneError=0;
       sceneNextAt=millis();
+      sceneStartedAt = millis();     // v49.5 restart guard
       sceneOn=true;
       stateRevision++;
       Serial.println("{\"ok\":true}");
