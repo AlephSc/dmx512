@@ -516,11 +516,52 @@ void hwBankAdjust(int dir){
   stateRevision++;
 }
 
-// Play scene fisik: paritas logika onSPlay (tanpa HTTP — langsung state).
-// v49.3: dipanggil hwInputTask dgn index pin utk noise guard (rate limit +
-// lockout per pin). pinIdx<0 = jalur tanpa pin (tanpa guard).
-void hwPlayScene(int s, int pinIdx){
-  if(s<0||s>=N_SCENES) return;
+// v50.1 MESSAGE-PASSING (akar fix "lagging + tidak teratur saat tombol
+// fisik aktif"): SEBELUMNYA hwPlayScene menulis state playback (sceneOn,
+// sceneIdx, sceneStep, sceneNextAt, chaseOn, selectedScene) langsung dari
+// task hwIn Core 1 — BERSEBELINGAN dengan sceneTick() dmxTask Core 0 yang
+// membaca field sama 40x/dtk. Mutex hanya melindungi scan playable, bukan
+// penulisan state; urutan tulis "benar" (race fix v49.2) tidak menghilangkan
+// race — Core 0 tetap bisa membaca kombinasi state setengah-jadi. Efek:
+// langkah scene ter-skip/terulang, sceneNextAt tertimpa -> ritme playback
+// kacau = persis gejala "output tidak teratur" (frame DMX 40 fps rapi,
+// tapi isinya melompat — DMXSTAT membuktikan frame teratur).
+// FIX STRUKTURAL: task hwIn TIDAK menyentuh state playback & TIDAK mengambil
+// dmxMutex sama sekali. Ia hanya mengisi slot pesan single-producer
+// (atomic exchange) di bawah; dmxTask Core 0 memungutnya di AWAL loop dan
+// mengeksekusi transisi playback (satu-satunya penulis = Core 0). Race
+// hilang, jalur prioritas-mutex (hwIn 12 vs WiFi 23 di Core 1) hilang.
+#define HW_MSG_NONE 0
+#define HW_MSG_PLAY 1
+#define HW_MSG_STOP 2
+static volatile uint8_t  hwMsgOp   = HW_MSG_NONE;  // 0=kosong
+static volatile int8_t   hwMsgScene = -1;
+static volatile uint32_t hwMsgSeq  = 0;            // naik tiap pesan baru
+static uint32_t          hwMsgSeqSeen = 0;         // hanya dibaca dmxTask
+
+// Kirim pesan play/stop dari task hwIn. Tanpa mutex, tanpa Serial (blocking),
+// tanpa menulis state playback — aman dipanggil prio 12 Core 1.
+void hwMsgSend(uint8_t op, int8_t scene){
+  hwMsgScene = (int8_t)scene;
+  hwMsgOp    = op;
+  hwMsgSeq++;                              // seq TERAKHIR: penerima lihat pasangan utuh
+}
+
+// Eksekusi pesan hw di dmxTask (Core 0) — SATU-SATUNYA penulis state playback
+// jalur hw. Dipanggil di awal tiap iterasi dmxTask; meniru logika onSPlay /
+// hwPlayScene lama (validasi playable dgn mutex, lalu transisi state).
+void hwMsgDispatchInDmxTask(){
+  if(hwMsgSeq == hwMsgSeqSeen) return;     // tak ada pesan baru (atomic-ish)
+  uint8_t op = hwMsgOp; int8_t s = hwMsgScene;
+  hwMsgSeqSeen = hwMsgSeq;
+  if(op == HW_MSG_STOP){
+    Serial.println("[scene] stop hw (SW encoder)");
+    sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0;
+    chaseOn=false; chaseIdx=-1;
+    stateRevision++;
+    return;
+  }
+  if(op != HW_MSG_PLAY || s<0 || s>=N_SCENES) return;
   bool playable=false;
   xSemaphoreTake(dmxMutex,portMAX_DELAY);
   for(int k=0;k<SCENE_STEPS;k++){
@@ -529,18 +570,22 @@ void hwPlayScene(int s, int pinIdx){
   }
   xSemaphoreGive(dmxMutex);
   if(!playable){ sceneError=1; return; }
-  // v49.2 RACE FIX: sceneTick berjalan di Core 0 (dmxTask). Penulisan lama
-  // (sceneOn=true DULU baru sceneIdx) membuat Core 0 bisa membaca sceneOn
-  // aktif dengan sceneIdx LAMA -> memutar scene lain sesaat ("pindah scene
-  // acak"). Urutan benar: semua state baru ditulis DULU, sceneOn (switch
-  // aktif) PALING AKHIR.
+  // transisi playback — di Core 0, bersambung dengan sceneTick/fadeTick
   Serial.printf("[scene] play hw #%d\n", s+1);
   chaseOn=false; chaseIdx=-1;
   sceneIdx=s; sceneStep=-1; sceneNextAt=millis(); sceneError=0;
   selectedScene=s;
-  sceneStartedAt = millis();     // v49.5 restart guard
+  sceneStartedAt = millis();
   sceneOn=true;
   stateRevision++;
+}
+
+// Play scene fisik: kirim PESAN ke dmxTask (v50.1 — lihat hwMsgDispatchInDmxTask).
+// Task hwIn hanya memvalidasi range; seluruh transisi state playback dieksekusi
+// di Core 0 oleh dmxTask. pinIdx hanya utk noise gate.
+void hwPlayScene(int s, int pinIdx){
+  if(s<0||s>=N_SCENES) return;
+  hwMsgSend(HW_MSG_PLAY, (int8_t)s);
 }
 
 // v49.3: gate noise utk trigger tombol. Return false = trigger diabaikan.
@@ -687,13 +732,11 @@ void hwInputTask(){
     }
   }
   // --- encoder switch = STOP playback (hold-guard 400 ms)
+  // v50.1: kirim pesan STOP ke dmxTask — bukan menulis state playback dari sini.
   if(digitalRead(HW_ENC_SW) == LOW){
     if(ms - hwBtnLastAt[4] > 400){
       hwBtnLastAt[4] = ms;
-      Serial.println("[scene] stop hw (SW encoder)");
-      sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0;
-      chaseOn=false; chaseIdx=-1;
-      stateRevision++;
+      hwMsgSend(HW_MSG_STOP, -1);
     }
   }
 }
@@ -3506,6 +3549,26 @@ void onImportUpload(){
 // snapshot instrumen frame (diisi dmxTask, dibaca DMXSTAT — uint32 tugas
 // 32-bit atomik di ESP32, cukup tanpa mutex utk keperluan diagnosis)
 static volatile uint32_t dmxFrameMin = 0, dmxFrameMax = 0, dmxFrameAvg = 0, dmxFrameCnt = 0;
+// v50.1: instrumen penyebab jank — waktu tick terlama dmxTask (probe tunggu
+// mutex/priority inversion), hitungan stutter frame (>2x periode 25 ms), dan
+// stutter yang bersamaan dengan tulis flash (NVS). Tujuan: saat operator
+// melaporkan "delay sedikit", DMXSTAT langsung menyebut penyebabnya dengan
+// angka, bukan tebakan.
+static volatile uint32_t dmxMutexWaitMax = 0;      // max durasi tick (ms) per window
+static volatile uint32_t dmxStutterCnt  = 0;       // frame dengan interval >50 ms
+static volatile uint32_t dmxNvsFreezeCnt= 0;       // stutter yang terjadi saat nvsWriting
+static volatile bool     dmxStatResetReq = false;  // DMXSTAT -> nol-kan window
+
+// v50.1 SHOW-SAFE NVS: flag "sedang show" ditulis dmxTask (Core 0) setiap
+// iterasi; loop() (Core 1) membaca sebelum persistAll() auto-save. Saat
+// scene/chase/strobe aktif, tulis flash ditunda sampai idle — cache CPU
+// kedua core membeku beberapa ms per sektor saat NVS write, tak peduli
+// prioritas task (penyebab stutter sporadis jangka panjang yang dilaporkan).
+static volatile bool showBusy = false;
+// ditulis loop() sebelum persistAll(), dibaca dmxTask utk korelasi stutter
+static volatile bool nvsWriting = false;
+// v50.1: auto-save sedang ditunda karena show aktif (hanya loop() Core 1)
+static bool nvsSaveDeferred = false;
 
 void dmxTask(void* arg){
   TickType_t lastWake = xTaskGetTickCount();
@@ -3513,21 +3576,48 @@ void dmxTask(void* arg){
   // min/max/avg sejak DMXSTAT terakhir — bukti angka kelaparan task.
   uint32_t prevNow = millis();
   uint32_t fMin = 0xFFFFFFFF, fMax = 0, fSum = 0, fCnt = 0;
+  uint32_t mwMax = 0, stut = 0, nvsFrz = 0;
   for(;;){
+    // v50.1: pesan dari task hwIn (play/stop scene) dieksekusi DI SINI —
+    // dmxTask = satu-satunya penulis state playback. Urutan pertama:
+    // transisi playback SEBELUM chaseTick/sceneTick iterasi ini membacanya.
+#if HW_DECK_ENABLE
+    hwMsgDispatchInDmxTask();
+#endif
     uint32_t now = millis();
+    // v50.1: flag show-busy utk show-safe NVS (dibaca loop() Core 1)
+    showBusy = (sceneOn || chaseOn || strobeWant > 0);
+    // v50.1: ukur durasi tick (probe tunggu mutex / priority inversion)
+    uint32_t t0 = millis();
     chaseTick(now);
     sceneTick(now);
+    uint32_t t1 = millis();
+    if(t1-t0 > mwMax) mwMax = t1-t0;     // tick (chase+scene) terlama
     fadeTick(0.025f);
     buildFrame();
     dmxHeartbeat++;
     uint32_t iv = now - prevNow; prevNow = now;
-    if(iv < fMin) fMin = iv;
-    if(iv > fMax) fMax = iv;
-    fSum += iv; fCnt++;
+    bool justReset = false;
+    if(dmxStatResetReq){                 // window baru dimulai (DMXSTAT terakhir)
+      fMin = 0xFFFFFFFF; fMax = 0; fSum = 0; fCnt = 0;
+      mwMax = 0; stut = 0; nvsFrz = 0;
+      dmxStatResetReq = false;
+      justReset = true;                  // frame ini di luar window (interval utuh)
+    }
+    if(!justReset){
+      if(iv < fMin) fMin = iv;
+      if(iv > fMax) fMax = iv;
+      if(iv > 50){                          // >2x periode = stutter terlihat mata
+        stut++;
+        if(nvsWriting) nvsFrz++;            // stutter saat tulis flash = bukti NVS
+      }
+      fSum += iv; fCnt++;
+    }
     vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(25));   // ~40fps presisi
     // ekspose utk DMXSTAT (dibaca handler serial — nilai snapshot kasar cukup)
     dmxFrameMin = fMin; dmxFrameMax = fMax;
     dmxFrameAvg = fCnt ? (fSum / fCnt) : 0; dmxFrameCnt = fCnt;
+    dmxMutexWaitMax = mwMax; dmxStutterCnt = stut; dmxNvsFreezeCnt = nvsFrz;
   }
 }
 TaskHandle_t dmxTaskHandle = NULL;
@@ -3858,19 +3948,39 @@ void handleSerialCmd(String cmd){
     // Normal: min 24-26, avg ~25, max <50. strb=255 + half harusnya 40ms
     // (12,5 Hz). Dipakai mendiagnosis "strobe master lambat": bandingkan
     // nilai strb aktual vs fader UI.
+    // v50.1: field diagnosis "delay/tidak teratur":
+    //   tickMax  = durasi tick dmxTask terlama (chase+scene) — tinggi berarti
+    //              menunggu dmxMutex (priority inversion / contention).
+    //   stutter  = jumlah frame dengan interval >50 ms (terlihat mata).
+    //   nvsFrz   = stutter yang bersamaan tulis flash NVS — >0 = bukti
+    //              auto-save membekukan frame (show-safe belum menutup semua
+    //              jalur; /save manual masih bisa jatuh saat show).
+    //   hwTrig   = total pesan play/stop dari task tombol diterima dmxTask.
+    // Reset window setiap DMXSTAT -> angka = sejak pembacaan terakhir.
     if(op=="DMXSTAT"){
       uint8_t sv=strobeWant;
       uint32_t half = 40 + (uint32_t)(255 - sv) * 1960 / 255;
+#if HW_DECK_ENABLE
+      uint32_t hwTrigVal = hwMsgSeq;      // pesan play/stop dari task tombol
+#else
+      uint32_t hwTrigVal = 0;
+#endif
       Serial.println(String("{\"frames\":"+String(dmxFrameCnt)
         +",\"min\":"+String(dmxFrameMin)
         +",\"avg\":"+String(dmxFrameAvg)
         +",\"max\":"+String(dmxFrameMax)
+        +",\"tickMax\":"+String(dmxMutexWaitMax)
+        +",\"stutter\":"+String(dmxStutterCnt)
+        +",\"nvsFrz\":"+String(dmxNvsFreezeCnt)
+        +",\"hwTrig\":"+String(hwTrigVal)
         +",\"strb\":"+String(sv)
         +",\"halfMs\":"+String(half)
         +",\"mast\":"+String(masterOut)
         +",\"chase\":"+(chaseOn?"true":"false")
         +",\"sceneOn\":"+(sceneOn?"true":"false")
+        +",\"showBusy\":"+(showBusy?"true":"false")
         +",\"artnet\":\""+String(artnetMode?"network":"local")+"\"}"));
+      dmxStatResetReq = true;     // dmxTask meng-nol-kan window di iterasi berikut
       return;
     }
 
@@ -4296,5 +4406,22 @@ void loop(){
   // AUTO-SAVE NVS (sisi server, safety-net): 60 detik setelah simpan terakhir,
   // bila masih ada perubahan (nvsDirty) -> persistAll(). Menutup kasus browser
   // ditutup sebelum timer client 60 s sempat mengirim /save.
-  if(nvsDirty && (millis()-lastSaveAt)>=60000) persistAll();
+  // v50.1 SHOW-SAFE: saat scene/chase/strobe sedang aktif, tulis flash
+  // DITUNDA sampai playback idle — setiap sektor yang ditulis membekukan
+  // cache instruksi kedua core beberapa ms (frame DMX telat sesaat tak
+  // peduli prioritas task). Saat playback berhenti, iterasi loop berikutnya
+  // otomatis memenuhi kondisi dan persist dijalankan.
+  if(nvsDirty && (millis()-lastSaveAt)>=60000){
+    if(showBusy){
+      if(!nvsSaveDeferred){
+        nvsSaveDeferred = true;
+        Serial.println("[nvs] auto-save DITUNDA (show aktif) — menunggu playback idle");
+      }
+    } else {
+      nvsSaveDeferred = false;
+      nvsWriting = true;            // penanda utk korelasi stutter (dmxTask)
+      persistAll();
+      nvsWriting = false;
+    }
+  }
 }

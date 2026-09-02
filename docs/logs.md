@@ -1,5 +1,49 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 66 - 2026-09-02 - v50.1: riset akar "delay + tidak teratur"
+
+### Analisis (berbasis bukti bisect + DMXSTAT user)
+Frame DMX terbukti 40 fps rapi saat gejala → "delay" bukan frame telat,
+tapi ISI frame melompat. Tiga mekanisme teridentifikasi:
+
+1. **RACE playback lintas-core**: `hwPlayScene` (task hwIn, Core 1) menulis
+   state playback (sceneOn/sceneIdx/sceneStep/sceneNextAt) TANPA mutex,
+   bersamaan `sceneTick` (dmxTask, Core 0) membaca field sama 40x/dtk.
+   Race fix v49.2 hanya mengatur urutan tulis — race tetap ada. Efek:
+   langkah ter-skip/terulang, ritme kacau = "tidak teratur".
+2. **PRIORITY INVERSION dmxMutex**: pemegang mutex di Core 1 (hwIn 12 /
+   loop 1) di-preempt WiFi (23) → dmxTask (18) menunggu → frame telat
+   sesaat. Sporadis — cocok gejala jangka panjang.
+3. **NVS WRITE FREEZE**: tulis flash membekukan cache instruksi KEDUA core
+   beberapa ms per sektor, tak peduli prioritas — auto-save 60 dtk =
+   stutter sporadis.
+
+### Fix v50.1 (deck tetap NONAKTIF default — fix untuk saat diaktifkan)
+1. **Message-passing hw → dmxTask**: task hwIn hanya `hwMsgSend()` (slot
+   pesan atomic, tanpa mutex/Serial/state). `hwMsgDispatchInDmxTask()`
+   dieksekusi dmxTask Core 0 di awal tiap iterasi — dmxTask kini
+   SATU-SATUNYA penulis state playback. Race & jalur inversion hilang
+   struktural. Encoder SW stop juga lewat pesan.
+2. **Instrumen DMXSTAT baru**: `tickMax` (durasi tick terlama = probe
+   tunggu mutex), `stutter` (frame >50 ms), `nvsFrz` (stutter saat tulis
+   flash), `hwTrig` (pesan hw diterima), `showBusy`. Window reset tiap
+   DMXSTAT (handshake `dmxStatResetReq`).
+3. **Show-safe NVS auto-save**: `showBusy` (ditulis dmxTask: sceneOn ||
+   chaseOn || strobe>0) dibaca loop(); auto-save DITUNDA sampai playback
+   idle. `/save` manual tetap bisa saat show (pilihan operator).
+
+### Validasi
+Brace-balance identik HEAD; pasangan #if/#endif 7 blok; semua simbol hw
+di dalam guard. Compile: user (Arduino IDE). Push: mengulang v49.5+v50
+yang gagal (DNS) + commit ini.
+
+### Uji yang diharapkan
+- Deck OFF (default): tidak berubah dari v50.
+- Deck ON (`HW_DECK_ENABLE 1`): tap tombol → scene play mulus; DMXSTAT
+  `tickMax` harus <10 ms, `stutter` ~0, `hwTrig` naik sesuai tekanan.
+- Saat stutter terjadi lagi: DMXSTAT 2x (jeda 10 dtk) → bandingkan
+  `stutter` vs `nvsFrz` vs `tickMax` → penyebab langsung terbaca.
+
 ## Session 65 - 2026-09-01 - v50: deck fisik dimatikan (HW_DECK_ENABLE 0)
 
 ### Konteks (lanjutan dari sesi terputus)
