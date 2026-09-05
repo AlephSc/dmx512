@@ -504,7 +504,8 @@ static uint32_t hwLockUntil[4] = {0};   // pin ter-lock noise sampai ms ini
 static uint32_t hwGTrigAt = 0;          // trigger global terakhir
 static uint8_t  hwGTrigCnt = 0;         // trigger global dalam window 10 dtk
 static uint32_t hwGLockUntil = 0;       // global lock sampai ms ini
-static volatile uint32_t sceneStartedAt = 0;  // v49.5: kapan scene mulai (restart guard)
+// (v49.5 sceneStartedAt dipakai di sini untuk restart guard, tapi deklarasinya
+//  ada di luar blok HW_DECK_ENABLE — dipakai juga jalur play HTTP/serial.)
 
 // tabel transisi quadrature: index = (last<<2)|now -> delta
 static const int8_t HW_ENC_TAB[16] = {
