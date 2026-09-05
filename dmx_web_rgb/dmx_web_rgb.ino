@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v50"
+#define BUILD_TAG "v51"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -433,14 +433,16 @@ void artnetTask(){
 }
 
 // ---------------------------------------------------------------
-// v50: INPUT FISIK (deck tombol/encoder) — DIMATIKAN via switch
-// compile-time. HW_DECK_ENABLE 0 = seluruh kode deck (pin, task "hwIn",
-// noise guard) dikompilasi KELUAR: pin tak dikonfigurasi, tak ada task
-// tambahan — kondisi eksekusi identik build BISECT-A_noHW yang teruji
-// NORMAL di rig user (bisect 2026-08-31: noHW = aman, noArtNet = lagging).
-// Seluruh kode v49.x tetap utuh di bawah; set 1 utk mengaktifkan lagi.
-// ---------------------------------------------------------------
-#define HW_DECK_ENABLE 0
+// v51: INPUT FISIK (deck tombol/encoder) — AKTIF via switch runtime.
+// HW_DECK_ENABLE 1 = kode deck dikompilasi MASUK (pin, task "hwIn" prio 12,
+// noise guard, message-passing v50.1). hwEnabled (bawah) = saklar runtime
+// default MATI tiap boot (perilaku boot identik v50 OFF/normal); operator
+// menyalakan via switch WebUI / desktop (GET /hw?on=1) atau serial HWON.
+// Matikan kapan saja via switch (GET /hw?off=1) atau serial HWOFF.
+// Riwayat: v50 mematikan total via compile (HW_DECK_ENABLE 0) karena lagging;
+// v50.1 memperbaiki akar struktural (message-passing); v51 mengembalikan
+// deck dengan default-OFF yang aman + switch di kedua client.
+#define HW_DECK_ENABLE 1
 
 // v49.5: kapan scene mulai (restart guard tombol hw). DIPAKAI JUGA jalur
 // play HTTP/serial — deklarasinya harus di luar switch HW_DECK_ENABLE.
@@ -486,9 +488,13 @@ static volatile int16_t hwEncCount = 0;        // total detent (state JSON)
 //   1) RATE LIMIT: hwPlayScene dari tombol maks 1x per 300 ms.
 //   2) NOISE LOCKOUT: >3 trigger dalam 10 dtk dari pin sama = pin di-lock
 //      30 dtk + log Serial — operator melihat pin mana yang bermasalah.
-//   3) KILL SWITCH: serial "HWOFF"/"HWON" + tombol WebUI (hwEnable=false
-//      = deck fisik nonaktif total; rig aman sebelum perbaikan wiring).
-static volatile bool hwEnabled = true;
+//   3) KILL SWITCH: serial "HWOFF"/"HWON" + switch WebUI/desktop
+//      (GET /hw?on=1|off=1) — hwEnabled=false = deck fisik nonaktif total;
+//      rig aman sebelum perbaikan wiring. v51: default MATI tiap boot
+//      (boot = perilaku v50 OFF yang teruji normal; operator ON-kan bila
+//      tombol dibutuhkan). Ephemeral (tidak disimpan NVS) seperti artnetMode.
+//      hwInputTask() memeriksa flag ini di awal tiap polling 5 ms.
+static volatile bool hwEnabled = false;
 static uint32_t hwLastPlayAt = 0;
 static uint32_t hwTrigAt[4] = {0};      // timestamp trigger terakhir per pin
 static uint8_t  hwTrigCnt[4] = {0};     // jumlah trigger dalam window 10 dtk
@@ -2230,7 +2236,10 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button class="btn-go" id="btnSPlay" title="Cek scene terpilih">&#9654; Cek</button>
     </div></div>
     <p class="state-line" id="sinfo">pilih scene (S1-S20), lalu EDIT utk merangkai preset</p>
-    <p class="state-line" id="hwDeck" style="color:#546e7a">DECK FISIK: NONAKTIF di build ini (HW_DECK_ENABLE=0 — penyebab lagging; lihat docs/logs.md)</p>
+    <div class="bankhead"><div class="ctrlgroup">
+      <button class="editmode" id="btnHw">TOMBOL FISIK: OFF</button>
+      <span class="state-line" id="hwDeck" style="margin:0">deck mati — tap tombol tidak berpengaruh</span>
+    </div></div>
     <div class="bank" id="sbank"></div>
     <div class="steps" id="steps"></div>
     <p class="sub">durasi tiap langkah = Hold preset masing-masing</p>
@@ -2670,6 +2679,25 @@ $('btnArtnet').addEventListener('click',()=>{
   artnetMode=!artnetMode; applyArtnetBtn();
   api('/artnet?mode='+(artnetMode?'network':'local')).catch(e=>showError(e.message));
 });
+// v51: switch deck tombol fisik — default MATI tiap boot (perilaku v50 OFF).
+// ON = tap/hold B1-B4 + encoder memainkan scene; OFF = tap diabaikan.
+// Ephemeral: tidak disimpan NVS; state ikut polling/WS field "hw".
+let hwOn=false;
+function applyHwBtn(){
+  const b=$('btnHw'); if(!b) return;
+  b.textContent='TOMBOL FISIK: '+(hwOn?'ON':'OFF');
+  b.classList.toggle('on',hwOn);
+  const el=$('hwDeck'); if(!el) return;
+  if(!hwOn){ el.textContent='deck mati — tap tombol tidak berpengaruh'; return; }
+}
+$('btnHw').addEventListener('click',()=>{
+  const want=!hwOn;
+  api(want?'/hw?on=1':'/hw?off=1').then(j=>{
+    if(j&&j.hw!==undefined){ hwOn=!!j.hw; }
+    else { hwOn=want; }
+    applyHwBtn();
+  }).catch(e=>showError(e.message));
+});
 // Aman perangkat: "Penuh" hanya untuk PAR (dimmer+RGB); moving/fog/strobe tetap 0.
 $('btnWhite').addEventListener('click',()=>{allKeys.forEach(k=>{const fi=+k.split('_')[0];sliders[k].value=(FIX[fi].type===0)?255:0;});paintAll();pushLive({t:'all',v:1},'all=on');});
 $('btnOff').addEventListener('click',()=>{allKeys.forEach(k=>sliders[k].value=0);paintAll();pushLive({t:'all',v:0},'all=off');});
@@ -2874,13 +2902,19 @@ function syncFromServer(j, skipActive){
   });
   if(j.chaseOn!==undefined && j.chaseOn!==chaseOn){ chaseOn=j.chaseOn; applyChaseBtn(); }
   if(j.artnet!==undefined){ const an=(j.artnet==='network'); if(an!==artnetMode){ artnetMode=an; applyArtnetBtn(); } }   // v49
-  // v49: deck fisik — indikator grup + tombol di panel scene
+  // v51: switch deck tombol fisik — state "hw" dari server adalah otoritas
+  // (sinkron dua arah: switch di client lain / serial HWON/HWOFF ikut tampil).
+  if(j.hw!==undefined){ const hon=!!j.hw; if(hon!==hwOn){ hwOn=hon; applyHwBtn(); } }
+  // v49: deck fisik — indikator grup + tombol di panel scene (hanya saat ON)
   if(j.hwBank!==undefined){
     const el=$('hwDeck'); if(el){
-      const g=Math.floor(j.hwBank/4)+1;
-      el.textContent='DECK FISIK \u00b7 GRUP '+g+': scene '+(j.hwBank+1)+'-'+Math.min(j.hwBank+4,NSCN)+
-        ' \u00b7 [tap=play \u00b7 hold B4=grup berikut \u00b7 hold B1=grup sebelum] \u00b7 '+
-        ((j.hwB||[]).map(b=>b?'#':'-').join(''));
+      if(!hwOn){ el.textContent='deck mati — tap tombol tidak berpengaruh'; }
+      else {
+        const g=Math.floor(j.hwBank/4)+1;
+        el.textContent='GRUP '+g+': scene '+(j.hwBank+1)+'-'+Math.min(j.hwBank+4,NSCN)+
+          ' \u00b7 [tap=play \u00b7 hold B4=grup berikut \u00b7 hold B1=grup sebelum] \u00b7 '+
+          ((j.hwB||[]).map(b=>b?'#':'-').join(''));
+      }
     }
   }
   if(j.sceneOn!==undefined && j.sceneOn!==sceneOn){ sceneOn=j.sceneOn; applySceneBtn(); if(!sceneOn) renderSteps(); }
@@ -3477,6 +3511,39 @@ void onArtnet(){
   j+=",\"lastAt\":"+String(artnetLastAt);
   j+=",\"pkt\":"+String(artnetPktCount)+"}";
   server.send(200,"application/json",j);
+}
+// ---------------------------------------------------------------
+// v51: Deck tombol fisik — GET /hw?on=1 | /hw?off=1 | /hw (status).
+// Saklar runtime hwEnabled (default MATI tiap boot = perilaku v50 OFF).
+// Ephemeral seperti artnetMode (tidak disimpan NVS). Paritas serial
+// HWOFF/HWON. Saat dimatikan, playback yang jalan ikut dihentikan agar
+// rig tidak menggantung di scene yang dipicu tombol.
+// Bila dikompilasi tanpa deck (HW_DECK_ENABLE 0): jawab hw_disabled
+// eksplisit supaya operator tahu ini bukan bug.
+// ---------------------------------------------------------------
+void onHw(){
+#if HW_DECK_ENABLE
+  if(server.hasArg("on") || server.hasArg("off") || server.hasArg("enable")){
+    bool want = server.hasArg("on") ? (server.arg("on")!="0")
+              : server.hasArg("enable") ? (server.arg("enable")!="0" && server.arg("enable")!="off")
+              : false;
+    if(server.hasArg("off")) want = false;
+    hwEnabled = want;
+    if(!hwEnabled){
+      sceneOn=false; sceneIdx=-1; sceneStep=-1; sceneNextAt=0;
+      chaseOn=false; chaseIdx=-1;
+    }
+    stateRevision++;
+    Serial.println(String("HW deck: ")+(hwEnabled?"ON (tombol aktif)":"OFF (tombol nonaktif)"));
+    server.send(200,"application/json",
+      String("{\"ok\":true,\"hw\":")+(hwEnabled?"true":"false")+"}");
+    return;
+  }
+  server.send(200,"application/json",
+    String("{\"ok\":true,\"hw\":")+(hwEnabled?"true":"false")+"}");
+#else
+  sendApiError(409,"hw_disabled","Deck fisik tidak dikompilasi (HW_DECK_ENABLE=0)");
+#endif
 }
 // GET /psetfade?n=X&f=&h= -> ubah fade/hold preset X tanpa merekam ulang
 void onPresetFade(){
@@ -4322,7 +4389,8 @@ void setup(){
    server.on("/groups",HTTP_GET, onGroupsGet);   // v40: metadata grup fader (paritas LISTG serial)
   server.on("/ctypes", HTTP_GET,  onCtypesGet); // v48: daftar custom type
   server.on("/ctypes", HTTP_POST, onCtypesPost);// v48: commit custom type
-  server.on("/artnet", HTTP_GET,  onArtnet);   // v49: mode Art-Net input
+   server.on("/artnet", HTTP_GET,  onArtnet);   // v49: mode Art-Net input
+   server.on("/hw",     HTTP_GET,  onHw);       // v51: switch deck tombol fisik
   server.on("/wifistat",HTTP_GET, onWifiStat);   // v43: status koneksi WiFi
   server.on("/wifiset", HTTP_POST, onWifiSet);   // v43: simpan kredensial + reconnect
   server.on("/wifiset", HTTP_GET, onWifiSet);    // kompatibilitas desktop v44

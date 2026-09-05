@@ -233,10 +233,14 @@ class HttpTransport(QObject):
             self.error_occurred.emit(f"Perintah tidak didukung via WiFi: {cmd}")
             return None
         last = None
-        for method, path in steps:
+        for step in steps:
+            method, path = step[0], step[1]
+            body = step[2] if len(step) > 2 else None
+            headers = step[3] if len(step) > 3 else None
             try:
-                status, body = self._http(method, path, timeout=timeout)
-                last = json.loads(body.decode())
+                status, rbody = self._http(method, path, timeout=timeout,
+                                           body=body, headers=headers)
+                last = json.loads(rbody.decode())
             except Exception as e:  # noqa: BLE001
                 self.error_occurred.emit(f"HTTP {path}: {e}")
                 return None
@@ -252,9 +256,11 @@ class HttpTransport(QObject):
             return
 
         def _fire():
-            for method, path in steps:
+            for step in steps:
                 try:
-                    self._http(method, path, timeout=2.5)
+                    self._http(step[0], step[1], timeout=2.5,
+                               body=(step[2] if len(step) > 2 else None),
+                               headers=(step[3] if len(step) > 3 else None))
                 except Exception:  # noqa: BLE001
                     return   # kontrol sesaat gagal = tidak fatal; state sync menyusul
 
@@ -269,6 +275,7 @@ class HttpTransport(QObject):
         if op == "LISTG": return [("GET", "/groups")]
         if op == "LISTP": return [("GET", "/presets")]
         if op == "LISTS": return [("GET", "/scenes")]
+        if op == "LISTCT": return [("GET", "/ctypes")]   # v48: custom type list
         if op == "EXPORT": return [("GET", "/export")]
         if op == "SAVE": return [("POST", "/save")]
         if op == "LOAD": return [("GET", "/loaddata")]
@@ -295,6 +302,27 @@ class HttpTransport(QObject):
             rest = cmd.split(" ", 2)
             pw = urllib.parse.quote(rest[2]) if len(rest) > 2 else ""
             return [("GET", f"/wifiset?ssid={ssid}&pass={pw}")]
+        # v50 desktop parity: Art-Net mode & custom type commit (serial
+        # commands ada sejak v48/v49; endpoint web setara kini dipakai).
+        if op == "ARTNET":
+            mode = "network" if (len(parts) > 1 and parts[1].lower() in ("network", "on")) else "local"
+            return [("GET", f"/artnet?mode={mode}")]
+        if op == "ARTSTAT": return [("GET", "/artnet")]
+        # v51: switch deck tombol fisik — paritas serial HWOFF/HWON dan
+        # endpoint web GET /hw. HWSTAT = status saja.
+        if op == "HWON": return [("GET", "/hw?on=1")]
+        if op == "HWOFF": return [("GET", "/hw?off=1")]
+        if op == "HWSTAT": return [("GET", "/hw")]
+        if op == "CTSET":
+            # CTSET <json> -> POST /ctypes {"types":[...]} (body JSON asli)
+            body = cmd.split(" ", 1)[1] if " " in cmd else ""
+            return [("POST", "/ctypes", body.encode("utf-8"),
+                     {"Content-Type": "application/json"})]
+        if op == "FIXSET":
+            # FIXSET <json> -> POST /fixes {"count":..,"fixtures":[...]}
+            body = cmd.split(" ", 1)[1] if " " in cmd else "{}"
+            return [("POST", "/fixes", body.encode("utf-8"),
+                     {"Content-Type": "application/json"})]
         return None
 
     # ---- import file via HTTP multipart POST ---------------------------

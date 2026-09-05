@@ -78,9 +78,26 @@ class MixerTab(QWidget):
         self.b_chase = QPushButton("CHASE OFF")
         self.b_chase.setCheckable(True)
         self.b_chase.clicked.connect(self._on_chase)
+        # v50 desktop parity: toggle Art-Net LOCAL <-> NETWORK (serial ARTNET /
+        # web /artnet?mode=). Mode aktif ikut state GET ("artnet" field).
+        self.b_artnet = QPushButton("Art-Net: LOCAL")
+        self.b_artnet.setCheckable(True)
+        self.b_artnet.setToolTip("NETWORK: ESP32 mendengar ArtDmx UDP 6454 dan "
+                                 "menimpa output DMX (input jaringan).")
+        self.b_artnet.clicked.connect(self._on_artnet)
+        # v51: switch deck tombol fisik (serial HWON/HWOFF / web /hw?on|off).
+        # Default MATI tiap boot (perilaku v50 OFF); mode aktif ikut state
+        # GET (field "hw") seperti toggle Art-Net di atas.
+        self.b_hw = QPushButton("Tombol Fisik: OFF")
+        self.b_hw.setCheckable(True)
+        self.b_hw.setToolTip("ON: tap/hold B1-B4 + encoder memainkan scene. "
+                             "OFF: tap tombol diabaikan (aman saat show).")
+        self.b_hw.clicked.connect(self._on_hw)
         side.addWidget(self.b_black)
         side.addWidget(self.b_allon)
         side.addWidget(self.b_chase)
+        side.addWidget(self.b_artnet)
+        side.addWidget(self.b_hw)
         side.addStretch(1)
         top.addLayout(side)
         top.addStretch(1)
@@ -98,6 +115,14 @@ class MixerTab(QWidget):
     def _on_chase(self, on):
         self.b_chase.setText("CHASE ON" if on else "CHASE OFF")
         self.cmd.emit("CHASE on" if on else "CHASE off")
+
+    def _on_artnet(self, on):
+        self.b_artnet.setText("Art-Net: NETWORK" if on else "Art-Net: LOCAL")
+        self.cmd.emit("ARTNET network" if on else "ARTNET local")
+
+    def _on_hw(self, on):
+        self.b_hw.setText("Tombol Fisik: ON" if on else "Tombol Fisik: OFF")
+        self.cmd.emit("HWON" if on else "HWOFF")
 
     # ---- data masuk dari ESP32 ---------------------------------------------
     def build_groups(self, groups):
@@ -367,6 +392,20 @@ class MixerTab(QWidget):
             if self.b_chase.isChecked() != on:
                 self.b_chase.setChecked(on)
                 self.b_chase.setText("CHASE ON" if on else "CHASE OFF")
+        # v50: mode Art-Net dari state GET ("artnet": "local"/"network")
+        if "artnet" in j:
+            an = j["artnet"] == "network"
+            if self.b_artnet.isChecked() != an:
+                self.b_artnet.setChecked(an)
+                self.b_artnet.setText("Art-Net: NETWORK" if an else "Art-Net: LOCAL")
+        # v51: switch deck tombol fisik dari state GET ("hw": true/false).
+        # Otoritas = server, jadi switch di WebUI / serial HWON/HWOFF ikut
+        # tampil di sini dan sebaliknya.
+        if "hw" in j:
+            hon = bool(j["hw"])
+            if self.b_hw.isChecked() != hon:
+                self.b_hw.setChecked(hon)
+                self.b_hw.setText("Tombol Fisik: ON" if hon else "Tombol Fisik: OFF")
         cur = j.get("cur", {})
         # Fader grup: hanya di-set bila SEMUA member seragam. Kalau member
         # berbeda (satu fixture digeser manual), posisi fader grup dibiarkan

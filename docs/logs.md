@@ -1,5 +1,37 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 67 - 2026-09-05 - v51: switch On/Off tombol fisik di WebUI + desktop
+
+### Permintaan
+Toggle On/Off deck tombol fisik dari kedua client (web + desktop app).
+
+### Implementasi
+1. **Firmware**: `HW_DECK_ENABLE` 0 → 1 (kode deck kembali masuk, dengan
+   fix struktural v50.1 message-passing). `hwEnabled` default `true` →
+   `false` = MATI tiap boot (boot identik perilaku v50 OFF yang teruji
+   normal; operator ON-kan bila tombol dibutuhkan). Ephemeral seperti
+   `artnetMode` (tidak disimpan NVS).
+2. **Endpoint baru** `GET /hw`: `?on=1` / `?off=1` / `?enable=1|0` untuk
+   ubah, tanpa arg untuk status. `{"ok":true,"hw":true|false}`. OFF juga
+   menghentikan playback yang jalan. Paritas serial HWOFF/HWON (sudah ada).
+3. **WebUI**: baris `hwDeck` statis → tombol switch `btnHw`
+   (TOMBOL FISIK: ON/OFF) + teks status grup. State `hwOn`, `applyHwBtn()`,
+   sinkron dua arah dari field `hw` di `/cur`/WS (switch client lain atau
+   serial ikut tampil).
+4. **Desktop**: tombol checkable "Tombol Fisik: ON/OFF" di tab Mixer
+   (sebelah Art-Net), emit `HWON`/`HWOFF`; `transport.py` memetakan ke
+   `GET /hw?on=1|off=1` via WiFi (serial langsung HWOFF/HWON); `apply_state`
+   sinkron dari field `hw` polling GET. Menunggu ACK (bukan fire-and-forget).
+5. `BUILD_TAG` v50 → **v51**.
+
+### Validasi
+- `py_compile` 6 file desktop: PASS. `git diff --check`: bersih.
+- Firmware tidak di-build di sini (aturan proyek) — compile via Arduino IDE,
+  Serial harus tampil `=== DMX Web Console v51 ===`, hard-refresh browser.
+- File desktop lain yang sudah termodifikasi sebelum sesi ini (main.py,
+  patch_tab.py, system_tab.py, worker.py, README, ses_fbe6.md) TIDAK
+  disentuh — commit hanya 3 file sesi ini + logs.md.
+
 ## Session 66 - 2026-09-02 - v50.1: riset akar "delay + tidak teratur"
 
 ### Analisis (berbasis bukti bisect + DMXSTAT user)
