@@ -1,5 +1,47 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 68 - 2026-09-06 - v51.1: fix "scene berubah warna sendiri" (scene 11 putih → merah)
+
+### Permintaan
+Saat klik scene no 11, warna tampil beda dari yang disimpan (disimpan putih,
+tampil merah). Fatal untuk show.
+
+### Akar masalah (code audit, dmx_web_rgb.ino)
+Scene menyimpan REFERENSI nomor preset (COW v46). Tiga lubang proteksi:
+1. **importJson() (web)**: bila `cowShadowPreset()` gagal (COW_FULL / slot
+   bayangan habis), slot YANG MASIH DIRUJUK scene tetap ditimpa (`memcpy`
+   tanpa `continue`) → data scene rusak senyap.
+2. **IMPORT_END (serial, dipakai desktop via USB)**: TIDAK ada proteksi COW
+   sama sekali — import langsung menimpa `presets[i]`.
+3. **REKAM gagal (507 shadow_full)**: toast hilang cepat + bank tidak
+   di-refresh → operator yakin rekaman sukses, padahal data slot masih lama;
+   scene memainkan warna lama.
+
+### Implementasi (semua di dmx_web_rgb.ino, BUILD_TAG v51 → v51.1)
+1. `importJson()`: slot yang COW-nya gagal DILEWATI (`continue`) — data scene
+   diutamakan, slot bank tidak berubah.
+2. `IMPORT_END` serial: proteksi COW paritas web; slot gagal dilewati,
+   response `{"ok":true,"warn":"shadow_full","skipped":N}`; `sceneRev++`.
+3. WebUI onPad REKAM: gagal → `alert()` jelas + `refreshPresets()` + tetap di
+   mode REKAM; sukses → keluar REKAM seperti semula.
+4. Langkah scene kini tampil SWATCH WARNA preset dirujuk (+ CSS `.ssw`);
+   `refreshPresets()` ikut memanggil `renderSteps()` — mismatch data scene vs
+   bank terlihat saat EDIT, bukan saat show.
+5. Handler baru **`SCANCOW`** (serial): audit integritas scene↔preset —
+   `refTotal/hidden/shadow/free/orphan`. `free` kecil = dekat shadow_full
+   (cek sebelum show); `orphan>0` = indikator bocor slot bayangan (bug COW
+   lama / data v45), tidak berbahaya tapi memakan slot. Aman saat playback
+   (read-only di bawah mutex).
+6. Guard **`SPLAY` serial**: validasi playable (paritas HTTP/hw) — scene
+   kosong tidak bisa di-ON-kan senyap via desktop.
+
+### Validasi
+- `git diff --check` bersih. Firmware tidak di-build di sini (aturan proyek) —
+  compile via Arduino IDE, Serial harus tampil `=== DMX Web Console v51.1 ===`,
+  hard-refresh browser (HTML embed berubah).
+- Test re-produksi: rekam preset A (merah) → masukkan ke scene → rekam ulang
+  slot dengan putih via REKAM → play scene → warna konsisten dengan swatch.
+
 ## Session 67 - 2026-09-05 - v51: switch On/Off tombol fisik di WebUI + desktop
 
 ### Permintaan

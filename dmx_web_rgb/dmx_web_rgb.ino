@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v51"
+#define BUILD_TAG "v51.1"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -1602,8 +1602,12 @@ bool importJson(const String& s){
     // terlindungi. Catatan: file export menyimpan SEMUA slot (incl.
     // tersembunyi), jadi scene di device tujuan biasanya sudah tercakup;
     // proteksi ini untuk file yang datanya berbeda dari scene lokal.
+    // v51.1 FIX "scene berubah warna sendiri": COW gagal (slot bayangan habis)
+    // dulu hanya dicatat lalu slot TETAP ditimpa -> data scene rusak senyap.
+    // Sekarang slot yang gagal diproteksi DILEWATI (data scene diutamakan,
+    // preset bank untuk slot itu tidak berubah — lebih aman daripada rusak).
     if(presetSceneRefCount(i)>0){
-      if(cowShadowPreset(i)==COW_FULL) shadowFailed=true;
+      if(cowShadowPreset(i)==COW_FULL){ shadowFailed=true; continue; }
     }
     memcpy(presets[i],tmp[i],PRESET_CHUNK);
   }
@@ -2069,6 +2073,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
         color:var(--muted);font-size:12px;display:flex;align-items:center;justify-content:center;
         font-variant-numeric:tabular-nums}
   .step.fill{color:var(--accent);border-color:var(--accent)}
+  .step .ssw{width:10px;height:7px;border-radius:2px;display:inline-block;margin-right:4px;vertical-align:middle;border:1px solid rgba(255,255,255,.2)}
   #masterPanel{grid-column:2;grid-row:2}
   #scenePanel{grid-column:1;grid-row:2}
   #presetPanel{grid-column:1;grid-row:3}
@@ -2760,7 +2765,14 @@ function renderSteps(){
   for(let k=0;k<NSTEPS;k++){
     const c=document.createElement('div'); c.className='step';
     const v=arr?arr[k]:0;
-    if(v>0){ c.textContent=v; c.classList.add('fill'); } else { c.textContent='\u00b7'; }
+    if(v>0){
+      // v51.1: swatch warna preset dirujuk — mismatch data scene vs bank
+      // langsung terlihat saat EDIT (bukan saat show jalan).
+      const p=presetsData[v-1];
+      if(p&&p.used){ const sw=document.createElement('span'); sw.className='ssw'; sw.style.background=rgbStr(p); c.appendChild(sw); }
+      const tx=document.createElement('span'); tx.textContent=v; c.appendChild(tx);
+      c.classList.add('fill');
+    } else { c.textContent='\u00b7'; }
     box.appendChild(c);
   }
   const info=$('sinfo');
@@ -2806,11 +2818,22 @@ function onPad(i){
     api('/pclear?n='+(i+1)).then(()=>refreshPresets()).catch(e=>showError(e.message));
     exitDelMode();
   } else if(editMode){
+    // v51.1: gagal rekam (shadow_full 507) wajib terlihat jelas — toast lama
+    // hilang cepat + bank tak di-refresh -> operator yakin rekaman sukses,
+    // padahal data slot masih lama (scene nanti main warna lama = "warna error").
     api('/psave?n='+(i+1)+(ignoreDimmer?'&idim=1':'')+'&f='+pfade+'&h='+phold)
-      .then(()=>{ refreshPresets(); toast('Tersimpan ke preset #'+(i+1)); })
-      .catch(e=>showError(e.message));
-    selPreset=i; updateBankSel(); updatePinfo();     // hasil rekam langsung terpilih & terlihat
-    editMode=false;$('btnEdit').classList.remove('on');$('btnEdit').textContent='REKAM OFF';
+      .then(()=>{
+        refreshPresets(); toast('Tersimpan ke preset #'+(i+1));
+        selPreset=i; updateBankSel(); updatePinfo();
+        editMode=false;$('btnEdit').classList.remove('on');$('btnEdit').textContent='REKAM OFF';
+      })
+      .catch(e=>{
+        showError(e.message);
+        alert('GAGAL REKAM preset #'+(i+1)+': '+e.message+
+              '\n\nSlot preset habis untuk melindungi scene. Kosongkan scene/preset lain dulu, lalu ulangi REKAM.');
+        refreshPresets();
+        // tetap di mode REKAM — data belum pasti masuk
+      });
   }else{
     const p=presetsData[i];
     if(!p.used)return;
@@ -2826,7 +2849,7 @@ function onPad(i){
 function exitDelMode(){delMode=false;$('btnDel').classList.remove('on');$('btnDel').textContent='HAPUS OFF';$('bank').classList.remove('deleting');}
 function refreshPresets(){
   api('/presets').then(j=>{
-    presetsData=j; renderBank();
+    presetsData=j; renderBank(); renderSteps();   // v51.1: renderSteps ikut — swatch langkah scene memakai warna preset
     // Setelah data preset masuk, pulihkan Fade/Hold dari preset yang sedang terpilih
     applyFadeOfSelected();
   }).catch(e=>showError(e.message));
@@ -3806,6 +3829,17 @@ void handleSerialCmd(String cmd){
   if(op=="SPLAY"){                    // mulai scene
     int s=args.toInt()-1;
     if(s>=0&&s<N_SCENES){
+      // v51.1: validasi playable — paritas onSPlay HTTP/hwMsgDispatch. Tanpa ini
+      // serial bisa meng-ON-kan scene kosong (sceneOn=true lalu diam; bug kecil
+      // tapi state playback bohong di semua client).
+      bool playable=false;
+      xSemaphoreTake(dmxMutex,portMAX_DELAY);
+      for(int k=0;k<SCENE_STEPS;k++){
+        uint8_t p=scenes[s][k];
+        if(p>=1 && p<=N_PRESETS){ playable=true; break; }
+      }
+      xSemaphoreGive(dmxMutex);
+      if(!playable){ sceneError=1; Serial.println("{\"ok\":false,\"err\":\"scene_no_valid_presets\"}"); return; }
       // v49.2 race fix: state dulu, sceneOn terakhir (lihat hwPlayScene)
       Serial.printf("[scene] play ser #%d\n", s+1);
       sceneIdx=s; sceneStep=-1; sceneError=0;
@@ -4052,6 +4086,47 @@ void handleSerialCmd(String cmd){
       return;
     }
 
+    // v51.1: SCANCOW -> audit integritas hubungan scene<->preset (self-check).
+    // Menjawab kekhawatiran "scene berubah warna sendiri" dengan ANGKA:
+    //   refTotal = total langkah scene yang merujuk preset (sanity volume).
+    //   hidden   = langkah yang merujuk slot bayangan (used=0) — sah by design
+    //              (COW v46), tapi operator perlu tahu bebannya.
+    //   shadow   = jumlah slot bayangan terpakai dari 30 slot (kapasitas COW).
+    //   free     = slot benar-benar kosong = ruang COW tersisa. Makin kecil
+    //              makin dekat ke kondisi shadow_full (507) — cek SEBELUM show.
+    //   orphan   = BUG indicator: slot bayangan yang TIDAK dirujuk scene mana
+    //              pun (bocor — seharusnya tak pernah >0; kalau >0, data v45
+    //              lama atau bug COW sebelumnya). Tidak berbahaya, hanya
+    //              memakan slot.
+    // Jalankan kapan pun (aman saat playback — hanya baca, di bawah mutex).
+    if(op=="SCANCOW"){
+      xSemaphoreTake(dmxMutex,portMAX_DELAY);
+      int refTotal=0, hidden=0, shadow=0, free_=0, orphan=0;
+      static uint8_t refcnt[N_PRESETS];
+      memset(refcnt,0,sizeof(refcnt));
+      for(int s=0;s<N_SCENES;s++)
+        for(int k=0;k<SCENE_STEPS;k++){
+          uint8_t p=scenes[s][k];
+          if(p>=1 && p<=N_PRESETS){
+            refTotal++;
+            refcnt[p-1]++;
+            if(!presets[p-1][0]) hidden++;
+          }
+        }
+      for(int i=0;i<N_PRESETS;i++){
+        if(presets[i][0]) continue;              // slot visible: bukan urusan COW
+        if(refcnt[i]>0) shadow++;                // slot bayangan terpakai
+        else { orphan++; free_++; }              // kosong murni = bocor / ruang COW
+      }
+      xSemaphoreGive(dmxMutex);
+      Serial.println(String("{\"refTotal\":"+String(refTotal)
+        +",\"hidden\":"+String(hidden)
+        +",\"shadow\":"+String(shadow)
+        +",\"free\":"+String(free_)
+        +",\"orphan\":"+String(orphan)+"}"));
+      return;
+    }
+
     // CHASE on/off -> toggle chase
     if(op=="CHASE"){
      // v49.4 race fix: state dulu, chaseOn terakhir (paritas onChase)
@@ -4247,17 +4322,32 @@ void handleSerialCmd(String cmd){
      int found=0;
      for(int i=0;i<N_PRESETS;i++) if(serImportProvided[i]) found++;
      if(found==0){ Serial.println("{\"ok\":false,\"err\":\"tidak ada preset\"}"); return; }
-     // Commit: timpa HANYA baris yang dikirim (sisanya tidak disentuh),
-     // sama persis dengan semantik importJson() di web.
-     xSemaphoreTake(dmxMutex,portMAX_DELAY);
-     for(int i=0;i<N_PRESETS;i++)
-       if(serImportProvided[i]) memcpy(presets[i],serImport[i],PRESET_CHUNK);
-     xSemaphoreGive(dmxMutex);
-     serImportActive=false;
-     markStateChanged();
-     persistAll();
-     Serial.println("{\"ok\":true}");
-     return;
+      // Commit: timpa HANYA baris yang dikirim (sisanya tidak disentuh),
+      // sama persis dengan semantik importJson() di web.
+      // v51.1 FIX "scene berubah warna sendiri": jalur serial (desktop app
+      // via USB) TIDAK punya proteksi COW sama sekali — import menimpa preset
+      // yang dirujuk scene -> scene berubah warna. Sekarang: salin data lama
+      // ke slot bayangan dulu (COW), slot yang gagal (bayangan habis) dilewati.
+      xSemaphoreTake(dmxMutex,portMAX_DELAY);
+      int cowSkipped=0;
+      for(int i=0;i<N_PRESETS;i++){
+        if(!serImportProvided[i]) continue;
+        if(presetSceneRefCount(i)>0){
+          if(cowShadowPreset(i)==COW_FULL){ cowSkipped++; continue; }
+        }
+        memcpy(presets[i],serImport[i],PRESET_CHUNK);
+      }
+      xSemaphoreGive(dmxMutex);
+      serImportActive=false;
+      if(cowSkipped>0) sceneRev++;
+      markStateChanged();
+      persistAll();
+      if(cowSkipped>0){
+        Serial.print("{\"ok\":true,\"warn\":\"shadow_full\",\"skipped\":");
+        Serial.print(cowSkipped);
+        Serial.println("}");
+      } else Serial.println("{\"ok\":true}");
+      return;
    }
 
    // --- End parity commands ---
