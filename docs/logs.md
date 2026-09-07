@@ -1,5 +1,42 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 70 - 2026-09-07 - v51.3: floor durasi langkah 25ms — fader speed jujur di ekstrem
+
+### Permintaan
+User: bisakah fader speed membuat output melebihi kecepatan DMX / apakah
+melebihi kecepatan transmit kabel berdampak? Frame akan menumpuk (stack)?
+
+### Analisis (jawab kekhawatiran, bukan langsung kode)
+- Laju frame DMX dikunci `vTaskDelayUntil(25ms)` di dmxTask — TIDAK dipengaruhi
+  speedMul. Speed hanya memperpendek durasi TAHAN langkah (isi frame), bukan
+  laju transmisi. Standar USITT/ESTA 250kbps / 512ch ≈ 22,5ms + break = 40 fps
+  maks — tidak mungkin terlampaui. Kabel/fixture tidak bisa "kecepatan
+  berlebih" oleh fader speed.
+- Frame TIDAK menumpuk: dmxTask = loop perioda tetap, satu frame per tick
+  sinkron, tanpa antrean. Tick telat (NVS dsb) tak menciptakan utang —
+  stutter tunggal terukur DMXSTAT, tak terakumulasi. Latensi pergantian
+  langkah = ≤1 frame (25ms) + fade.
+- Satu ketidakjujuran fader tersisa: speed ×5 + hold 100ms → langkah diminta
+ 20ms < tick 25ms → self-limit, dan deadline di antara tick bisa buat langkah
+  efektif 2 tick (50ms, jitter).
+
+### Implementasi (dmx_web_rgb.ino, v51.2 → v51.3)
+1. `stepFloor()` helper (dekat clampSpeed): floor durasi langkah = 25ms =
+   1 periode frame.
+2. `sceneTick`/`chaseTick`: `nextAt = now + stepFloor(ms/clampSpeed(speedMul))`
+   — fader jujur (tak ada nilai speed yang diam-diam tak tercapai), jitter
+   25→50ms hilang.
+3. `applyPresetToWant`: floor `effDur` 20→25ms — fade minimal satu frame utuh
+   (fade 20ms tetap snap oleh `fadeMs<=20` di fadeTick; 25 lebih ketat).
+
+### Validasi
+- `git diff --check` bersih. Compile via Arduino IDE (aturan proyek); Serial
+  harus tampil `=== DMX Web Console v51.3 ===`.
+- Scene hold 100ms + speed ×5 → langkah tiap 25ms tepat, tanpa jitter.
+  `DMXSTAT`: min 24-26 / avg ~25 / max <50 (bukti laju frame tak berubah).
+- Regresi: speed ×5 + hold 100ms + fade 600ms → fade clamp 25ms (snap),
+  tiap langkah warna penuh (fix blink v51.2 tetap).
+
 ## Session 69 - 2026-09-07 - v51.2: fader Speed (0.1–5x) + fix blink/tercampur antar langkah scene
 
 ### Permintaan

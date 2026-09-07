@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v51.2"
+#define BUILD_TAG "v51.3"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -281,6 +281,11 @@ static volatile bool chaseOn = false; static volatile uint32_t chaseMs = 1500; s
 // ikut (aliasing vs sampling internal lampu, lihat catatan strobe v49).
 static volatile float speedMul = 1.0f;
 static inline float clampSpeed(float v){ return (v<0.1f)?0.1f:((v>5.0f)?5.0f:v); }
+// v51.3: floor durasi langkah = 1 periode frame DMX (25ms). Speed ekstrem
+// dgn hold pendek tidak "berbohong" — langkah tidak pernah diminta lebih
+// cepat dari tick dmxTask (self-limit sebelumnya; kini eksplisit & jujur).
+// Juga menghapus jitter 25->50ms saat deadline jatuh di antara tick.
+static inline uint32_t stepFloor(uint32_t ms){ return (ms<25)?25:ms; }
 
 static uint8_t presets[N_PRESETS][PRESET_CHUNK];   // chunk: [0]=used, [1..512]=nilai
 
@@ -1377,7 +1382,7 @@ void chaseTick(uint32_t now){
   if(n<0){ chaseOn=false; return; }
   chaseIdx=n;
   applyPresetToWant(n);
-  chaseNextAt=now+(uint32_t)(chaseMs/clampSpeed(speedMul));   // v51.2: speed multiplier
+  chaseNextAt=now+stepFloor((uint32_t)(chaseMs/clampSpeed(speedMul)));   // v51.2: speed multiplier + v51.3 floor 1 frame
 }
 
 // Scene playback: maju ke langkah non-kosong berikutnya (wrap), terapkan
@@ -1400,7 +1405,7 @@ void sceneTick(uint32_t now){
   // menulis 5x/dtk dari dmxTask Core 0 — spam Serial + jitter timing frame.
   sceneStep=chosen;
   applyPresetToWant(pnum-1);               // mutex diambil di dalamnya
-  sceneNextAt=now+(uint32_t)(sceneMs/clampSpeed(speedMul));   // v51.2: speed multiplier
+  sceneNextAt=now+stepFloor((uint32_t)(sceneMs/clampSpeed(speedMul)));   // v51.2: speed multiplier + v51.3 floor 1 frame
 }
 
 // ---------------------------------------------------------------
@@ -1422,7 +1427,7 @@ void applyPresetToWant(int idx){
   // jadi perilaku pload/PSL tak berubah.
   float sm = clampSpeed(speedMul);
   uint32_t effDur = (uint32_t)((chaseOn||sceneOn) ? (chaseMs/sm) : chaseMs);
-  if(effDur < 20) effDur = 20;                 // snap threshold fadeTick
+  if(effDur < 25) effDur = 25;                 // v51.3: floor 1 frame (dari 20) — fade minimal satu frame utuh
   if(fadeMs > effDur) fadeMs = effDur;
   uint32_t boWin = (effDur < 350) ? effDur : 350;   // blackout-on-move juga di-cap
   for(int f=0; f<N_FIX; f++){
