@@ -1,5 +1,52 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 69 - 2026-09-07 - v51.2: fader Speed (0.1–5x) + fix blink/tercampur antar langkah scene
+
+### Permintaan
+1. Fader speed: multiplier 0,1x–5x mempercepat playback.
+2. Bug: preset yang dipakai di scene lain kadang "blink ke warna lain /
+   tercampur" saat scene berjalan memasuki preset yang di-sharing.
+
+### Akar masalah blink (code audit)
+`applyPresetToWant` mengambil `fadeMs = presetFadeMs(idx)` TANPA clamp
+terhadap hold langkah. Bila fade 600ms & hold 100ms → langkah berikut datang
+saat fade baru jalan 1/6 → `out[]` tertinggal di campuran warna lama+baru →
+"blink ke warna preset lain". Ditambah `blackoutEnd = now+350` melebihi durasi
+langkah pendek. Sharing preset antar scene bukan penyebab — hanya membuat
+gejala lebih tampak (warna sisa fade dari konteks scene lain).
+
+### Implementasi (dmx_web_rgb.ino, v51.1 → v51.2)
+1. **`speedMul`** (volatile float, default 1.0, ephemeral spt master/strobe,
+   tidak NVS) + `clampSpeed()` 0.1–5.0.
+2. **`sceneTick`/`chaseTick`**: `nextAt = now + ms/clampSpeed(speedMul)` —
+   mempercepat/memperlambat kedua auto-run. Strobe master sengaja TIDAK ikut
+   (aliasing vs sampling internal lampu, catatan strobe v49).
+3. **Fix blink**: di `applyPresetToWant` — `effDur` = durasi langkah efektif
+   (÷ speed saat auto-run); `fadeMs = min(fadeMs, effDur)` (floor 20ms);
+   blackout-on-move `min(350, effDur)`. Saat idle (pload/PSL) effDur = hold
+   preset sendiri → perilaku manual tak berubah (fade tak pernah > hold).
+4. **Endpoint**: `/ctrl?spd=<float>` (mutex, paritas mast/strb); serial
+   `SPD <x>` jawab `{"ok":true,"spd":1.5}`; WS `{"t":"spd","v":1.5}`
+   (parse atof, mutex).
+5. **State**: `buildStateJson` field `"spd"` (snapshot di bawah mutex, 1
+   desimal) → semua client sinkron.
+6. **WebUI**: fader SPEED di panel Master (0.1–5.0 step 0.1) label "×N.N",
+   event input/change/blur paritas master + anti-echo `activeKey!=='spd'`,
+   `syncFromServer` update dari `j.spd`.
+
+### Validasi
+- `git diff --check` bersih. Firmware tidak di-build di sini (aturan proyek) —
+  compile via Arduino IDE, Serial `=== DMX Web Console v51.2 ===`,
+  hard-refresh browser (HTML embed berubah).
+- Test speed: scene hold 1000ms → ×2 = langkah ~500ms, ×0.5 = ~2000ms.
+- Test blink re-produksi: preset merah fade 600ms + putih fade 600ms, hold
+ 100ms, sharing di 2 scene → SEBELUM: tercampur pink; SESUDAH: tiap langkah
+  mencapai warna penuh (fade dipendekkan otomatis ke 100ms).
+- Speed ekstrem ×5 pada hold 100ms = 20ms < tick 25ms → sebagian langkah
+  ter-skip per tick; diterima (di luar design blink ≤5Hz).
+- Out of scope (ditunda): fader speed di desktop app (working tree desktop
+  masih menumpuk perubahan sesi lain yang belum di-commit user).
+
 ## Session 68 - 2026-09-06 - v51.1: fix "scene berubah warna sendiri" (scene 11 putih → merah)
 
 ### Permintaan

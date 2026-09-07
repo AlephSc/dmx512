@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v51.1"
+#define BUILD_TAG "v51.2"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -274,6 +274,13 @@ static uint32_t strobeNextAt = 0;      // hanya disentuh buildFrame (Core0)
 static bool strobePhase = true;        // true=fase ON
 static volatile uint32_t fadeMs = 600;
 static volatile bool chaseOn = false; static volatile uint32_t chaseMs = 1500; static volatile int chaseIdx = -1;
+
+// v51.2 SPEED MULTIPLIER: 0.1x–5.0x pembagi durasi langkah scene & chase.
+// Ephemeral seperti master/strobe (tidak NVS — state operator per-sesi).
+// Hanya mempercepat/memperlambat auto-run; strobe master sengaja TIDAK
+// ikut (aliasing vs sampling internal lampu, lihat catatan strobe v49).
+static volatile float speedMul = 1.0f;
+static inline float clampSpeed(float v){ return (v<0.1f)?0.1f:((v>5.0f)?5.0f:v); }
 
 static uint8_t presets[N_PRESETS][PRESET_CHUNK];   // chunk: [0]=used, [1..512]=nilai
 
@@ -827,6 +834,17 @@ void wsHandleCtl(const uint8_t* data, size_t len){
     strobeWant=cv(wsInt(buf,"v",0));
     xSemaphoreGive(dmxMutex);
     stateRevision++;
+  } else if(strstr(buf, "\"t\":\"spd\"")){
+    // v51.2: speed multiplier via WS (paritas mast/strb). Value float dikirim
+    // sebagai angka; parse manual substring "v":<num> lalu atof.
+    const char* vp = strstr(buf, "\"v\":");
+    if(vp){
+      float sv = clampSpeed(atof(vp+4));
+      xSemaphoreTake(dmxMutex,portMAX_DELAY);
+      speedMul = sv;
+      xSemaphoreGive(dmxMutex);
+      stateRevision++;
+    }
   } else if(strstr(buf, "\"t\":\"all\"")){
     bool on = wsInt(buf,"v",0)==1;
     xSemaphoreTake(dmxMutex,portMAX_DELAY);
@@ -1359,7 +1377,7 @@ void chaseTick(uint32_t now){
   if(n<0){ chaseOn=false; return; }
   chaseIdx=n;
   applyPresetToWant(n);
-  chaseNextAt=now+chaseMs;
+  chaseNextAt=now+(uint32_t)(chaseMs/clampSpeed(speedMul));   // v51.2: speed multiplier
 }
 
 // Scene playback: maju ke langkah non-kosong berikutnya (wrap), terapkan
@@ -1382,7 +1400,7 @@ void sceneTick(uint32_t now){
   // menulis 5x/dtk dari dmxTask Core 0 — spam Serial + jitter timing frame.
   sceneStep=chosen;
   applyPresetToWant(pnum-1);               // mutex diambil di dalamnya
-  sceneNextAt=now+sceneMs;
+  sceneNextAt=now+(uint32_t)(sceneMs/clampSpeed(speedMul));   // v51.2: speed multiplier
 }
 
 // ---------------------------------------------------------------
@@ -1395,12 +1413,24 @@ void applyPresetToWant(int idx){
   fadeMs  = presetFadeMs(idx);
   chaseMs = presetHoldMs(idx);
   sceneMs = chaseMs;
+  // v51.2 FIX "blink/tercampur antar langkah": fade TIDAK boleh lebih panjang
+  // dari durasi langkah efektif. Bila fade 600ms tapi hold 100ms, langkah
+  // berikut datang saat fade baru jalan 1/6 -> out[] tertinggal di campuran
+  // warna lama+baru (gejala: "blink ke warna preset lain, seperti tercampur").
+  // Clamp: setiap langkah dijamin mencapai warna finalnya. Saat idle (bukan
+  // auto-run) efDur = hold preset sendiri — fade manual tak pernah > hold,
+  // jadi perilaku pload/PSL tak berubah.
+  float sm = clampSpeed(speedMul);
+  uint32_t effDur = (uint32_t)((chaseOn||sceneOn) ? (chaseMs/sm) : chaseMs);
+  if(effDur < 20) effDur = 20;                 // snap threshold fadeTick
+  if(fadeMs > effDur) fadeMs = effDur;
+  uint32_t boWin = (effDur < 350) ? effDur : 350;   // blackout-on-move juga di-cap
   for(int f=0; f<N_FIX; f++){
     // Deteksi gerakan besar pada pan/tilt (ch0 & ch2) -> aktifkan blackout sementara.
     if(fix[f].hasMove && fix[f].foot>=3){
       int d0 = abs((int)presets[idx][fix[f].start+0] - (int)want[fix[f].start+0]);
       int d2 = abs((int)presets[idx][fix[f].start+2] - (int)want[fix[f].start+2]);
-      if(d0>30 || d2>30) blackoutEnd[f] = now + 350;   // 350ms dimmer mati saat bergerak
+      if(d0>30 || d2>30) blackoutEnd[f] = now + boWin;   // dimmer mati saat bergerak (maks 350ms / durasi langkah)
     }
     for(uint16_t c=0; c<fix[f].foot; c++){
       uint16_t ch=fix[f].start+c;
@@ -2165,6 +2195,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <h3>Master <span style="color:var(--muted);font-weight:400">global</span></h3>
     <label><span class="lab">Master</span><input type="range" id="master" min="0" max="255" value="255"><span class="val" id="masterv">255</span></label>
     <label><span class="lab">Strobe</span><input type="range" id="mstrb" min="0" max="255" value="0"><span class="val" id="mstrbv">0</span></label>
+    <label><span class="lab">Speed</span><input type="range" id="spd" min="0.1" max="5" step="0.1" value="1"><span class="val" id="spdv">&times;1.0</span></label>
     <div class="actions"><button class="btn-off act" id="btnBlack">Blackout</button><button class="act" id="btnArtnet">Art-Net: LOCAL</button><button class="btn-go act" id="btnChase">Chase OFF</button><button class="btn-reset act" id="btnSaveData">Save Data</button><button class="btn-off act" id="btnLoadData">Load Data</button></div>
     <div class="status" id="saveStatus">Data tersimpan</div>
   </section>
@@ -2662,6 +2693,11 @@ $('master').addEventListener('blur',()=>onRelease($('master')));
 $('mstrb').addEventListener('input',()=>{activeKey='mstrb';$('mstrbv').textContent=$('mstrb').value;paintFill($('mstrb'));pushLive({t:'strb',v:+$('mstrb').value},'strb='+$('mstrb').value);});
 $('mstrb').addEventListener('change',()=>onRelease($('mstrb')));
 $('mstrb').addEventListener('blur',()=>onRelease($('mstrb')));
+// v51.2 SPEED: multiplier 0.1–5.0, pembagi durasi langkah scene & chase.
+// Ephemeral (paritas master/strobe — tidak persisten NVS).
+$('spd').addEventListener('input',()=>{activeKey='spd';$('spdv').innerHTML='&times;'+(+$('spd').value).toFixed(1);paintFill($('spd'));pushLive({t:'spd',v:+$('spd').value},'spd='+$('spd').value);});
+$('spd').addEventListener('change',()=>onRelease($('spd')));
+$('spd').addEventListener('blur',()=>onRelease($('spd')));
 // input = update label saja; persist ke NVS hanya saat lepas (change) -> hindari tulis flash tiap tick
 // Jalur simpan Fade & Hold SAMA PERSIS lewat satu fungsi persistTiming().
 function persistTiming(){
@@ -2915,6 +2951,7 @@ function syncFromServer(j, skipActive){
   if(j.master===undefined) return;
   if(!skipActive || activeKey!=='master'){ $('master').value=j.master; $('masterv').textContent=j.master; paintFill($('master')); }
   if(j.strb!==undefined && (!skipActive || activeKey!=='mstrb')){ $('mstrb').value=j.strb; $('mstrbv').textContent=j.strb; paintFill($('mstrb')); }
+  if(j.spd!==undefined && (!skipActive || activeKey!=='spd')){ $('spd').value=j.spd; $('spdv').innerHTML='&times;'+(+j.spd).toFixed(1); paintFill($('spd')); }
   allKeys.forEach(k=>{
     if(skipActive && k===activeKey) return;
     // v48 anti-bounce: channel sedang di-drag BANK -> jangan ditimpa echo
@@ -3414,6 +3451,13 @@ void onCtrl(){
     strobeWant=cv(server.arg("strb").toInt());
     xSemaphoreGive(dmxMutex);
   }   // ephemeral: tidak persisten NVS
+  if(server.hasArg("spd")){
+    // v51.2: speed multiplier 0.1–5.0 (float). Ephemeral seperti mast/strb.
+    float v = server.arg("spd").toFloat();
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    speedMul = clampSpeed(v);
+    xSemaphoreGive(dmxMutex);
+  }
    if(server.hasArg("all")){
      bool on = server.arg("all")=="on";
      xSemaphoreTake(dmxMutex,portMAX_DELAY);
@@ -3465,6 +3509,7 @@ String buildStateJson(){
   uint8_t m=masterOut;
   int si=sceneIdx, st=sceneStep;
   bool so=sceneOn;
+  float spd=clampSpeed(speedMul);             // v51.2: snapshot di bawah mutex
   xSemaphoreGive(dmxMutex);
   String j="{";
   j.reserve(2048);
@@ -3480,7 +3525,7 @@ String buildStateJson(){
 #else
   j+="\"hw\":false,";   // v50: deck fisik dikompilasi keluar
 #endif
-  j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
+  j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"spd\":"+String(spd,1)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
     if(!first) j+=","; first=false;
@@ -3788,7 +3833,14 @@ void handleSerialCmd(String cmd){
     strobeWant=cv(args.toInt());
     xSemaphoreGive(dmxMutex);
     stateRevision++;
-    Serial.println("{\"ok\":true}");
+    Serial.println("{\"ok\":true}");    return;
+  }
+  if(op=="SPD"){                      // v51.2: SPD <x> — speed multiplier 0.1–5.0
+    xSemaphoreTake(dmxMutex,portMAX_DELAY);
+    speedMul = clampSpeed(args.toFloat());
+    xSemaphoreGive(dmxMutex);
+    stateRevision++;
+    Serial.println(String("{\"ok\":true,\"spd\":")+String(speedMul,1)+"}");
     return;
   }
   if(op=="SET"){                      // SET <fi>_<ch>=<val>
