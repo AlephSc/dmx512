@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v51.3"
+#define BUILD_TAG "v52"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -108,6 +108,18 @@ void loadWifiCreds(){
 }
 const char* effSsid(){ return customSsid.length()>0 ? customSsid.c_str() : WIFI_SSID; }
 const char* effPass(){ return customSsid.length()>0 ? customPass.c_str() : WIFI_PASS; }
+
+// v52: kredensial AP darurat kustom (persist NVS "dmxwifi" key apssid/appass,
+// paritas customSsid/customPass STA). Kosong = default AP_SSID/AP_PASS.
+String customApSsid, customApPass;
+void loadApCreds(){
+  if(!wifiNvs.begin("dmxwifi",true)){ customApSsid=""; customApPass=""; return; }
+  customApSsid = wifiNvs.getString("apssid","");
+  customApPass = wifiNvs.getString("appass","");
+  wifiNvs.end();
+}
+const char* effApSsid(){ return customApSsid.length()>0 ? customApSsid.c_str() : AP_SSID; }
+const char* effApPass(){ return customApPass.length()>0 ? customApPass.c_str() : AP_PASS; }
 
 // ---------------------------------------------------------------
 // PIN ESP32 -> MAX485
@@ -1699,6 +1711,7 @@ void onWifiStat(){
   j+=",\"ip\":\"";      j+= activeIP().toString(); j+="\"";
   j+=",\"rssi\":";      j+= String(sta?WiFi.RSSI():0);
   j+=",\"apActive\":";  j+= (WiFi.getMode() & WIFI_AP)?"true":"false";
+  j+=",\"apSsid\":\"";  j+= String(effApSsid()); j+="\"";   // v52: AP aktif/tersimpan
   j+="}";
   server.send(200,"application/json",j);
 }
@@ -1737,7 +1750,7 @@ void wifiReconnectTick(){
     Serial.println("WiFi kustom GAGAL setelah 6 percobaan -> kembali ke kredensial bawaan + AP darurat");
     // URUTAN PENTING: aktifkan AP dulu (bila tanpa Ethernet) agar operator
     // tidak pernah terkunci, BARU coba kredensial bawaan sebagai STA.
-    if(!ETH.linkUp()){ WiFi.mode(WIFI_AP_STA); WiFi.softAP(AP_SSID, AP_PASS); }
+    if(!ETH.linkUp()){ WiFi.mode(WIFI_AP_STA); WiFi.softAP(effApSsid(), effApPass()); }
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     return;
   }
@@ -1747,6 +1760,31 @@ void wifiReconnectTick(){
   // tidak kehilangan akses selama percobaan berlangsung).
   WiFi.mode((WiFi.getMode() & WIFI_AP) ? WIFI_AP_STA : WIFI_STA);
   WiFi.begin(customSsid.c_str(), customPass.c_str());
+}
+
+// v52: POST /apset?ssid&pass -> simpan kredensial AP darurat kustom ke NVS.
+// Validasi paritas onWifiSet. Bila AP sedang aktif, softAP di-restart dengan
+// kredensial baru SEKARANG (operator terhubung via AP tidak terkunci —
+// koneksi client AP memang terputus saat SSID berubah, itu wajar; reconnect
+// ke SSID baru). Serial monitor / Ethernet tetap jalan sebagai jalan keluar.
+void onApSet(){
+  String ssid=server.arg("ssid"); ssid.trim();
+  String pass=server.arg("pass"); pass.trim();
+  if(ssid.length()==0 || ssid.length()>32){ sendApiError(400,"ap_no_ssid","SSID AP kosong atau terlalu panjang"); return; }
+  if(pass.length()>63){ sendApiError(400,"ap_pass_long","Password AP terlalu panjang"); return; }
+  // WPA2 minimal 8 karakter (ESP32 softAP menolak <8 dan menyala terbuka!)
+  if(pass.length()>0 && pass.length()<8){ sendApiError(400,"ap_pass_short","Password AP minimal 8 karakter (WPA2)"); return; }
+  if(!wifiNvs.begin("dmxwifi",false)){
+    sendApiError(500,"ap_nvs_begin_failed","Gagal membuka namespace NVS");
+    return;
+  }
+  bool ok = wifiNvs.putString("apssid",ssid)>0 && wifiNvs.putString("appass",pass)>0;
+  wifiNvs.end();
+  if(!ok){ sendApiError(500,"ap_nvs_fail","Gagal menyimpan kredensial AP ke flash"); return; }
+  customApSsid=ssid; customApPass=pass;
+  if(WiFi.getMode() & WIFI_AP) WiFi.softAP(effApSsid(), effApPass());   // re-apply langsung
+  Serial.printf("AP kustom tersimpan: %s\n", ssid.c_str());
+  sendApiOk();
 }
 
 void onSelect(){
@@ -2212,6 +2250,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <label><span class="lab">Sandi</span><input type="password" id="wpass" maxlength="63" placeholder="password WiFi" style="background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;grid-column:2/4"></label>
     <div class="actions"><button class="btn-go act" id="btnWifiSet">Sambungkan &amp; Simpan</button></div>
     <p class="sub">Kredensial tersimpan di flash &amp; dipakai tiap boot. Gagal 6x percobaan = otomatis kembali ke bawaan + AP darurat.</p>
+    <h3 style="margin-top:14px">AP Darurat <span style="color:var(--muted);font-weight:400">nama &amp; sandi kustom</span></h3>
+    <p class="sub" id="apStat">AP dipakai bila WiFi &amp; Ethernet sama-sama gagal (supaya tidak terkunci dari device).</p>
+    <label><span class="lab">SSID AP</span><input type="text" id="apssid" maxlength="32" placeholder="nama AP darurat" style="background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;grid-column:2/4"></label>
+    <label><span class="lab">Sandi AP</span><input type="password" id="appass" maxlength="63" placeholder="minimal 8 karakter (kosong = tanpa sandi)" style="background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;grid-column:2/4"></label>
+    <div class="actions"><button class="btn-reset act" id="btnApSet">Simpan AP</button></div>
+    <p class="sub">Tersimpan ke flash, dipakai AP berikutnya aktif. Jika AP sedang aktif, AP langsung pakai SSID baru (koneksi AP saat ini terputus — hubungkan ulang ke SSID baru).</p>
   </section>
 
   <section class="panel" id="patchPanel">
@@ -3262,6 +3306,9 @@ function wifiRefresh(){
     if(j.connected){ st.textContent='Terhubung ke "'+j.ssid+'" \u00b7 IP '+j.ip+' \u00b7 '+j.rssi+' dBm'+(j.custom?' \u00b7 kustom':''); st.style.color='#7bd88f'; }
     else if(j.pending){ st.textContent='Mencoba menyambung ke "'+j.ssid+'"...'; st.style.color='#ffd54f'; }
     else { st.textContent=(j.apActive?'Mode AP darurat \u00b7 IP '+j.ip:'Tidak terhubung'); st.style.color='#ff8a65'; }
+    // v52: prefill SSID AP kustom (satu kali; jangan timpa yang sedang diedit)
+    const apIn=$('apssid');
+    if(apIn && j.apSsid!==undefined && !apIn.dataset.filled){ apIn.value=j.apSsid; apIn.dataset.filled='1'; }
   }).catch(()=>{});
 }
 $('btnWifiSet').addEventListener('click',()=>{
@@ -3275,6 +3322,15 @@ $('btnWifiSet').addEventListener('click',()=>{
       setTimeout(()=>toast('Bila IP berubah, buka alamat IP baru (lihat Serial Monitor)'),3500);
     })
     .catch(e=>{ showError(e.message); wifiRefresh(); });
+});
+// v52: simpan kredensial AP darurat kustom.
+$('btnApSet').addEventListener('click',()=>{
+  const ssid=$('apssid').value.trim(), pass=$('appass').value.trim();
+  if(!ssid){ toast('Isi SSID AP dulu'); return; }
+  if(pass.length>0 && pass.length<8){ toast('Sandi AP minimal 8 karakter'); return; }
+  api('/apset?ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass))
+    .then(()=>{ toast('AP kustom tersimpan'); wifiRefresh(); })
+    .catch(e=>showError(e.message));
 });
 wifiRefresh();
 </script>
@@ -4303,6 +4359,7 @@ void handleSerialCmd(String cmd){
       j+=",\"ip\":\""; j+= activeIP().toString(); j+="\"";
       j+=",\"rssi\":"; j+= String(sta?WiFi.RSSI():0);
       j+=",\"apActive\":"; j+= (WiFi.getMode() & WIFI_AP)?"true":"false";
+      j+=",\"apSsid\":\""; j+= String(effApSsid()); j+="\"";   // v52
       j+="}";
       Serial.println(j);
       return;
@@ -4322,6 +4379,26 @@ void handleSerialCmd(String cmd){
       customSsid=ssid; customPass=pass;
       wifiPending=true; wifiTryAt=millis(); wifiTryCount=0;
       WiFi.disconnect();
+      Serial.println("{\"ok\":true}");
+      return;
+    }
+    // v52: APSET <ssid> <pass> -> simpan kredensial AP darurat kustom (paritas
+    // POST /apset web). Re-apply langsung bila AP sedang aktif.
+    if(op=="APSET"){
+      args.trim();
+      int sp=args.indexOf(' ');
+      String ssid = (sp<0) ? args : args.substring(0,sp);
+      String pass = (sp<0) ? String("") : args.substring(sp+1);
+      ssid.trim(); pass.trim();
+      if(ssid.length()==0 || ssid.length()>32){ Serial.println("{\"ok\":false,\"err\":\"SSID AP kosong/panjang\"}"); return; }
+      if(pass.length()>63){ Serial.println("{\"ok\":false,\"err\":\"sandi AP terlalu panjang\"}"); return; }
+      if(pass.length()>0 && pass.length()<8){ Serial.println("{\"ok\":false,\"err\":\"sandi AP minimal 8 karakter (WPA2)\"}"); return; }
+      wifiNvs.begin("dmxwifi",false);
+      bool ok = wifiNvs.putString("apssid",ssid)>0 && wifiNvs.putString("appass",pass)>0;
+      wifiNvs.end();
+      if(!ok){ Serial.println("{\"ok\":false,\"err\":\"gagal simpan NVS\"}"); return; }
+      customApSsid=ssid; customApPass=pass;
+      if(WiFi.getMode() & WIFI_AP) WiFi.softAP(effApSsid(), effApPass());
       Serial.println("{\"ok\":true}");
       return;
     }
@@ -4502,6 +4579,7 @@ void setup(){
   delay(1000);   // v47: jeda sebelum radio WiFi on — hindari spike arus TX
                  // bertepatan dengan init SPI yang barusan selesai
   loadWifiCreds();
+  loadApCreds();               // v52: kredensial AP darurat kustom
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);            // respons web lebih responsif
   WiFi.begin(effSsid(), effPass());
@@ -4523,8 +4601,8 @@ void setup(){
     // ---- TAHAP 3: AP darurat (hanya bila Ethernet & WiFi keduanya gagal) ----
     Serial.println("WiFi gagal & Ethernet tidak ada. Fallback ke AP darurat.");
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    Serial.print("AP: "); Serial.print(AP_SSID);
+    WiFi.softAP(effApSsid(), effApPass());
+    Serial.print("AP: "); Serial.print(effApSsid());
     Serial.print(" | Buka browser: http://"); Serial.println(WiFi.softAPIP());
   }
 
@@ -4539,9 +4617,11 @@ void setup(){
   server.on("/ctypes", HTTP_POST, onCtypesPost);// v48: commit custom type
    server.on("/artnet", HTTP_GET,  onArtnet);   // v49: mode Art-Net input
    server.on("/hw",     HTTP_GET,  onHw);       // v51: switch deck tombol fisik
-  server.on("/wifistat",HTTP_GET, onWifiStat);   // v43: status koneksi WiFi
-  server.on("/wifiset", HTTP_POST, onWifiSet);   // v43: simpan kredensial + reconnect
-  server.on("/wifiset", HTTP_GET, onWifiSet);    // kompatibilitas desktop v44
+   server.on("/wifistat",HTTP_GET, onWifiStat);   // v43: status koneksi WiFi
+   server.on("/wifiset", HTTP_POST, onWifiSet);   // v43: simpan kredensial + reconnect
+   server.on("/wifiset", HTTP_GET, onWifiSet);    // kompatibilitas desktop v44
+   server.on("/apset",   HTTP_POST, onApSet);     // v52: kredensial AP darurat kustom
+   server.on("/apset",   HTTP_GET, onApSet);      // kompatibilitas pola wifiset
   server.on("/spush", HTTP_GET, onSPush);
   server.on("/spop",  HTTP_GET, onSPop);
   server.on("/sclear",HTTP_GET, onSClear);

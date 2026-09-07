@@ -1,5 +1,38 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 71 - 2026-09-07 - v52: edit nama & sandi AP darurat kustom (NVS)
+
+### Permintaan
+Edit nama (SSID) dan sandi AP darurat secara manual dari WebUI/serial,
+otomatis tersimpan ke NVS.
+
+### Implementasi (dmx_web_rgb.ino, v51.3 → v52)
+1. **State**: `customApSsid/customApPass` (persist NVS `dmxwifi` key
+   `apssid`/`appass`, paritas customSsid STA) + `loadApCreds()` di setup +
+   `effApSsid()/effApPass()` (kosong = default AP_SSID/AP_PASS).
+2. **Call site AP** (3 lokasi: fallback setup, gagal-6x reconnect, fallback
+   wifiReconnectTick) kini pakai nilai efektif.
+3. **Endpoint** `POST /apset?ssid&pass` (GET paritas) — validasi: SSID 1-32,
+   sandi ≤63, sandi 1-7 DITOLAK (ESP32 softAP <8 char = AP terbuka!).
+   Bila AP sedang aktif, `softAP` re-apply langsung (koneksi AP client
+   terputus — wajar saat SSID berubah).
+4. **Serial** `APSET <ssid> <pass>` (paritas web) + field `apSsid` di
+   `WIFIST`/`/wifistat`.
+5. **WebUI**: section "AP Darurat" di panel WiFi — input SSID/sandi AP +
+   tombol "Simpan AP"; prefill SSID AP dari `/wifistat` (sekali, tak menimpa
+   edit user).
+
+### Validasi
+- `git diff --check` bersih. Compile Arduino IDE; Serial harus tampil
+  `=== DMX Web Console v52 ===`; hard-refresh browser.
+- Test: set AP kustom → reboot (power cycle) → matikan router WiFi → device
+  fallback AP dengan SSID baru, sandi baru.
+- Test sandi <8 char ditolak (400 ap_pass_short).
+- Test live re-apply: aktifkan kondisi AP aktif → set AP baru → AP restart
+  dengan SSID baru di scan HP.
+- Catatan: namespace `dmxwifi` sudah ada sejak v43, tidak menambah partisi;
+  migrasi storage `dmxrgb` tidak menyentuh key AP.
+
 ## Session 70 - 2026-09-07 - v51.3: floor durasi langkah 25ms — fader speed jujur di ekstrem
 
 ### Permintaan
