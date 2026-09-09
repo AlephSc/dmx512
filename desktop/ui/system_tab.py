@@ -1,7 +1,9 @@
 # Tab SISTEM: Save/Load NVS, Export/Import file, konfigurasi WiFi ESP32, log.
-from PySide6.QtCore import Signal
+# v50 desktop parity: diagnostik — Stat Frame DMX (serial DMXSTAT) &
+# Stat Art-Net (serial ARTSTAT), melebihi Web UI (yang tak punya ini).
+from PySide6.QtCore import Signal, QTimer
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                               QLineEdit, QPushButton, QTextEdit)
+                                QLineEdit, QPushButton, QTextEdit, QGroupBox)
 
 
 class SystemTab(QWidget):
@@ -76,6 +78,40 @@ class SystemTab(QWidget):
         self.status_lbl = QLabel("Status: -")
         root.addWidget(self.status_lbl)
 
+        # --- v50: diagnostik DMX/Art-Net -----------------------------------
+        dbox = QGroupBox("DIAGNOSTIK (maju terus melebihi Web UI)")
+        dv = QVBoxLayout(dbox)
+        drow = QHBoxLayout()
+        self.b_dmxstat = QPushButton("Stat Frame DMX")
+        self.b_dmxstat.setToolTip("Interval frame min/avg/max ms (hanya via USB Serial — "
+                                  "firmware tidak mengekspos statistik frame via HTTP).")
+        self.b_dmxstat.clicked.connect(lambda: self.cmd.emit("DMXSTAT"))
+        self.b_artstat = QPushButton("Stat Art-Net")
+        self.b_artstat.clicked.connect(lambda: self.cmd.emit("ARTSTAT"))
+        self.b_diag_auto = QPushButton("Auto 2 dtk")
+        self.b_diag_auto.setCheckable(True)
+        self.b_diag_auto.clicked.connect(self._on_diag_auto)
+        drow.addWidget(self.b_dmxstat)
+        drow.addWidget(self.b_artstat)
+        drow.addWidget(self.b_diag_auto)
+        drow.addStretch(1)
+        dv.addLayout(drow)
+        self.dmx_lbl = QLabel("Frame DMX: -")
+        self.dmx_lbl.setStyleSheet("color:#9aa4b2;")
+        dv.addWidget(self.dmx_lbl)
+        self.art_lbl = QLabel("Art-Net: -")
+        self.art_lbl.setStyleSheet("color:#9aa4b2;")
+        dv.addWidget(self.art_lbl)
+        dhint = QLabel("Normal: interval frame min 24-26 ms, avg ~25 ms, max <50 ms. "
+                       "Nilai max besar = task DMX kelaparan (output tidak teratur).")
+        dhint.setStyleSheet("color:#9aa4b2;font-size:11px;")
+        dhint.setWordWrap(True)
+        dv.addWidget(dhint)
+        root.addWidget(dbox)
+        self._diag_timer = QTimer(self)
+        self._diag_timer.setInterval(2000)
+        self._diag_timer.timeout.connect(lambda: self.cmd.emit("DMXSTAT"))
+
         root.addWidget(QLabel("Log:"))
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -88,7 +124,51 @@ class SystemTab(QWidget):
             return
         self.wifi_apply_requested.emit(ssid, self.wifi_pass.text())
 
+    def _on_diag_auto(self, on):
+        if on:
+            self._diag_timer.start()
+            self.cmd.emit("DMXSTAT")
+        else:
+            self._diag_timer.stop()
+
+    def set_http_mode(self, is_http):
+        """DMXSTAT tidak punya endpoint HTTP — nonaktifkan tombolnya di WiFi.
+        ARTSTAT tetap aktif (dipetakan ke GET /artnet)."""
+        self.b_dmxstat.setEnabled(not is_http)
+        if is_http:
+            self._diag_timer.stop()
+            self.b_diag_auto.setChecked(False)
+            self.dmx_lbl.setText("Frame DMX: hanya via USB Serial (tidak ada endpoint HTTP).")
+            self.dmx_lbl.setStyleSheet("color:#9aa4b2;")
+
     # ---- API utk main window -------------------------------------------------
+    def set_dmxstat(self, j):
+        """Render respons DMXSTAT: interval frame ms + snapshot runtime."""
+        try:
+            self.dmx_lbl.setText(
+                f"Frame DMX: {j.get('frames','?')} frame · "
+                f"min {j.get('min','?')} ms · avg {j.get('avg','?')} ms · "
+                f"max {j.get('max','?')} ms · mast {j.get('mast','?')} · "
+                f"chase={j.get('chase','?')} · sceneOn={j.get('sceneOn','?')} · "
+                f"artnet={j.get('artnet','?')}")
+        except Exception:  # noqa: BLE001
+            self.dmx_lbl.setText(f"Frame DMX: {j}")
+        bad = False
+        try:
+            if int(j.get("max", 0)) > 60:
+                bad = True
+        except (TypeError, ValueError):
+            pass
+        self.dmx_lbl.setStyleSheet("color:#e74c3c;" if bad else "color:#7bd88f;")
+
+    def set_artstat(self, j):
+        """Render respons ARTSTAT: mode + paket terakhir."""
+        mode = j.get("mode", "?")
+        pkt = j.get("pkt", "?")
+        last = j.get("lastAt", "?")
+        txt = f"Art-Net: mode {mode.upper()} · {pkt} paket · aktivitas terakhir {last}"
+        self.art_lbl.setText(txt)
+        self.art_lbl.setStyleSheet("color:#4fc3f7;")
     def set_wifi(self, j):
         """Render status dari respons WIFIST//wifistat."""
         if j.get("connected"):

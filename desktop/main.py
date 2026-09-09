@@ -188,6 +188,8 @@ class MainWindow(QMainWindow):
                 target = f"WiFi {ip}"
                 self.tab_patch.is_http = True   # v45: patch via POST /fixes
             self.tab_patch.is_http = (not is_serial)
+            # v50: DMXSTAT tanpa endpoint HTTP -> tombol hanya aktif via serial
+            self.tab_system.set_http_mode(not is_serial)
             self._thread = QThread(self)
             self._worker = SerialWorker(self.transport)
             self._worker.moveToThread(self._thread)
@@ -241,6 +243,9 @@ class MainWindow(QMainWindow):
             self._worker.cmd_queue.put(("LISTS", "LISTS"))
         elif op == "FIXSET":
             self._worker.cmd_queue.put(("LISTF", "LISTF"))   # v45: refresh patch
+        elif op == "CTSET":
+            # v50: refresh custom type + mixer label setelah commit
+            self._worker.cmd_queue.put(("LISTCT", "LISTCT"))
         elif op == "LOAD":
             self._worker.cmd_queue.put(("LISTP", "LISTP"))
             self._worker.cmd_queue.put(("LISTS", "LISTS"))
@@ -399,6 +404,13 @@ class MainWindow(QMainWindow):
             if isinstance(payload, list) and all(isinstance(x, dict) for x in payload):
                 self.state.custom_types = payload
                 self.tab_mixer.set_custom_types(payload)
+                self.tab_patch.set_custom_types(payload)   # v50: editor tipe
+        elif kind == "DMXSTAT":   # v50: diagnostik frame DMX
+            if isinstance(payload, dict):
+                self.tab_system.set_dmxstat(payload)
+        elif kind == "ARTSTAT":   # v50: status Art-Net
+            if isinstance(payload, dict):
+                self.tab_system.set_artstat(payload)
         elif kind == "LISTP":
             if isinstance(payload, list):
                 self.state.presets = payload

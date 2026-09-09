@@ -63,7 +63,13 @@ class SerialWorker(QObject):
                     continue
                 timeout = 10.0 if kind == "EXPORT" else 2.5
                 resp = self.transport.request(cmd, timeout=timeout)
-                if kind in ("LISTF", "LISTG", "LISTP", "LISTS", "LISTCT", "EXPORT", "WIFIST"):
+                # DMXSTAT/ARTSTAT dikirim dengan kind "cmd" dari SystemTab —
+                # route berdasarkan op (bukan kind) agar respons stats (tanpa
+                # field "ok") sampai ke data_received, bukan command_done.
+                if op in ("ARTSTAT", "DMXSTAT"):
+                    self.data_received.emit(op, resp)
+                elif kind in ("LISTF", "LISTG", "LISTP", "LISTS", "LISTCT", "EXPORT",
+                              "WIFIST"):
                     self.data_received.emit(kind, resp)
                 else:
                     self.command_done.emit(cmd, resp)
