@@ -24,6 +24,7 @@ def midi_to_dmx(v):
 ACTIONS = [
     ("master", "Master dimmer (CC)"),
     ("strb", "Strobe master (CC)"),
+    ("spd", "Speed multiplier 0.1-5 (CC)"),
     ("group", "Fader grup (CC, param=grup 0-7)"),
     ("chan", "Channel fixture (CC, param1=fixture, param2=ch)"),
     ("preset", "Mainkan preset (Note, param=0-29)"),
@@ -124,6 +125,9 @@ class MidiMapper:
                 cmds.append(f"MAST {v}")
             elif a == "strb":
                 cmds.append(f"STRB {v}")
+            elif a == "spd":
+                # v53: CC 0-127 -> DMX 0-255 -> 0.0-5.0, floor 0.1 (firmware clamp juga)
+                cmds.append(f"SPD {max(0.1, v * 5.0 / 255):.1f}")
             elif a == "group":
                 cmds.append(f"GRP {e.get('index', 0)} {v}")
             elif a == "chan":

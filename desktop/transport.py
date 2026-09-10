@@ -19,8 +19,8 @@ import serial.tools.list_ports
 
 from PySide6.QtCore import QObject, Signal
 
-# VID chip USB-UART yang umum dipakai ESP32 dev board
-_KNOWN_VIDS = {0x1A86, 0x10C4, 0x0403, 0x303A, 0x2341, 0x04D8, 0x10C4}
+# VID chip USB-UART yang umum dipakai ESP32 dev board (v53: hapus duplikat 0x10C4)
+_KNOWN_VIDS = {0x1A86, 0x10C4, 0x0403, 0x303A, 0x2341, 0x04D8}
 
 
 def list_candidate_ports():
@@ -268,6 +268,14 @@ class HttpTransport(QObject):
 
     def _translate(self, cmd):
         """Translate → [(method, path), ...]. Return None bila tidak didukung."""
+        # v53 (audit): guard panjang — perintah malformed tak boleh IndexError
+        # (sebelumnya bisa membunuh thread worker).
+        try:
+            return self._translate_inner(cmd)
+        except IndexError:
+            return None
+
+    def _translate_inner(self, cmd):
         parts = cmd.strip().split(" ")
         op = parts[0].upper()
         if op == "GET": return [("GET", "/cur")]
@@ -281,6 +289,7 @@ class HttpTransport(QObject):
         if op == "LOAD": return [("GET", "/loaddata")]
         if op == "MAST": return [("GET", f"/ctrl?mast={parts[1]}")]
         if op == "STRB": return [("GET", f"/ctrl?strb={parts[1]}")]
+        if op == "SPD": return [("GET", f"/ctrl?spd={parts[1]}")]   # v53: speed multiplier 0.1-5
         if op == "ALL": return [("GET", f"/ctrl?all={parts[1].lower()}")]
         if op == "SET": return [("GET", f"/set?{parts[1]}")]
         if op == "GRP": return [("GET", f"/grp?i={parts[1]}&v={parts[2]}")]
@@ -297,6 +306,20 @@ class HttpTransport(QObject):
         if op == "SCLR": return [("GET", f"/sclear?s={parts[1]}")]
         if op == "CHASE": return [("GET", "/chase?on=1" if parts[1].lower() == "on" else "/chase?off=1")]
         if op == "WIFIST": return [("GET", "/wifistat")]
+        # v53: NETMODE [STA 0/1] [AP 0/1] -> /netmode (parsial boleh).
+        if op == "NETMODE":
+            sta = ap = None
+            toks = [t.upper() for t in parts[1:]]
+            for i, t in enumerate(toks):
+                if t == "STA" and i + 1 < len(toks) and toks[i + 1] in ("0", "1"):
+                    sta = toks[i + 1]
+                if t == "AP" and i + 1 < len(toks) and toks[i + 1] in ("0", "1"):
+                    ap = toks[i + 1]
+            if sta is None and ap is None:
+                return None
+            q = "&".join(([f"sta={sta}"] if sta is not None else [])
+                         + ([f"ap={ap}"] if ap is not None else []))
+            return [("GET", f"/netmode?{q}")]
         if op == "WIFIS":
             ssid = urllib.parse.quote(cmd.split(" ", 2)[1] if len(cmd.split(" ", 2)) > 1 else "")
             rest = cmd.split(" ", 2)

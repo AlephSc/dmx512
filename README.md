@@ -2,7 +2,7 @@
 
 Controller DMX512 open-source berbasis ESP32 + MAX485 dengan Web UI dan aplikasi desktop Windows. Satu universe (512 channel), preset/scene/chase, patch fixture runtime, custom fixture type, input **Art-Net**, dan kontrol dari browser, desktop, maupun serial. *(Deck tombol fisik: kode lengkap ada, tapi **nonaktif default** sejak v50 — lihat [Input fisik](#input-fisik-hardware-button-deck).)*
 
-> **Status**: aktif dikembangkan — v50. Cocok untuk prototyping closed-network (lihat [Keamanan](#keamanan)).
+> **Status**: aktif dikembangkan — v53. Cocok untuk prototyping closed-network (lihat [Keamanan](#keamanan)).
 > Changelog lengkap per sesi: [`docs/logs.md`](./docs/logs.md)
 
 ## Daftar fitur lengkap
@@ -59,6 +59,7 @@ Spesifikasi bila diaktifkan (`HW_DECK_ENABLE 1`):
 
 ### Konektivitas & jaringan
 - **WiFi STA** (kredensial kustom dari UI/desktop, tersimpan NVS) + **W5500 Ethernet** (prioritas 1, auto DHCP) + AP darurat (prioritas 3, hanya bila keduanya gagal).
+- **Radio independen (v53)**: STA dan AP bisa dinyalakan/dimatikan masing-masing (`/netmode`, serial `NETMODE`, NVS `staen/apen`) — kombinasi STA saja / AP saja / keduanya; anti-lockout bila keduanya off tanpa Ethernet.
 - Boot bertahap Ethernet → WiFi → AP dengan staged delay anti-spike arus (ramah PSU marginal).
 - Web UI responsif (PC/HP/tablet): WebSocket realtime port 81 + HTTP fallback.
 - Aplikasi desktop Windows (PySide6): fitur setara Web UI via USB serial atau WiFi; MIDI controller + MIDI-learn.
@@ -97,7 +98,7 @@ ses/                # Log sesi pengerjaan (arsip)
 
 | Jalur | Endpoint / perintah |
 |---|---|
-| Kontrol realtime | WS `{"t":"s"\|"mast"\|"strb"\|"all"\|"b",...}` ; HTTP `/set /grp /ctrl /chase` |
+| Kontrol realtime | WS `{"t":"s"\|"mast"\|"strb"\|"spd"\|"all"\|"b",...}` ; HTTP `/set /grp /ctrl /chase` |
 | Preset | `/psave /pload /psetfade /pclear /presets` ; serial `PSL PSV PREC PDEL PSF` |
 | Scene | `/spush /spop /sclear /splay` ; serial `SPUSH SPOP SCLR SPLAY SSTOP` |
 | Patch | GET/POST `/fixes` ; serial `LISTF FIXSET` |
@@ -105,7 +106,7 @@ ses/                # Log sesi pengerjaan (arsip)
 | Custom type | GET/POST `/ctypes` ; serial `LISTCT CTSET` |
 | Art-Net | `/artnet` ; serial `ARTNET ARTSTAT` |
 | Kesehatan | `/health /cur` ; serial `DMXSTAT` |
-| WiFi | `/wifistat /wifiset` ; serial `WIFISTAT WIFISSET` |
+| WiFi | `/wifistat /wifiset /apset /netmode` ; serial `WIFISTAT WIFISSET APSET NETMODE` |
 | Data | `/save /loaddata /export /import` ; serial `SAVE LOAD EXPORT IMPORT` |
 | Deck fisik | nonaktif v50 (`HW_DECK_ENABLE 0`); bila aktif: serial `HWOFF HWON` |
 
@@ -181,7 +182,7 @@ const char* AP_SSID   = "DMX-RGB";      // AP darurat bila WiFi gagal
 3. Upload. Serial Monitor 115200 baud harus menampilkan:
 
 ```text
-=== DMX Web Console v50 ===
+=== DMX Web Console v53 ===
 Ethernet W5500: inisialisasi... (prioritas 1)
 WiFi: menyambung ke <SSID> ....
 WiFi tersambung. IP: http://192.168.x

@@ -24,7 +24,7 @@ class SerialWorker(QObject):
     # Sinkronisasi nilai tetap dijamin polling GET berkala.
     # Hanya kontrol kontinu boleh fire-and-forget. Aksi preset/scene harus
     # menunggu ACK agar error seperti "preset kosong" terlihat operator.
-    FIRE_OPS = {"SET", "MAST", "STRB", "GRP", "ALL"}
+    FIRE_OPS = {"SET", "MAST", "STRB", "SPD", "GRP", "ALL"}
 
     def __init__(self, transport):
         super().__init__()
@@ -57,12 +57,20 @@ class SerialWorker(QObject):
             except queue.Empty:
                 kind, cmd = None, None
             if cmd is not None:
-                op = cmd.split(" ", 1)[0].upper()
-                if op in self.FIRE_OPS:
-                    self.transport.send(cmd)     # tanpa round-trip
+                # v53 (audit): IndexError perintah malformed / error transport
+                # tak boleh membunuh thread worker diam-diam (UI terlihat
+                # tersambung padahal mati). Laporkan via command_done.
+                try:
+                    op = cmd.split(" ", 1)[0].upper()
+                    if op in self.FIRE_OPS:
+                        self.transport.send(cmd)     # tanpa round-trip
+                        continue
+                    timeout = 10.0 if kind == "EXPORT" else 2.5
+                    resp = self.transport.request(cmd, timeout=timeout)
+                except Exception as e:  # noqa: BLE001
+                    self.command_done.emit(cmd, {"ok": False, "err": "worker_error",
+                                                "msg": str(e)})
                     continue
-                timeout = 10.0 if kind == "EXPORT" else 2.5
-                resp = self.transport.request(cmd, timeout=timeout)
                 if kind in ("LISTF", "LISTG", "LISTP", "LISTS", "LISTCT", "EXPORT", "WIFIST"):
                     self.data_received.emit(kind, resp)
                 else:

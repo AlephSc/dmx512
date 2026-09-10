@@ -49,6 +49,9 @@ class MixerTab(QWidget):
         self._fixtures_data = []  # cache terakhir LISTF (instance attr, bukan
                                   # class attr — mutable class attr terbagi
                                   # antar instance; review v47 finding #1)
+        # v53 (audit): drag bank aktif per-instance. Class attr lama dibagi
+        # semua instance dan bisa macet bila widget di-rebuild mid-drag.
+        self._bank_drag_keys = set()
         self._build()
 
     def _build(self):
@@ -68,6 +71,19 @@ class MixerTab(QWidget):
         self.f_strb.pressed.connect(lambda: self.active.emit("strb", True))
         self.f_strb.released.connect(lambda: self.active.emit("strb", False))
         top.addWidget(self.f_strb)
+
+        # v53: speed multiplier scene+chase (0.1-5x, firmware v51.2+).
+        # Slider 1..50 = nilai/10 agar presisi 0.1 via VFader integer.
+        self.f_spd = VFader("Speed", color="#ffd54f")
+        self.f_spd.slider.blockSignals(True)
+        self.f_spd.slider.setRange(1, 50)
+        self.f_spd.slider.setValue(10)
+        self.f_spd.slider.blockSignals(False)
+        self.f_spd.val_lbl.setText("x1.0")
+        self.f_spd.slider.valueChanged.connect(self._on_spd_change)
+        self.f_spd.pressed.connect(lambda: self.active.emit("spd", True))
+        self.f_spd.released.connect(lambda: self.active.emit("spd", False))
+        top.addWidget(self.f_spd)
 
         side = QVBoxLayout()
         self.b_black = QPushButton("BLACKOUT")
@@ -124,6 +140,11 @@ class MixerTab(QWidget):
         self.b_hw.setText("Tombol Fisik: ON" if on else "Tombol Fisik: OFF")
         self.cmd.emit("HWON" if on else "HWOFF")
 
+    def _on_spd_change(self, v):
+        # v53: slider 1..50 -> 0.1..5.0; label xN.N (VFader menulis int mentah).
+        self.f_spd.val_lbl.setText(f"x{v / 10:.1f}")
+        self.cmd.emit(f"SPD {v / 10:.1f}")
+
     # ---- data masuk dari ESP32 ---------------------------------------------
     def build_groups(self, groups):
         """v47: data-only. Rendering grup terjadi di build_fixtures() agar
@@ -168,6 +189,7 @@ class MixerTab(QWidget):
         self._clear_layout(self.fix_layout)
         self.group_faders = []
         self.chan_faders = {}
+        self._bank_drag_keys.clear()  # v53: rebuild = widget baru; state drag lama tak berlaku
 
         # Kelompokkan fixture berdasarkan tipe, pertahankan urutan kemunculan
         type_groups = OrderedDict()
@@ -387,6 +409,15 @@ class MixerTab(QWidget):
             self.f_master.set_value(j["master"])
         if "strb" not in active_keys and "strb" in j:
             self.f_strb.set_value(j["strb"])
+        # v53: speed dari state GET ("spd" float 0.1-5). Label xN.N.
+        if "spd" not in active_keys and "spd" in j:
+            try:
+                sv = min(5.0, max(0.1, float(j["spd"])))
+            except (TypeError, ValueError):  # noqa: BLE001
+                sv = None
+            if sv is not None:
+                self.f_spd.set_value(int(round(sv * 10)))
+                self.f_spd.val_lbl.setText(f"x{sv:.1f}")
         if "chaseOn" in j:
             on = bool(j["chaseOn"])
             if self.b_chase.isChecked() != on:
@@ -407,15 +438,8 @@ class MixerTab(QWidget):
                 self.b_hw.setChecked(hon)
                 self.b_hw.setText("Tombol Fisik: ON" if hon else "Tombol Fisik: OFF")
         cur = j.get("cur", {})
-        # Fader grup: hanya di-set bila SEMUA member seragam. Kalau member
-        # berbeda (satu fixture digeser manual), posisi fader grup dibiarkan
-        # -> tidak ada lompatan visual (paritas syncGroups web v43).
-        for i, f in self.group_faders:
-            if f"grp{i}" in active_keys:
-                continue
-            vals = st.group_values(i)
-            if vals and all(v == vals[0] for v in vals):
-                f.set_value(vals[0])
+        # v48: fader grup dihapus (diganti bank); group_faders selalu kosong —
+        # loop lama dihapus v53 (dead code). Sinkron bank ada di bawah.
         for key, f in self.chan_faders.items():
             if key in active_keys:
                 continue

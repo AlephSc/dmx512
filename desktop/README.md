@@ -50,6 +50,8 @@ Perintah dikirim sebagai satu baris teks dengan `\n`. Semua respons adalah JSON.
 | LISTS | `LISTS` | Array scene 20Ã—30 langkah |
 | MAST \<v\> | `MAST 200` | Master dimmer |
 | STRB \<v\> | `STRB 128` | Strobe master |
+| SPD \<x\> | `SPD 1.5` | Speed multiplier scene+chase 0.1-5 (fw v51.2+) |
+| NETMODE [STA 0/1] [AP 0/1] | `NETMODE STA 1 AP 1` | Saklar independen radio; tanpa argumen = status (fw v53+) |
 | SET \<fi\_c\>=\<v\> | `SET 0_1=255` | Set channel tunggal |
 | GRP \<i\> \<v\> | `GRP 3 192` | Grup fader (tipe+offset) |
 | PSL \<n\> | `PSL 5` | Play/load preset n |
@@ -92,7 +94,7 @@ Catatan penting:
 
 Karena fitur seperti `ALL` (blackout/par full), paritas presisi REC/PFH (ms), serta metadata command (`LISTF/LISTG`) tersedia sejak v38. Pastikan firmware terupdate sebelum membangun desktop atau menggunakan .exe.
 
-## Protokol serial (ESP32 firmware v38+) — diperluas v39
+## Protokol serial (ESP32 firmware v38+) â€” diperluas v39
 
 Perintah dikirim sebagai satu baris teks dengan `\n`. Semua respons adalah JSON `{ok:true/false}`.
 
@@ -102,9 +104,11 @@ Perintah dikirim sebagai satu baris teks dengan `\n`. Semua respons adalah JSON 
 | LISTF | `LISTF` | Daftar fixture (untuk render mixer otomatis) |
 | LISTG | `LISTG` | Daftar grup fader |
 | LISTP | `LISTP` | Metadata preset (used, warna preview, f/h) |
-| LISTS | `LISTS` | Array scene 20×30 langkah |
+| LISTS | `LISTS` | Array scene 20Ã—30 langkah |
 | MAST \<v\> | `MAST 200` | Master dimmer |
 | STRB \<v\> | `STRB 128` | Strobe master |
+| SPD \<x\> | `SPD 1.5` | Speed multiplier scene+chase 0.1-5 (fw v51.2+) |
+| NETMODE [STA 0/1] [AP 0/1] | `NETMODE STA 1 AP 1` | Saklar independen radio; tanpa argumen = status (fw v53+) |
 | SET \<fi\_c\>=\<v\> | `SET 0_1=255` | Set channel tunggal |
 | GRP \<i\> \<v\> | `GRP 3 192` | Fader grup (tipe+offset) |
 | PSL \<n\> | `PSL 3` | Play/load preset n |

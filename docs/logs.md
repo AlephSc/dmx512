@@ -1,5 +1,80 @@
 # Session Logs - DMX512 Controller ESP32 Project
 
+## Session 72 - 2026-09-09 - v53: saklar independen STA/AP + fix audit speed
+
+### Permintaan
+1. STA + AP bisa dinyalakan/dimatikan masing-masing (Opsi 4: tanpa NAT).
+2. Audit fitur speed controller (v51.2/v51.3).
+3. Setelah implementasi: audit ulang seluruh WebUI + desktop.
+
+### Implementasi (dmx_web_rgb.ino, v52 → v53)
+1. **Flag NVS** `staEnable`/`apEnable` (`dmxwifi` key `staen`/`apen`,
+   default 1/0 = perilaku lama persis) + `loadNetSwitches()` + helper
+   `ensureApOn()` (tanpa sentuh STA, tanpa tendang client).
+2. **Boot matrix di `setup()`**: STA dilewati bila off; AP persisten via
+   `ensureApOn()`; safety net runtime (0,0 tanpa ETH → paksa AP, NVS tak
+   diubah); radio `WIFI_OFF` bila keduanya off + ETH up.
+3. **`wifiReconnectTick()`**: early-return bila STA off; `ensureApOn()`
+   saat sukses; guard re-`softAP` redundan di path 6x-gagal.
+4. **Endpoint** `POST /netmode?sta=&ap=` (+GET paritas, argumen parsial,
+   parse ketat hanya "0"/"1") + **serial** `NETMODE [STA 0/1] [AP 0/1]`
+   (tanpa argumen = status) via helper `setNetSwitches`/`applyStaAp`
+   (guard `net_would_lockout`, persist, apply live, `stateRevision++`).
+5. **Status**: field `staEnable`/`apEnable` di `/wifistat` + `WIFIST`.
+6. **Auto-enable STA** di `/wifiset` + `WIFIS` (kredensial baru = niat
+   menyambung; sebelumnya tick menghapus pending pasca-disconnect).
+7. **WebUI**: section Radio (checkbox STA/AP + Terapkan) + prefill +
+   status AP live; hint channel-follow.
+8. **Speed fix #2**: clamp fade hanya saat auto-run; pload/PSL manual
+   memakai fade rekaman apa adanya (komentar lama dikoreksi).
+9. **Desktop**: slider Speed (1..50 → 0.1..5.0, anti-echo `spd`) +
+   mapping `SPD`→`/ctrl?spd=` + `SPD` di `FIRE_OPS`; checkbox radio STA/AP
+   + `NETMODE` mapping + hint `net_would_lockout`; tabel protokol README.
+
+### Hasil audit speed (sebelum fix)
+- MEDIUM: desktop buta speed total (nol referensi `spd`) → diperbaiki.
+- LOW: clamp bocor ke pload manual + komentar tak akurat → diperbaiki.
+- LOW: ganti speed mid-step tak menjadwal ulang (dibiarkan; ekspektasi).
+- INFO: baca `speedMul` Core 0 tanpa mutex jinak (float 32-bit atomik);
+  `effDur` scene pakai `chaseMs` (=`sceneMs`, benar tapi rapuh).
+
+### Audit penuh WebUI + desktop pasca-implementasi (2 subagent + verifikasi manual)
+Diperbaiki langsung (kritis & aman):
+- HIGH: ACK serial fire-ops (MAST/STRB/SPD/SET/GRP/ALL) meracuni `request()`
+  berikutnya (WIFIST palsu, false-OK NETMODE) → ACK sukses dimatikan,
+  `stateRevision++` dipertahankan (sync via WS/GET). Error diagnostic tetap dibalas.
+- HIGH: `IndexError` perintah malformed membunuh thread worker diam-diam →
+  guard `_translate` + `try/except` worker → `command_done worker_error`.
+- HIGH: `int()` import korup menggagalkan batch + ESP32 macet `IMPORT_BEGIN`
+  (tanpa END) → koersi aman + `chans` non-list.
+- MED: `WIFIST` terima ACK basi `{"ok":true}` → validasi kunci status.
+- MED: checkbox radio basi saat connect → antre `WIFIST` sekali.
+- MED: `NETMODE`/`WIFIS` tanpa respons (putus jaringan sendiri) diam →
+  cabang `resp is None` + hint; hint `net_would_lockout`.
+- MED: `_bank_drag_keys` class-attr dibagi instance → instance + clear rebuild.
+- MED: field radio kini di `buildStateJson` + `syncFromServer` + checkbox
+  desktop ikut live GET (sync lintas-client penuh).
+- LOW: loop mati `group_faders`, `is_http` ganda, VID duplikat, aksi MIDI `spd`
+  (CC, tanpa binding default), label "AP darurat"→"AP", guard `apLine`/
+  `btnNetMode`, komentar GET/POST, teks failsafe AP.
+Dibiarkan (lapor saja, butuh uji browser/hardware atau di luar scope):
+- HIGH pre-existing: ID ganda `ctChannels` (input 2381 vs div 2390) merusak
+  editor custom type; `syncFromServer` early-return `master===undefined`
+  menggugurkan seluruh sync (3098).
+- MED: banjir thread SPD/drag, bank N×SET vs agregat WS, WIFIS spasi,
+  APSET belum ada di desktop, anti-echo spd mouse-only.
+- INFO: gap paritas CT editor + indikator deck; `spd` tak dijadwal-ulang mid-step.
+
+### Validasi
+- `git diff --check` bersih. Python tak tersedia di mesin build
+  (cek manual ganti `py_compile`): review diff baris-per-baris +
+  perbaikan 3 temuan review (parse `/netmode` ketat, `WIFI_OFF` boot,
+  `blockSignals` init slider, hint lockout).
+- Compile Arduino IDE + upload oleh user; Serial harus tampil
+  `=== DMX Web Console v53 ===`; hard-refresh browser.
+- File `desktop/README.md` sempat kena re-encode 2 baris mojibake lama
+  (cp1252) oleh tool edit → diperbaiki jadi UTF-8 benar (—/×).
+
 ## Session 71 - 2026-09-07 - v52: edit nama & sandi AP darurat kustom (NVS)
 
 ### Permintaan

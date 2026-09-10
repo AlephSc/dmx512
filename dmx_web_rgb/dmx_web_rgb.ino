@@ -70,7 +70,7 @@ struct Fixture;
 
 // Tag build: tampil di header UI & Serial. Kalau tag lama masih tampil di
 // browser setelah upload -> berarti cache/upload bermasalah, bukan kodenya.
-#define BUILD_TAG "v52"
+#define BUILD_TAG "v53"
 
 // ---------------------------------------------------------------
 // WIFI - Station (konek ke router), fallback AP darurat
@@ -112,6 +112,17 @@ const char* effPass(){ return customSsid.length()>0 ? customPass.c_str() : WIFI_
 // v52: kredensial AP darurat kustom (persist NVS "dmxwifi" key apssid/appass,
 // paritas customSsid/customPass STA). Kosong = default AP_SSID/AP_PASS.
 String customApSsid, customApPass;
+// v53: saklar independen radio — staEnable/apEnable (NVS "dmxwifi" key
+// staen/apen, UChar). Default (1,0) = perilaku lama persis: STA dicoba, AP
+// hanya darurat. (1,1) = STA+AP selalu nyala. (0,1) = AP saja. (0,0) hanya
+// sah bila ETH up, kalau tidak ditolak paksa (anti-lockout).
+bool staEnable=true, apEnable=false;
+void loadNetSwitches(){
+  if(!wifiNvs.begin("dmxwifi",true)){ staEnable=true; apEnable=false; return; }
+  staEnable = wifiNvs.getUChar("staen",1)!=0;
+  apEnable  = wifiNvs.getUChar("apen",0)!=0;
+  wifiNvs.end();
+}
 void loadApCreds(){
   if(!wifiNvs.begin("dmxwifi",true)){ customApSsid=""; customApPass=""; return; }
   customApSsid = wifiNvs.getString("apssid","");
@@ -120,6 +131,18 @@ void loadApCreds(){
 }
 const char* effApSsid(){ return customApSsid.length()>0 ? customApSsid.c_str() : AP_SSID; }
 const char* effApPass(){ return customApPass.length()>0 ? customApPass.c_str() : AP_PASS; }
+
+// v53: pastikan AP nyala sesuai apEnable TANPA menyentuh koneksi STA.
+// Aman dipanggil berulang: bila AP sudah nyala, langsung kembali (client tak ditendang).
+void ensureApOn(){
+  if(!apEnable) return;
+  if(WiFi.getMode() & WIFI_AP) return;
+  if((WiFi.getMode() & WIFI_STA) && WiFi.status()==WL_CONNECTED) WiFi.mode(WIFI_AP_STA);
+  else WiFi.mode(WIFI_AP);
+  WiFi.softAP(effApSsid(), effApPass());
+  Serial.print("AP persisten aktif: "); Serial.print(effApSsid());
+  Serial.print(" | Buka browser: http://"); Serial.println(WiFi.softAPIP());
+}
 
 // ---------------------------------------------------------------
 // PIN ESP32 -> MAX485
@@ -1434,13 +1457,16 @@ void applyPresetToWant(int idx){
   // dari durasi langkah efektif. Bila fade 600ms tapi hold 100ms, langkah
   // berikut datang saat fade baru jalan 1/6 -> out[] tertinggal di campuran
   // warna lama+baru (gejala: "blink ke warna preset lain, seperti tercampur").
-  // Clamp: setiap langkah dijamin mencapai warna finalnya. Saat idle (bukan
-  // auto-run) efDur = hold preset sendiri — fade manual tak pernah > hold,
-  // jadi perilaku pload/PSL tak berubah.
+  // Clamp: setiap langkah dijamin mencapai warna finalnya.
+  // v53 (audit speed #2): clamp HANYA saat auto-run (chase/scene). pload/PSL
+  // manual memakai fade rekaman apa adanya — walau fade > hold.
   float sm = clampSpeed(speedMul);
-  uint32_t effDur = (uint32_t)((chaseOn||sceneOn) ? (chaseMs/sm) : chaseMs);
-  if(effDur < 25) effDur = 25;                 // v51.3: floor 1 frame (dari 20) — fade minimal satu frame utuh
-  if(fadeMs > effDur) fadeMs = effDur;
+  uint32_t effDur = chaseMs;
+  if(chaseOn||sceneOn){
+    effDur = (uint32_t)(chaseMs/sm);
+    if(effDur < 25) effDur = 25;               // v51.3: floor 1 frame — fade minimal satu frame utuh
+    if(fadeMs > effDur) fadeMs = effDur;
+  }
   uint32_t boWin = (effDur < 350) ? effDur : 350;   // blackout-on-move juga di-cap
   for(int f=0; f<N_FIX; f++){
     // Deteksi gerakan besar pada pan/tilt (ch0 & ch2) -> aktifkan blackout sementara.
@@ -1712,6 +1738,8 @@ void onWifiStat(){
   j+=",\"rssi\":";      j+= String(sta?WiFi.RSSI():0);
   j+=",\"apActive\":";  j+= (WiFi.getMode() & WIFI_AP)?"true":"false";
   j+=",\"apSsid\":\"";  j+= String(effApSsid()); j+="\"";   // v52: AP aktif/tersimpan
+  j+=",\"staEnable\":"; j+= staEnable?"true":"false";       // v53: saklar radio
+  j+=",\"apEnable\":";  j+= apEnable?"true":"false";
   j+="}";
   server.send(200,"application/json",j);
 }
@@ -1728,6 +1756,8 @@ void onWifiSet(){
   wifiNvs.end();
   if(!ok){ sendApiError(500,"wifi_nvs_fail","Gagal menyimpan kredensial ke flash"); return; }
   customSsid=ssid; customPass=pass;
+  // v53: kredensial baru = niat menyambung -> pastikan STA menyala.
+  if(!staEnable){ staEnable=true; wifiNvs.begin("dmxwifi",false); wifiNvs.putUChar("staen",1); wifiNvs.end(); }
   wifiPending=true; wifiTryCount=0;
   // GRACE 800 ms sebelum tick pertama: biar respons HTTP/serial ini sempat
   // terkirim dulu; pemutusan koneksi lama dilakukan wifiReconnectTick().
@@ -1736,11 +1766,13 @@ void onWifiSet(){
 }
 void wifiReconnectTick(){
   if(!wifiPending) return;
+  if(!staEnable){ wifiPending=false; return; }  // v53: STA dimatikan — tak ada retry
   if((WiFi.getMode() & WIFI_STA) && WiFi.status()==WL_CONNECTED){
     wifiPending=false;
     Serial.print("WiFi kustom tersambung: "); Serial.print(customSsid);
     Serial.print(" IP: http://"); Serial.println(WiFi.localIP());
     stateRevision++;                       // UI ikut refresh status
+    ensureApOn();                            // v53: AP persisten ikut nyala
     return;
   }
   if(millis()-wifiTryAt < 2000) return;    // jeda antar percobaan
@@ -1750,7 +1782,8 @@ void wifiReconnectTick(){
     Serial.println("WiFi kustom GAGAL setelah 6 percobaan -> kembali ke kredensial bawaan + AP darurat");
     // URUTAN PENTING: aktifkan AP dulu (bila tanpa Ethernet) agar operator
     // tidak pernah terkunci, BARU coba kredensial bawaan sebagai STA.
-    if(!ETH.linkUp()){ WiFi.mode(WIFI_AP_STA); WiFi.softAP(effApSsid(), effApPass()); }
+    // v53: jangan re-softAP bila AP sudah nyala (tendang client sia-sia).
+    if(!ETH.linkUp() && !(WiFi.getMode() & WIFI_AP)){ WiFi.mode(WIFI_AP_STA); WiFi.softAP(effApSsid(), effApPass()); }
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     return;
   }
@@ -1784,6 +1817,66 @@ void onApSet(){
   customApSsid=ssid; customApPass=pass;
   if(WiFi.getMode() & WIFI_AP) WiFi.softAP(effApSsid(), effApPass());   // re-apply langsung
   Serial.printf("AP kustom tersimpan: %s\n", ssid.c_str());
+  sendApiOk();
+}
+
+// ---------------------------------------------------------------
+// v53: SAKLAR INDEPENDEN STA/AP (Web UI, desktop, serial)
+// GET/POST /netmode?sta=0/1&ap=0/1 -> argumen parsial diizinkan (yang tak
+// disebut dipertahankan). Guard anti-lockout: menolak state tanpa jalan
+// akses (STA off + AP off + ETH down).
+// ---------------------------------------------------------------
+// Terapkan saklar radio secara live. Hanya dipanggil setelah validasi +
+// persist sukses (via setNetSwitches).
+void applyStaAp(bool nstaE, bool napE){
+  bool apWasUp = (WiFi.getMode() & WIFI_AP);
+  staEnable=nstaE; apEnable=napE;
+  if(!staEnable){
+    wifiPending=false;
+    WiFi.disconnect();
+    if(apEnable){
+      WiFi.mode(WIFI_AP);
+      if(!apWasUp) WiFi.softAP(effApSsid(), effApPass());  // sudah nyala -> jangan tendang client
+      Serial.print("NETMODE: STA dimatikan, AP nyala: "); Serial.println(effApSsid());
+    } else {
+      // Caller menjamin ETH up di titik ini — radio WiFi boleh mati total.
+      WiFi.mode(WIFI_OFF);
+      Serial.println("NETMODE: STA+AP dimatikan (akses via Ethernet).");
+    }
+  } else {
+    // STA dinyalakan: picu flow reconnect seperti /wifiset (grace + retry).
+    wifiPending=true; wifiTryCount=0; wifiTryAt=millis()+800;
+    ensureApOn();
+    Serial.println("NETMODE: STA dinyalakan -- reconnect dijadwalkan.");
+  }
+  stateRevision++;
+}
+// Validasi + simpan NVS + terapkan. False + errCode bila ditolak/gagal.
+bool setNetSwitches(bool nstaE, bool napE, const char* &errCode){
+  if(!nstaE && !napE && !ETH.linkUp()){ errCode="net_would_lockout"; return false; }
+  if(!wifiNvs.begin("dmxwifi",false)){ errCode="net_nvs_begin_failed"; return false; }
+  bool ok = wifiNvs.putUChar("staen",nstaE?1:0)>0 && wifiNvs.putUChar("apen",napE?1:0)>0;
+  wifiNvs.end();
+  if(!ok){ errCode="net_nvs_fail"; return false; }
+  applyStaAp(nstaE, napE);
+  return true;
+}
+void onNetMode(){
+  bool hasSta=server.hasArg("sta"), hasAp=server.hasArg("ap");
+  if(!hasSta && !hasAp){ sendApiError(400,"net_no_arg","Sertakan ?sta=0/1 dan/atau ?ap=0/1"); return; }
+  // v53: parse ketat — toInt() mengubah sampah ("abc") jadi 0 = STA mati
+  // diam-diam. Hanya "0"/"1" yang diterima.
+  String sSta = hasSta ? server.arg("sta") : "", sAp = hasAp ? server.arg("ap") : "";
+  sSta.trim(); sAp.trim();
+  if((hasSta && sSta!="0" && sSta!="1")||(hasAp && sAp!="0" && sAp!="1")){ sendApiError(400,"net_bad_value","Nilai sta/ap harus 0 atau 1"); return; }
+  bool nstaE = hasSta ? (sSta=="1") : staEnable;
+  bool napE  = hasAp  ? (sAp=="1")  : apEnable;
+  const char* err=nullptr;
+  if(!setNetSwitches(nstaE, napE, err)){
+    if(String(err)=="net_would_lockout") sendApiError(400,err,"Menolak: tak ada jalan akses tersisa (STA+AP off tanpa Ethernet)");
+    else sendApiError(500,err,"Gagal menyimpan saklar radio");
+    return;
+  }
   sendApiOk();
 }
 
@@ -2251,11 +2344,16 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <div class="actions"><button class="btn-go act" id="btnWifiSet">Sambungkan &amp; Simpan</button></div>
     <p class="sub">Kredensial tersimpan di flash &amp; dipakai tiap boot. Gagal 6x percobaan = otomatis kembali ke bawaan + AP darurat.</p>
     <h3 style="margin-top:14px">AP Darurat <span style="color:var(--muted);font-weight:400">nama &amp; sandi kustom</span></h3>
-    <p class="sub" id="apStat">AP dipakai bila WiFi &amp; Ethernet sama-sama gagal (supaya tidak terkunci dari device).</p>
+    <p class="sub" id="apStat">Status AP: memuat...</p>
     <label><span class="lab">SSID AP</span><input type="text" id="apssid" maxlength="32" placeholder="nama AP darurat" style="background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;grid-column:2/4"></label>
     <label><span class="lab">Sandi AP</span><input type="password" id="appass" maxlength="63" placeholder="minimal 8 karakter (kosong = tanpa sandi)" style="background:#14161b;color:#dfe3ea;border:1px solid #3a3f4b;border-radius:4px;padding:6px;grid-column:2/4"></label>
     <div class="actions"><button class="btn-reset act" id="btnApSet">Simpan AP</button></div>
     <p class="sub">Tersimpan ke flash, dipakai AP berikutnya aktif. Jika AP sedang aktif, AP langsung pakai SSID baru (koneksi AP saat ini terputus — hubungkan ulang ke SSID baru).</p>
+    <h3 style="margin-top:14px">Radio <span style="color:var(--muted);font-weight:400">STA &amp; AP independen</span></h3>
+    <label><span class="lab">WiFi STA</span><span><input type="checkbox" id="swSta" checked> <span class="sub">sambung ke WiFi tujuan</span></span></label>
+    <label><span class="lab">AP</span><span><input type="checkbox" id="swAp"> <span class="sub">pancarkan AP (SSID di atas)</span></span></label>
+    <div class="actions"><button class="btn-go act" id="btnNetMode">Terapkan Radio</button></div>
+    <p class="sub">Kombinasi bebas: STA saja / AP saja / keduanya. Mematikan keduanya tanpa Ethernet ditolak (anti-lockout). Saat keduanya nyala, channel AP mengikuti WiFi — client AP reconnect sesaat. Catatan: AP bisa menyala darurat walau switch AP off bila semua jalur lain gagal.</p>
   </section>
 
   <section class="panel" id="patchPanel">
@@ -3001,6 +3099,10 @@ function syncFromServer(j, skipActive){
   if(!skipActive || activeKey!=='master'){ $('master').value=j.master; $('masterv').textContent=j.master; paintFill($('master')); }
   if(j.strb!==undefined && (!skipActive || activeKey!=='mstrb')){ $('mstrb').value=j.strb; $('mstrbv').textContent=j.strb; paintFill($('mstrb')); }
   if(j.spd!==undefined && (!skipActive || activeKey!=='spd')){ $('spd').value=j.spd; $('spdv').innerHTML='&times;'+(+j.spd).toFixed(1); paintFill($('spd')); }
+  // v53: switch radio ikut state broadcast (sync lintas-client; jangan timpa yang sedang diklik)
+  if(j.staEnable!==undefined){ const ss=$('swSta'); if(ss && document.activeElement!==ss) ss.checked=!!j.staEnable; }
+  if(j.apEnable!==undefined){ const sa=$('swAp'); if(sa && document.activeElement!==sa) sa.checked=!!j.apEnable; }
+  if(j.apActive!==undefined){ const al=$('apStat'); if(al) al.textContent = j.apActive ? ('AP nyala \u00b7 '+(j.apSsid||'')) : 'AP mati.'; }
   allKeys.forEach(k=>{
     if(skipActive && k===activeKey) return;
     // v48 anti-bounce: channel sedang di-drag BANK -> jangan ditimpa echo
@@ -3305,10 +3407,18 @@ function wifiRefresh(){
     const st=$('wifiStat'); if(!st) return;
     if(j.connected){ st.textContent='Terhubung ke "'+j.ssid+'" \u00b7 IP '+j.ip+' \u00b7 '+j.rssi+' dBm'+(j.custom?' \u00b7 kustom':''); st.style.color='#7bd88f'; }
     else if(j.pending){ st.textContent='Mencoba menyambung ke "'+j.ssid+'"...'; st.style.color='#ffd54f'; }
-    else { st.textContent=(j.apActive?'Mode AP darurat \u00b7 IP '+j.ip:'Tidak terhubung'); st.style.color='#ff8a65'; }
+    else { st.textContent=(j.apActive?'Mode AP \u00b7 IP '+j.ip:'Tidak terhubung'); st.style.color='#ff8a65'; }
     // v52: prefill SSID AP kustom (satu kali; jangan timpa yang sedang diedit)
     const apIn=$('apssid');
     if(apIn && j.apSsid!==undefined && !apIn.dataset.filled){ apIn.value=j.apSsid; apIn.dataset.filled='1'; }
+    // v53: sinkron switch radio (jangan timpa yang sedang diklik)
+    const swS=$('swSta'), swA=$('swAp');
+    if(swS && j.staEnable!==undefined && document.activeElement!==swS) swS.checked=!!j.staEnable;
+    if(swA && j.apEnable!==undefined && document.activeElement!==swA) swA.checked=!!j.apEnable;
+    const apLine=$('apStat');
+    if(apLine && j.apActive!==undefined){
+      apLine.textContent = j.apActive ? ('AP nyala \u00b7 '+(j.apSsid||'')) : 'AP mati.';
+    }
   }).catch(()=>{});
 }
 $('btnWifiSet').addEventListener('click',()=>{
@@ -3331,6 +3441,18 @@ $('btnApSet').addEventListener('click',()=>{
   api('/apset?ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass))
     .then(()=>{ toast('AP kustom tersimpan'); wifiRefresh(); })
     .catch(e=>showError(e.message));
+});
+// v53: saklar independen STA/AP.
+$('btnNetMode').addEventListener('click',()=>{
+  const swS=$('swSta'), swA=$('swAp');
+  if(!swS||!swA){ toast('Panel radio belum siap'); return; }
+  const sta=swS.checked?1:0, ap=swA.checked?1:0;
+  api('/netmode?sta='+sta+'&ap='+ap)
+    .then(()=>{
+      toast('Radio diterapkan (STA '+sta+', AP '+ap+')');
+      let n=0; const t=setInterval(()=>{ n++; wifiRefresh(); if(n>=8) clearInterval(t); },2000);
+    })
+    .catch(e=>{ showError(e.message); wifiRefresh(); });
 });
 wifiRefresh();
 </script>
@@ -3572,8 +3694,11 @@ String buildStateJson(){
   bool so=sceneOn;
   float spd=clampSpeed(speedMul);             // v51.2: snapshot di bawah mutex
   xSemaphoreGive(dmxMutex);
+  bool staE=staEnable, apE=apEnable;              // v53: ditulis Core 1 saja
+  bool apOn=(WiFi.getMode() & WIFI_AP);           // v53: status AP live
+  String apS=String(effApSsid());                 // v53: Core 1 saja, aman
   String j="{";
-  j.reserve(2048);
+  j.reserve(2120);
   j+="\"build\":\""+String(BUILD_TAG)+"\",";
   j+="\"sceneRev\":"+String(sceneRev.load())+",";   // v46: client reload /scenes saat berubah
   j+="\"artnet\":\""+String(artnetMode?"network":"local")+"\",";   // v49: indikator mode
@@ -3586,7 +3711,12 @@ String buildStateJson(){
 #else
   j+="\"hw\":false,";   // v50: deck fisik dikompilasi keluar
 #endif
-  j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"spd\":"+String(spd,1)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false")+",\"cur\":{";
+  j+="\"master\":"+String(m)+",\"strb\":"+String((int)strobeWant)+",\"spd\":"+String(spd,1)+",\"fade\":"+String(fadeMs)+",\"chase\":"+String(chaseMs)+",\"chaseOn\":"+(chaseOn?"true":"false")+",\"sceneOn\":"+(so?"true":"false")+",\"scenesp\":"+String(sceneMs)+",\"scn\":"+String(si)+",\"stp\":"+String(st)+",\"selectedPreset\":"+String(selectedPreset)+",\"selectedScene\":"+String(selectedScene)+",\"revision\":"+String(stateRevision.load())+",\"nvsDirty\":"+(nvsDirty?"true":"false")+",\"lastSaveOk\":"+(lastSaveOk?"true":"false");
+  j+=",\"staEnable\":"; j+=(staE?"true":"false");   // v53: saklar radio (sync lintas-client)
+  j+=",\"apEnable\":"; j+=(apE?"true":"false");
+  j+=",\"apActive\":"; j+=(apOn?"true":"false");
+  j+=",\"apSsid\":\""; j+=apS; j+="\"";
+  j+=",\"cur\":{";
   bool first=true;
   for(int f=0;f<N_FIX;f++)for(uint16_t c=0;c<fix[f].foot;c++){
     if(!first) j+=","; first=false;
@@ -3886,7 +4016,10 @@ void handleSerialCmd(String cmd){
     masterWant=cv(args.toInt()); masterOut=masterWant;
     xSemaphoreGive(dmxMutex);
     stateRevision++;
-    Serial.println("{\"ok\":true}");
+    // v53: TANPA balasan (fire-and-forget). Desktop mengirim MAST puluhan
+    // kali/detik tanpa menunggu; setiap ACK basi bisa termakan request()
+    // berikutnya sebagai respons WIFIST/NETMODE palsu. Sinkron nilai tetap
+    // mengalir via stateRevision -> WS broadcast + GET polling.
     return;
   }
   if(op=="STRB"){
@@ -3894,14 +4027,15 @@ void handleSerialCmd(String cmd){
     strobeWant=cv(args.toInt());
     xSemaphoreGive(dmxMutex);
     stateRevision++;
-    Serial.println("{\"ok\":true}");    return;
+    // v53: tanpa balasan (alasan sama dengan MAST di atas).
+    return;
   }
   if(op=="SPD"){                      // v51.2: SPD <x> — speed multiplier 0.1–5.0
     xSemaphoreTake(dmxMutex,portMAX_DELAY);
     speedMul = clampSpeed(args.toFloat());
     xSemaphoreGive(dmxMutex);
     stateRevision++;
-    Serial.println(String("{\"ok\":true,\"spd\":")+String(speedMul,1)+"}");
+    // v53: tanpa balasan (alasan sama dengan MAST di atas; spd ikut GET).
     return;
   }
   if(op=="SET"){                      // SET <fi>_<ch>=<val>
@@ -3921,7 +4055,8 @@ void handleSerialCmd(String cmd){
           out[ch]=want[ch];                    // snap: fader manual terasa langsung
           xSemaphoreGive(dmxMutex);
           stateRevision++;
-          Serial.println("{\"ok\":true}");
+          // v53: tanpa balasan sukses (fire-and-forget; lihat MAST).
+          // Balasan error di bawah dipertahankan (jarang, diagnostik).
           return;
         }
       }
@@ -3998,7 +4133,8 @@ void handleSerialCmd(String cmd){
        }
        xSemaphoreGive(dmxMutex);
        stateRevision++; nvsDirty=true;
-       Serial.println("{\"ok\":true}");
+       // v53: tanpa balasan sukses (fire-and-forget; lihat MAST).
+       // Balasan error di bawah dipertahankan (jarang, diagnostik).
      } else Serial.println("{\"ok\":false,\"err\":\"GRP <i> <v>\"}");
      return;
    }
@@ -4271,7 +4407,7 @@ void handleSerialCmd(String cmd){
      }
      xSemaphoreGive(dmxMutex);
      stateRevision++;
-     Serial.println("{\"ok\":true}");
+     // v53: tanpa balasan (fire-and-forget; lihat MAST).
      return;
    }
 
@@ -4360,6 +4496,8 @@ void handleSerialCmd(String cmd){
       j+=",\"rssi\":"; j+= String(sta?WiFi.RSSI():0);
       j+=",\"apActive\":"; j+= (WiFi.getMode() & WIFI_AP)?"true":"false";
       j+=",\"apSsid\":\""; j+= String(effApSsid()); j+="\"";   // v52
+      j+=",\"staEnable\":"; j+= staEnable?"true":"false";      // v53: saklar radio
+      j+=",\"apEnable\":";  j+= apEnable?"true":"false";
       j+="}";
       Serial.println(j);
       return;
@@ -4377,6 +4515,8 @@ void handleSerialCmd(String cmd){
       wifiNvs.end();
       if(!ok){ Serial.println("{\"ok\":false,\"err\":\"gagal simpan NVS\"}"); return; }
       customSsid=ssid; customPass=pass;
+      // v53: kredensial baru = niat menyambung -> pastikan STA menyala.
+      if(!staEnable){ staEnable=true; wifiNvs.begin("dmxwifi",false); wifiNvs.putUChar("staen",1); wifiNvs.end(); }
       wifiPending=true; wifiTryAt=millis(); wifiTryCount=0;
       WiFi.disconnect();
       Serial.println("{\"ok\":true}");
@@ -4399,6 +4539,34 @@ void handleSerialCmd(String cmd){
       if(!ok){ Serial.println("{\"ok\":false,\"err\":\"gagal simpan NVS\"}"); return; }
       customApSsid=ssid; customApPass=pass;
       if(WiFi.getMode() & WIFI_AP) WiFi.softAP(effApSsid(), effApPass());
+      Serial.println("{\"ok\":true}");
+      return;
+    }
+    // v53: NETMODE [STA 0/1] [AP 0/1] -> saklar independen radio (paritas
+    // POST /netmode web). Tanpa argumen = status JSON.
+    if(op=="NETMODE"){
+      args.trim();
+      bool staUp=((WiFi.getMode()&WIFI_STA)&&WiFi.status()==WL_CONNECTED);
+      if(args.length()==0){
+        Serial.print("{\"ok\":true,\"staEnable\":"); Serial.print(staEnable?"true":"false");
+        Serial.print(",\"apEnable\":"); Serial.print(apEnable?"true":"false");
+        Serial.print(",\"sta\":"); Serial.print(staUp?"true":"false");
+        Serial.print(",\"apActive\":"); Serial.print((WiFi.getMode()&WIFI_AP)?"true":"false");
+        Serial.print(",\"eth\":"); Serial.print(ETH.linkUp()?"true":"false");
+        Serial.println("}");
+        return;
+      }
+      String a=args; a.toUpperCase();
+      int nsta=staEnable?1:0, nap=apEnable?1:0;
+      bool okParse=true;
+      int p=a.indexOf("STA");
+      if(p>=0){ int d=-1; for(int i=p+3;i<a.length();i++){ if(a[i]=='0'||a[i]=='1'){ d=a[i]-'0'; break; } if(a[i]!=' '&&a[i]!='='&&a[i]!=':'&&a[i]!='\t'){ break; } } if(d<0) okParse=false; else nsta=d; }
+      p=a.indexOf("AP");
+      // "AP" juga cocok di dalam kata lain — terima karena sintaks perintah sempit.
+      if(p>=0){ int d=-1; for(int i=p+2;i<a.length();i++){ if(a[i]=='0'||a[i]=='1'){ d=a[i]-'0'; break; } if(a[i]!=' '&&a[i]!='='&&a[i]!=':'&&a[i]!='\t'){ break; } } if(d<0) okParse=false; else nap=d; }
+      if(!okParse || (a.indexOf("STA")<0 && a.indexOf("AP")<0)){ Serial.println("{\"ok\":false,\"err\":\"pakai: NETMODE [STA 0/1] [AP 0/1]\"}"); return; }
+      const char* err=nullptr;
+      if(!setNetSwitches(nsta==1, nap==1, err)){ Serial.print("{\"ok\":false,\"err\":\""); Serial.print(err); Serial.println("\"}"); return; }
       Serial.println("{\"ok\":true}");
       return;
     }
@@ -4580,16 +4748,27 @@ void setup(){
                  // bertepatan dengan init SPI yang barusan selesai
   loadWifiCreds();
   loadApCreds();               // v52: kredensial AP darurat kustom
+  loadNetSwitches();           // v53: saklar STA/AP
+  // v53 safety net (runtime saja, NVS tak diubah): (STA off, AP off) tanpa
+  // Ethernet = tak ada jalan akses -> paksa AP darurat agar tak terkunci.
+  if(!staEnable && !apEnable && !ethHasIP){
+    apEnable=true;
+    Serial.println("NETMODE: STA+AP off tanpa Ethernet -> AP darurat dipaksa nyala (anti-lockout).");
+  }
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);            // respons web lebih responsif
-  WiFi.begin(effSsid(), effPass());
-  Serial.print("WiFi: menyambung ke "); Serial.print(effSsid());
-  if(customSsid.length()>0) Serial.print(" (kustom)");
-  uint32_t t0=millis();
-  while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){
-    delay(250); Serial.print(".");
+  if(!staEnable){
+    Serial.println("WiFi STA dimatikan (netmode) -- percobaan STA dilewati.");
+  } else {
+    WiFi.begin(effSsid(), effPass());
+    Serial.print("WiFi: menyambung ke "); Serial.print(effSsid());
+    if(customSsid.length()>0) Serial.print(" (kustom)");
+    uint32_t t0=millis();
+    while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){
+      delay(250); Serial.print(".");
+    }
+    Serial.println();
   }
-  Serial.println();
 
   if(WiFi.status()==WL_CONNECTED){
     Serial.print("WiFi tersambung. IP: http://");
@@ -4605,6 +4784,11 @@ void setup(){
     Serial.print("AP: "); Serial.print(effApSsid());
     Serial.print(" | Buka browser: http://"); Serial.println(WiFi.softAPIP());
   }
+  // v53: AP persisten — nyala juga saat STA/ETH sukses bila apEnable=1.
+  ensureApOn();
+  // v53: radio mati total bila keduanya off (hanya tercapai saat ETH up —
+  // lihat safety net di atas).
+  if(!staEnable && !apEnable) WiFi.mode(WIFI_OFF);
 
   server.on("/",      HTTP_GET, sendUi);
   server.on("/set",   HTTP_GET, onSet);
@@ -4622,6 +4806,8 @@ void setup(){
    server.on("/wifiset", HTTP_GET, onWifiSet);    // kompatibilitas desktop v44
    server.on("/apset",   HTTP_POST, onApSet);     // v52: kredensial AP darurat kustom
    server.on("/apset",   HTTP_GET, onApSet);      // kompatibilitas pola wifiset
+   server.on("/netmode", HTTP_POST, onNetMode);   // v53: saklar independen STA/AP
+   server.on("/netmode", HTTP_GET, onNetMode);    // kompatibilitas pola wifiset
   server.on("/spush", HTTP_GET, onSPush);
   server.on("/spop",  HTTP_GET, onSPop);
   server.on("/sclear",HTTP_GET, onSClear);

@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         # WiFi kustom ESP32 (v43)
         self.tab_system.wifi_refresh_requested.connect(self._wifi_refresh)
         self.tab_system.wifi_apply_requested.connect(self._wifi_apply)
+        self.tab_system.netmode_apply_requested.connect(self._netmode_apply)
         self._wifi_polls = 0
         self._wifi_timer = QTimer(self)
         self._wifi_timer.setInterval(2000)
@@ -186,7 +187,6 @@ class MainWindow(QMainWindow):
                     self.btn_conn.setChecked(False)
                     return
                 target = f"WiFi {ip}"
-                self.tab_patch.is_http = True   # v45: patch via POST /fixes
             self.tab_patch.is_http = (not is_serial)
             self._thread = QThread(self)
             self._worker = SerialWorker(self.transport)
@@ -201,6 +201,8 @@ class MainWindow(QMainWindow):
             # ambil metadata dari ESP32 (v48: + LISTCT custom type)
             for kind in ("LISTF", "LISTG", "LISTP", "LISTS", "LISTCT"):
                 self._worker.cmd_queue.put((kind, kind))
+            # v53: status radio (sinkron checkbox STA/AP, bukan default basi)
+            self._worker.cmd_queue.put(("WIFIST", "WIFIST"))
             self.btn_conn.setText("PUTUS")
             self.btn_conn.setObjectName("dangerBtn")
             self._refresh_style(self.btn_conn)
@@ -296,15 +298,30 @@ class MainWindow(QMainWindow):
                 continue
             n = idx + 1
             u = 1 if pr.get("u") else 0
-            f_ms = int(pr.get("f", 600))
-            h_ms = int(pr.get("h", 1500))
+            # v53 (audit): koersi aman — satu nilai korup tak boleh menggagalkan
+            # seluruh import / membuat ESP32 macet di IMPORT_BEGIN (tanpa END).
+            try:
+                f_ms = int(pr.get("f", 600))
+            except (TypeError, ValueError):  # noqa: BLE001
+                f_ms = 600
+            try:
+                h_ms = int(pr.get("h", 1500))
+            except (TypeError, ValueError):  # noqa: BLE001
+                h_ms = 1500
             q.put(("cmd", f"IMPORT_P {n} {u} {f_ms} {h_ms}"))
             chans = pr.get("c", [])
+            if not isinstance(chans, list):
+                chans = []
             for off in range(0, 512, CHUNK):
                 seg = chans[off:off + CHUNK]
                 if not seg:
                     break
-                vals = ",".join(str(int(v) & 0xFF) for v in seg)
+                def _b(v):
+                    try:
+                        return str(int(v) & 0xFF)
+                    except (TypeError, ValueError):  # noqa: BLE001
+                        return "0"
+                vals = ",".join(_b(v) for v in seg)
                 q.put(("cmd", f"IMPORT_C {n} {off} {vals}"))
             n_total += 1
         q.put(("cmd", "IMPORT_END"))
@@ -354,6 +371,21 @@ class MainWindow(QMainWindow):
         self._worker.cmd_queue.put(("cmd", f"WIFIS {ssid} {pw}"))
         self.tab_system.log(f"WiFi: menerapkan kredensial '{ssid}' ke ESP32...")
         self._set_status("WiFi: koneksi baru dicoba — status diperbarui otomatis.")
+        self._wifi_polls = 0
+        self._wifi_timer.start()
+
+    def _netmode_apply(self, sta, ap):
+        # v53: saklar independen STA/AP (firmware v53+). Respons error
+        # (mis. anti-lockout) tampil via command_done -> log Sistem.
+        if self._worker is None:
+            self._set_status("Belum terhubung — radio tidak bisa diubah.")
+            return
+        self._worker.cmd_queue.put(
+            ("cmd", f"NETMODE STA {1 if sta else 0} AP {1 if ap else 0}"))
+        self.tab_system.log(
+            f"Radio: menerapkan STA {'ON' if sta else 'OFF'} + "
+            f"AP {'ON' if ap else 'OFF'} ke ESP32...")
+        self._set_status("Radio: diterapkan — status diperbarui otomatis.")
         self._wifi_polls = 0
         self._wifi_timer.start()
 
@@ -409,13 +441,18 @@ class MainWindow(QMainWindow):
             if isinstance(payload, dict) and "presets" in payload:
                 self._save_export(payload)
         elif kind == "WIFIST":
-            if isinstance(payload, dict):
+            # v53 (audit): tolak ACK basi {"ok":true} nyasar (tanpa kunci
+            # status) agar tak menimpa status valid jadi "Tidak terhubung."
+            if isinstance(payload, dict) and ("connected" in payload
+                                              or "staEnable" in payload):
                 self.tab_system.set_wifi(payload)
 
     # Pesan error firmware yang perlu penjelasan ramah operator (v46).
     _ERR_HINTS = {
         "shadow_full": "Slot preset habis: data lama dipertahankan untuk scene. "
                        "Kosongkan scene/preset yang tak terpakai, lalu ulangi.",
+        "net_would_lockout": "Ditolak agar tak terkunci: nyalakan STA atau AP dulu, "
+                             "atau sambungkan Ethernet.",
     }
 
     def _on_cmd_done(self, cmd, resp):
@@ -430,6 +467,12 @@ class MainWindow(QMainWindow):
         elif isinstance(resp, dict) and resp.get("ok") is True:
             # ACK terlihat operator tanpa mengganggu refresh state berkala.
             self._set_status(f"OK: {cmd}")
+        elif resp is None:
+            # v53 (audit): timeout/terputus — mis. NETMODE/WIFIS memutus
+            # jaringan yang dipakai desktop sendiri. Jangan diam.
+            self._set_status(f"Tidak ada respons [{cmd}] — periksa koneksi/IP baru.")
+            self.tab_system.log(f"Tidak ada respons [{cmd}] — bila radio diubah, "
+                                f"cek IP/AP baru lalu sambung ulang.")
 
     def _on_serial_error(self, msg):
         self._set_status(msg)
