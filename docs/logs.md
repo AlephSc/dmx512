@@ -75,6 +75,14 @@ Dibiarkan (lapor saja, butuh uji browser/hardware atau di luar scope):
 - File `desktop/README.md` sempat kena re-encode 2 baris mojibake lama
   (cp1252) oleh tool edit → diperbaiki jadi UTF-8 benar (—/×).
 
+### Merge pasca-pull (masih Session 72)
+Pull mengambil remote `97ff5aa` (panel diagnostik DMXSTAT/ARTSTAT desktop)
+yang conflict dengan v53 lokal di `system_tab.py` (2 hunk) + `worker.py`
+(1 hunk). Resolusi: gabung keduanya (import `QCheckBox+QGroupBox`, routing
+op-stats + `try/except` worker, kedua wiring `main.py`). Merge commit
+`70b0061`, push `97ff5aa..70b0061` sukses. Sesi diekspor ke
+`ses/session-ses_v53-netmode.md`.
+
 ## Session 71 - 2026-09-07 - v52: edit nama & sandi AP darurat kustom (NVS)
 
 ### Permintaan
