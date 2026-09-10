@@ -124,6 +124,11 @@ Perintah dikirim sebagai satu baris teks dengan `\n`. Semua respons adalah JSON 
 | SCLR \<s\> | `SCLR 5` | Kosongkan scene s |
 | CHASE on/off | `CHASE on` | Aktifkan/hentikan chase |
 | ALL on/off | `ALL off` | Blackout (0) / PAR Full (hanya PAR yang 255) |
+| ARTNET local/network | `ARTNET network` | Mode input Art-Net (NETWORK = dengar UDP 6454) |
+| ARTSTAT | `ARTSTAT` | Mode Art-Net + jumlah paket + aktivitas terakhir |
+| DMXSTAT | `DMXSTAT` | Diagnostik interval frame DMX (min/avg/max ms) |
+| LISTCT | `LISTCT` | Daftar tipe custom slot 5-15 (v48) |
+| CTSET \<json\> | `CTSET {"types":[...]}` | Commit definisi tipe custom (paritas POST /ctypes) |
 | SAVE | `SAVE` | Paksa simpan NVS (auto-save juga aktif tiap 60s jika dirty) |
 | LOAD | `LOAD` | Muat ulang snapshot NVS ke RAM |
 | EXPORT | `EXPORT` | Export semua preset lengkap (JSON besar, ~42KB) |
@@ -138,3 +143,22 @@ Catatan penting:
 - Firmware tidak mengubah mesin DMX/mixer/format preset/NVS. Hanya adapter serial ke web handler.
 
 Upload v39 dan uji command-by-command via Serial Monitor atau aplikasi desktop.
+
+## Paritas Web UI — desktop (v50)
+
+Fitur Web UI yang kini juga ada di desktop:
+
+- **Editor Tipe Custom** (tab Patch, tombol "Editor Tipe Custom"): slot 5-15,
+  nama tipe, jumlah channel 1-32, label per channel (8 char), mode
+  Fader/Switch (?) — kirim `CTSET` via serial atau `POST /ctypes` via WiFi.
+- **Toggle Art-Net LOCAL/NETWORK** (tab Mixer): paritas tombol Web UI;
+  mode aktif ikut otomatis dari polling GET (field `artnet`).
+- **Diagnostik** (tab Sistem, melebihi Web UI): Stat Frame DMX (`DMXSTAT`,
+  interval min/avg/max + auto 2 dtk) dan Stat Art-Net (`ARTSTAT`).
+- Dropdown tipe fixture di Patch kini memuat tipe custom (`* NAMA`).
+
+Catatan paritas yang TIDAK mungkin via serial (keterbatasan firmware):
+
+- SSID WiFi mengandung spasi (serial `WIFIS` memecah di spasi pertama) —
+  gunakan Web UI untuk kasus itu.
+- Push realtime WebSocket (desktop memakai polling GET 250-400 ms).

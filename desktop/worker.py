@@ -71,7 +71,12 @@ class SerialWorker(QObject):
                     self.command_done.emit(cmd, {"ok": False, "err": "worker_error",
                                                 "msg": str(e)})
                     continue
-                if kind in ("LISTF", "LISTG", "LISTP", "LISTS", "LISTCT", "EXPORT", "WIFIST"):
+                # DMXSTAT/ARTSTAT dikirim dengan kind "cmd" dari SystemTab —
+                # route berdasarkan op (bukan kind) agar respons stats (tanpa
+                # field "ok") sampai ke data_received, bukan command_done.
+                if op in ("ARTSTAT", "DMXSTAT"):
+                    self.data_received.emit(op, resp)
+                elif kind in ("LISTF", "LISTG", "LISTP", "LISTS", "LISTCT", "EXPORT", "WIFIST"):
                     self.data_received.emit(kind, resp)
                 else:
                     self.command_done.emit(cmd, resp)
